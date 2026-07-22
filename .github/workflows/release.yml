@@ -77,12 +77,18 @@ jobs:
             const release = status.releases.find(({ name }) => name === "@codex-relay/mobile");
             if (release) process.stdout.write(release.type);
           ' /tmp/changeset-status.json)"
+          relay_release_version="$(node -e '
+            const status = require(process.argv[1]);
+            const release = status.releases.find(({ name }) => name === "codex-relay");
+            if (release) process.stdout.write(release.newVersion);
+          ' /tmp/changeset-status.json)"
 
           if [[ -n "$release_type" && "$release_type" != "patch" ]]; then
             echo "::error::@codex-relay/mobile changesets must use patch; received $release_type"
             exit 1
           fi
 
+          mobile_release_version=""
           if [[ "$release_type" == "patch" ]]; then
             current_mobile_version="$(node -p 'require("./apps/mobile/package.json").version')"
             mobile_release_version="$(node scripts/mobile-release-version.mjs next "$current_mobile_version" "$IOS_APP_VERSION" "$release_type")"
@@ -92,6 +98,9 @@ jobs:
             echo "deploy=false" >> "$GITHUB_OUTPUT"
             echo "package-version=" >> "$GITHUB_OUTPUT"
           fi
+
+          release_title="$(node scripts/mobile-release-version.mjs title "$relay_release_version" "$mobile_release_version" "$IOS_APP_VERSION")"
+          echo "pr-title=$release_title" >> "$GITHUB_OUTPUT"
 
       - name: Create release pull request or publish
         id: changesets
@@ -112,6 +121,7 @@ jobs:
           IOS_APP_VERSION: ${{ steps.ios-app-version.outputs.version }}
           MOBILE_PATCH: ${{ steps.mobile-release-plan.outputs.deploy }}
           MOBILE_RELEASE_VERSION: ${{ steps.mobile-release-plan.outputs.package-version }}
+          RELEASE_PR_TITLE: ${{ steps.mobile-release-plan.outputs.pr-title }}
           PR_NUMBER: ${{ steps.changesets.outputs.pullRequestNumber }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -143,10 +153,7 @@ jobs:
               process.env.MOBILE_PATCH === "true"
                 ? [bodyWithoutTarget, targetBlock].filter(Boolean).join("\n\n")
                 : bodyWithoutTarget;
-            const nextTitle =
-              process.env.MOBILE_PATCH === "true"
-                ? `chore: release @codex-relay/mobile@${process.env.MOBILE_RELEASE_VERSION} (app-version ${process.env.IOS_APP_VERSION})`
-                : "chore: release codex-relay";
+            const nextTitle = process.env.RELEASE_PR_TITLE;
 
             if (nextBody !== body || nextTitle !== pullRequest.title) {
               await github.rest.pulls.update({
