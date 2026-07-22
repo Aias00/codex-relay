@@ -11,5 +11,5 @@
     "version": true,
     "tag": false
   },
-  "ignore": ["react-native-direct-fetch"]
+  "ignore": []
 }

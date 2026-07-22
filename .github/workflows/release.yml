@@ -41,6 +41,27 @@ jobs:
           BEFORE_SHA: ${{ github.event.before }}
         run: node .github/scripts/detect-mobile-patch-release.mjs
 
+      - name: Detect npm package release
+        id: npm-release
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          current_version="$(node -p 'require("./packages/codex-relay/package.json").version')"
+          previous_version=""
+          if [[ -n "$BEFORE_SHA" && ! "$BEFORE_SHA" =~ ^0+$ ]]; then
+            previous_package="$(git show "$BEFORE_SHA:packages/codex-relay/package.json")"
+            previous_version="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).version)' "$previous_package")"
+          fi
+
+          publish=false
+          if [[ -n "$previous_version" && "$previous_version" != "$current_version" ]]; then
+            publish=true
+          fi
+
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "previous-version=${previous_version:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "current-version=$current_version" >> "$GITHUB_OUTPUT"
+
       - name: Read current iOS app version
         id: ios-app-version
         working-directory: apps/mobile
@@ -66,7 +87,7 @@ jobs:
           echo "version=$ios_version" >> "$GITHUB_OUTPUT"
           echo "Current iOS app version: $ios_version"
 
-      - name: Read mobile release plan
+      - name: Read pending release plans
         id: mobile-release-plan
         env:
           IOS_APP_VERSION: ${{ steps.ios-app-version.outputs.version }}
@@ -82,6 +103,7 @@ jobs:
             const release = status.releases.find(({ name }) => name === "codex-relay");
             if (release) process.stdout.write(release.newVersion);
           ' /tmp/changeset-status.json)"
+          echo "relay-package-version=$relay_release_version" >> "$GITHUB_OUTPUT"
 
           if [[ -n "$release_type" && "$release_type" != "patch" ]]; then
             echo "::error::@codex-relay/mobile changesets must use patch; received $release_type"
@@ -99,70 +121,11 @@ jobs:
             echo "package-version=" >> "$GITHUB_OUTPUT"
           fi
 
-          release_title="$(node scripts/mobile-release-version.mjs title "$relay_release_version" "$mobile_release_version" "$IOS_APP_VERSION")"
-          echo "pr-title=$release_title" >> "$GITHUB_OUTPUT"
-
-      - name: Create release pull request or publish
-        id: changesets
-        uses: changesets/action@v1
-        with:
-          commit: "chore: release codex-relay"
-          title: "chore: release codex-relay"
-          version: pnpm version-packages
-          publish: pnpm release
+      - name: Publish npm package
+        if: steps.npm-release.outputs.publish == 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Update release pull request with mobile target
-        if: steps.changesets.outputs.hasChangesets == 'true' && steps.changesets.outputs.pullRequestNumber != ''
-        uses: actions/github-script@v9
-        env:
-          IOS_APP_VERSION: ${{ steps.ios-app-version.outputs.version }}
-          MOBILE_PATCH: ${{ steps.mobile-release-plan.outputs.deploy }}
-          MOBILE_RELEASE_VERSION: ${{ steps.mobile-release-plan.outputs.package-version }}
-          RELEASE_PR_TITLE: ${{ steps.mobile-release-plan.outputs.pr-title }}
-          PR_NUMBER: ${{ steps.changesets.outputs.pullRequestNumber }}
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const markerStart = "<!-- mobile-ota-target:start -->";
-            const markerEnd = "<!-- mobile-ota-target:end -->";
-            const pullNumber = Number(process.env.PR_NUMBER);
-            const { data: pullRequest } = await github.rest.pulls.get({
-              ...context.repo,
-              pull_number: pullNumber,
-            });
-            const body = pullRequest.body ?? "";
-            const startIndex = body.indexOf(markerStart);
-            const endIndex = body.indexOf(markerEnd, startIndex);
-            const bodyWithoutTarget =
-              startIndex >= 0 && endIndex >= 0
-                ? `${body.slice(0, startIndex)}${body.slice(endIndex + markerEnd.length)}`.trimEnd()
-                : body.trimEnd();
-            const targetBlock = [
-              markerStart,
-              "### iOS OTA deployment",
-              "",
-              `- Mobile release: \`@codex-relay/mobile@${process.env.MOBILE_RELEASE_VERSION}\``,
-              `- Target app-version: \`${process.env.IOS_APP_VERSION}\``,
-              "- Trigger: `@codex-relay/mobile` patch changeset",
-              markerEnd,
-            ].join("\n");
-            const nextBody =
-              process.env.MOBILE_PATCH === "true"
-                ? [bodyWithoutTarget, targetBlock].filter(Boolean).join("\n\n")
-                : bodyWithoutTarget;
-            const nextTitle = process.env.RELEASE_PR_TITLE;
-
-            if (nextBody !== body || nextTitle !== pullRequest.title) {
-              await github.rest.pulls.update({
-                ...context.repo,
-                pull_number: pullNumber,
-                body: nextBody,
-                title: nextTitle,
-              });
-            }
+        run: pnpm release
 
       - name: Validate Hot Updater configuration
         if: steps.mobile-release.outputs.deploy == 'true'
@@ -208,3 +171,91 @@ jobs:
         if: steps.mobile-release.outputs.deploy == 'true'
         working-directory: apps/mobile
         run: pnpm hot-updater bundle list -p ios --limit 5 --json
+
+      - name: Configure release commit author
+        if: steps.mobile-release-plan.outputs.relay-package-version != '' || steps.mobile-release-plan.outputs.deploy == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Update npm release branch
+        if: steps.mobile-release-plan.outputs.relay-package-version != ''
+        run: |
+          git switch --create changeset-release/npm-main "$GITHUB_SHA"
+          pnpm version-packages:npm
+          git add .changeset packages/codex-relay
+          git commit -m "chore: release codex-relay"
+          git push --force-with-lease origin HEAD:refs/heads/changeset-release/npm-main
+
+      - name: Update mobile release branch
+        if: steps.mobile-release-plan.outputs.deploy == 'true'
+        run: |
+          git switch --detach "$GITHUB_SHA"
+          git switch --create changeset-release/mobile-main "$GITHUB_SHA"
+          pnpm version-packages:mobile
+          git add .changeset apps/mobile
+          git commit -m "chore: release @codex-relay/mobile"
+          git push --force-with-lease origin HEAD:refs/heads/changeset-release/mobile-main
+
+      - name: Create or update package release pull requests
+        if: steps.mobile-release-plan.outputs.relay-package-version != '' || steps.mobile-release-plan.outputs.deploy == 'true'
+        uses: actions/github-script@v9
+        env:
+          IOS_APP_VERSION: ${{ steps.ios-app-version.outputs.version }}
+          MOBILE_RELEASE_VERSION: ${{ steps.mobile-release-plan.outputs.package-version }}
+          RELAY_RELEASE_VERSION: ${{ steps.mobile-release-plan.outputs.relay-package-version }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const releases = [];
+            if (process.env.RELAY_RELEASE_VERSION) {
+              releases.push({
+                branch: "changeset-release/npm-main",
+                title: `chore: release codex-relay@${process.env.RELAY_RELEASE_VERSION}`,
+                body: [
+                  "## npm package release",
+                  "",
+                  `- Package: \`codex-relay@${process.env.RELAY_RELEASE_VERSION}\``,
+                  "- Deployment: npm publish after merge",
+                ].join("\n"),
+              });
+            }
+            if (process.env.MOBILE_RELEASE_VERSION) {
+              releases.push({
+                branch: "changeset-release/mobile-main",
+                title: `chore: release @codex-relay/mobile@${process.env.MOBILE_RELEASE_VERSION} (app-version ${process.env.IOS_APP_VERSION})`,
+                body: [
+                  "## iOS OTA deployment",
+                  "",
+                  `- Mobile release: \`@codex-relay/mobile@${process.env.MOBILE_RELEASE_VERSION}\``,
+                  `- Target app-version: \`${process.env.IOS_APP_VERSION}\``,
+                  "- Deployment: Hot Updater after merge",
+                ].join("\n"),
+              });
+            }
+
+            for (const release of releases) {
+              const { data: pullRequests } = await github.rest.pulls.list({
+                ...context.repo,
+                base: "main",
+                head: `${context.repo.owner}:${release.branch}`,
+                state: "open",
+              });
+              const pullRequest = pullRequests[0];
+              if (pullRequest) {
+                await github.rest.pulls.update({
+                  ...context.repo,
+                  pull_number: pullRequest.number,
+                  title: release.title,
+                  body: release.body,
+                });
+              } else {
+                await github.rest.pulls.create({
+                  ...context.repo,
+                  base: "main",
+                  head: release.branch,
+                  title: release.title,
+                  body: release.body,
+                });
+              }
+            }

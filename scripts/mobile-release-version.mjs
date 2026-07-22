@@ -41,18 +41,6 @@ export function isMobileShipRelease(previousVersion, currentVersion) {
   return currentShipVersion.shipNumber === 1;
 }
 
-export function formatReleasePullRequestTitle(relayVersion, mobileVersion, appVersion) {
-  const releases = [];
-  if (relayVersion) {
-    releases.push(`codex-relay@${relayVersion}`);
-  }
-  if (mobileVersion) {
-    releases.push(`@codex-relay/mobile@${mobileVersion} (app-version ${appVersion})`);
-  }
-
-  return `chore: release ${releases.join(" + ")}`;
-}
-
 function parseShipVersion(version) {
   const match = shipVersionPattern.exec(version ?? "");
   if (!match) {
@@ -66,13 +54,8 @@ function parseShipVersion(version) {
 }
 
 function main() {
-  const [command, firstValue, secondValue, thirdValue] = process.argv.slice(2);
-  if (command === "title") {
-    console.log(formatReleasePullRequestTitle(firstValue, secondValue, thirdValue));
-    return;
-  }
-
-  if (command !== "next" || !firstValue || !secondValue || !thirdValue) {
+  const [command, currentVersion, appVersion, releaseType] = process.argv.slice(2);
+  if (command !== "next" || !currentVersion || !appVersion || !releaseType) {
     console.error(
       "Usage: node scripts/mobile-release-version.mjs next <current> <app-version> <release-type>",
     );
@@ -80,7 +63,7 @@ function main() {
     return;
   }
 
-  console.log(nextMobileShipVersion(firstValue, secondValue, thirdValue));
+  console.log(nextMobileShipVersion(currentVersion, appVersion, releaseType));
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {

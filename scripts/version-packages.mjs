@@ -11,10 +11,23 @@ const workspaceRoot = fileURLToPath(new URL("..", import.meta.url));
 const mobileRoot = resolve(workspaceRoot, "apps/mobile");
 const mobilePackagePath = resolve(workspaceRoot, "apps/mobile/package.json");
 const mobileChangelogPath = resolve(workspaceRoot, "apps/mobile/CHANGELOG.md");
+const ignoredPackagesByTarget = {
+  npm: [mobilePackageName, "react-native-direct-fetch"],
+  mobile: ["codex-relay", "react-native-direct-fetch"],
+};
 
 function main() {
+  const target = process.argv[2];
+  const ignoredPackages = ignoredPackagesByTarget[target];
+  if (!ignoredPackages) {
+    throw new Error("Usage: node scripts/version-packages.mjs <npm|mobile>");
+  }
+
   const status = readChangesetStatus();
-  const mobileRelease = status.releases.find(({ name }) => name === mobilePackageName);
+  const mobileRelease =
+    target === "mobile"
+      ? status.releases.find(({ name }) => name === mobilePackageName)
+      : undefined;
   let targetMobileVersion;
 
   if (mobileRelease) {
@@ -27,7 +40,8 @@ function main() {
     );
   }
 
-  execFileSync("pnpm", ["changeset", "version"], {
+  const ignoreArguments = ignoredPackages.flatMap((packageName) => ["--ignore", packageName]);
+  execFileSync("pnpm", ["changeset", "version", ...ignoreArguments], {
     cwd: workspaceRoot,
     stdio: "inherit",
   });
