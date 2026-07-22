@@ -1,0 +1,63 @@
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const appVersionPattern = /^\d+\.\d+\.\d+$/;
+const semverPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+const shipVersionPattern = /^(\d+\.\d+\.\d+)-ship\.(\d+)$/;
+
+export function nextMobileShipVersion(currentVersion, appVersion) {
+  if (!semverPattern.test(currentVersion) || !appVersionPattern.test(appVersion)) {
+    throw new TypeError(`Invalid mobile release versions: ${currentVersion}, ${appVersion}`);
+  }
+
+  const currentShipVersion = parseShipVersion(currentVersion);
+  const nextShipNumber =
+    currentShipVersion?.appVersion === appVersion ? currentShipVersion.shipNumber + 1 : 1;
+
+  return `${appVersion}-ship.${nextShipNumber}`;
+}
+
+export function isMobileShipRelease(previousVersion, currentVersion) {
+  if (!semverPattern.test(previousVersion ?? "")) {
+    return false;
+  }
+
+  const previousShipVersion = parseShipVersion(previousVersion);
+  const currentShipVersion = parseShipVersion(currentVersion);
+  if (!currentShipVersion) {
+    return false;
+  }
+
+  if (previousShipVersion?.appVersion === currentShipVersion.appVersion) {
+    return currentShipVersion.shipNumber === previousShipVersion.shipNumber + 1;
+  }
+
+  return currentShipVersion.shipNumber === 1;
+}
+
+function parseShipVersion(version) {
+  const match = shipVersionPattern.exec(version ?? "");
+  if (!match) {
+    return undefined;
+  }
+
+  return {
+    appVersion: match[1],
+    shipNumber: Number(match[2]),
+  };
+}
+
+function main() {
+  const [command, currentVersion, appVersion] = process.argv.slice(2);
+  if (command !== "next" || !currentVersion || !appVersion) {
+    console.error("Usage: node scripts/mobile-release-version.mjs next <current> <app-version>");
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(nextMobileShipVersion(currentVersion, appVersion));
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  main();
+}

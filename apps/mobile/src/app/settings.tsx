@@ -1,6 +1,7 @@
 import { HotUpdater } from "@hot-updater/react-native";
 import { useSelector } from "@legendapp/state/react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import Constants from "expo-constants";
 import { router } from "expo-router";
 import { Heart } from "lucide-react-native";
 import { useEffect, useRef, useState } from "react";
@@ -35,6 +36,7 @@ import {
   formatHotUpdaterLogTime,
   useHotUpdaterLogs,
 } from "@/lib/hot-updater-logs";
+import { formatMobileReleaseVersion } from "@/lib/mobile-release-version";
 import {
   defaultPushNotificationPreferences,
   getExpoPushToken,
@@ -52,6 +54,8 @@ import {
   setStatusState,
 } from "@/lib/server-state";
 import { chatStore$, resetChatSessionState, setConnection, setServerUrl } from "@/state/chat-store";
+
+import mobilePackage from "../../package.json";
 
 const hotUpdaterBaseUrl = process.env.EXPO_PUBLIC_HOT_UPDATER_BASE_URL?.trim();
 const hotUpdaterBaseUrlStatus = hotUpdaterBaseUrl ? "configured" : "missing";
@@ -81,7 +85,10 @@ export default function SettingsScreen() {
   const computerName = hasPairedSession
     ? (machineName ?? connectedComputerName(serverUrl))
     : "No paired computer";
-  const [appVersion] = useState(() => HotUpdater.getAppVersion() ?? "1.0.0");
+  const [appVersion] = useState(
+    () => HotUpdater.getAppVersion() ?? Constants.expoConfig?.version ?? "1.0.0",
+  );
+  const releaseVersionLabel = formatMobileReleaseVersion(appVersion, mobilePackage.version);
   const [appliedBundleSuffix] = useState(appliedHotUpdateBundleSuffix);
   const hotUpdaterTapCountRef = useRef(0);
   const [showHotUpdaterLogs, setShowHotUpdaterLogs] = useState(false);
@@ -628,7 +635,7 @@ export default function SettingsScreen() {
                   />
                 </View>
                 <ThemedText type="code" themeColor="textSecondary" style={styles.versionText}>
-                  Version {appVersion}
+                  Version {releaseVersionLabel}
                   {appUpdate.status === "checking" ? " · checking" : null}
                   {appUpdate.status === "current" ? " · current" : null}
                   {appUpdate.status === "downloading" ? " · downloading" : null}

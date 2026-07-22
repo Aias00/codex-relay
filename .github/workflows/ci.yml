@@ -38,3 +38,6 @@ jobs:
 
       - name: Typecheck
         run: pnpm typecheck
+
+      - name: Test release version policy
+        run: pnpm test:release

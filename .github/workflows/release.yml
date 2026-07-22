@@ -35,7 +35,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Detect mobile patch release
+      - name: Detect mobile ship release
         id: mobile-release
         env:
           BEFORE_SHA: ${{ github.event.before }}
@@ -68,6 +68,8 @@ jobs:
 
       - name: Read mobile release plan
         id: mobile-release-plan
+        env:
+          IOS_APP_VERSION: ${{ steps.ios-app-version.outputs.version }}
         run: |
           pnpm changeset status --output=/tmp/changeset-status.json
           release_type="$(node -e '
@@ -77,9 +79,13 @@ jobs:
           ' /tmp/changeset-status.json)"
 
           if [[ "$release_type" == "patch" ]]; then
+            current_mobile_version="$(node -p 'require("./apps/mobile/package.json").version')"
+            mobile_release_version="$(node scripts/mobile-release-version.mjs next "$current_mobile_version" "$IOS_APP_VERSION")"
             echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "package-version=$mobile_release_version" >> "$GITHUB_OUTPUT"
           else
             echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "package-version=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create release pull request or publish
@@ -100,6 +106,7 @@ jobs:
         env:
           IOS_APP_VERSION: ${{ steps.ios-app-version.outputs.version }}
           MOBILE_PATCH: ${{ steps.mobile-release-plan.outputs.deploy }}
+          MOBILE_RELEASE_VERSION: ${{ steps.mobile-release-plan.outputs.package-version }}
           PR_NUMBER: ${{ steps.changesets.outputs.pullRequestNumber }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -122,20 +129,26 @@ jobs:
               markerStart,
               "### iOS OTA deployment",
               "",
+              `- Mobile release: \`@codex-relay/mobile@${process.env.MOBILE_RELEASE_VERSION}\``,
               `- Target app-version: \`${process.env.IOS_APP_VERSION}\``,
-              "- Trigger: `@codex-relay/mobile` patch release",
+              "- Trigger: `@codex-relay/mobile` patch changeset",
               markerEnd,
             ].join("\n");
             const nextBody =
               process.env.MOBILE_PATCH === "true"
                 ? [bodyWithoutTarget, targetBlock].filter(Boolean).join("\n\n")
                 : bodyWithoutTarget;
+            const nextTitle =
+              process.env.MOBILE_PATCH === "true"
+                ? `chore: release @codex-relay/mobile@${process.env.MOBILE_RELEASE_VERSION} (app-version ${process.env.IOS_APP_VERSION})`
+                : "chore: release codex-relay";
 
-            if (nextBody !== body) {
+            if (nextBody !== body || nextTitle !== pullRequest.title) {
               await github.rest.pulls.update({
                 ...context.repo,
                 pull_number: pullNumber,
                 body: nextBody,
+                title: nextTitle,
               });
             }
 

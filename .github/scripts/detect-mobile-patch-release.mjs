@@ -3,24 +3,9 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { isMobileShipRelease } from "../../scripts/mobile-release-version.mjs";
+
 const packagePath = "apps/mobile/package.json";
-
-export function isPatchRelease(previousVersion, currentVersion) {
-  const parseVersion = (version) => {
-    const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version ?? "");
-    return match?.slice(1).map(Number);
-  };
-  const previous = parseVersion(previousVersion);
-  const current = parseVersion(currentVersion);
-
-  return Boolean(
-    previous &&
-    current &&
-    current[0] === previous[0] &&
-    current[1] === previous[1] &&
-    current[2] === previous[2] + 1,
-  );
-}
 
 function main() {
   const currentVersion = JSON.parse(readFileSync(packagePath, "utf8")).version;
@@ -38,7 +23,7 @@ function main() {
     }
   }
 
-  const deploy = isPatchRelease(previousVersion, currentVersion);
+  const deploy = isMobileShipRelease(previousVersion, currentVersion);
 
   appendFileSync(
     process.env.GITHUB_OUTPUT,
@@ -46,8 +31,8 @@ function main() {
   );
   console.log(
     deploy
-      ? `Detected @codex-relay/mobile patch release: ${previousVersion} -> ${currentVersion}`
-      : `No mobile patch release detected: ${previousVersion ?? "unknown"} -> ${currentVersion}`,
+      ? `Detected @codex-relay/mobile ship release: ${previousVersion} -> ${currentVersion}`
+      : `No mobile ship release detected: ${previousVersion ?? "unknown"} -> ${currentVersion}`,
   );
 }
 
