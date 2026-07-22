@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -33,7 +35,55 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Detect mobile patch release
+        id: mobile-release
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: node .github/scripts/detect-mobile-patch-release.mjs
+
+      - name: Read current iOS app version
+        id: ios-app-version
+        working-directory: apps/mobile
+        run: |
+          native_versions="$(pnpm hot-updater app-version --json)"
+          native_ios_version="$(node -e '
+            const version = JSON.parse(process.argv[1]).ios;
+            if (version) process.stdout.write(version);
+          ' "$native_versions")"
+          expo_config="$(pnpm expo config --json)"
+          configured_version="$(node -e '
+            const version = JSON.parse(process.argv[1]).version;
+            if (!/^\d+\.\d+\.\d+$/.test(version)) process.exit(1);
+            process.stdout.write(version);
+          ' "$expo_config")"
+
+          if [[ -n "$native_ios_version" && "$native_ios_version" != "$configured_version" ]]; then
+            echo "::error::Native iOS version ($native_ios_version) does not match Expo config ($configured_version)"
+            exit 1
+          fi
+
+          ios_version="${native_ios_version:-$configured_version}"
+          echo "version=$ios_version" >> "$GITHUB_OUTPUT"
+          echo "Current iOS app version: $ios_version"
+
+      - name: Read mobile release plan
+        id: mobile-release-plan
+        run: |
+          pnpm changeset status --output=/tmp/changeset-status.json
+          release_type="$(node -e '
+            const status = require(process.argv[1]);
+            const release = status.releases.find(({ name }) => name === "@codex-relay/mobile");
+            if (release) process.stdout.write(release.type);
+          ' /tmp/changeset-status.json)"
+
+          if [[ "$release_type" == "patch" ]]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create release pull request or publish
+        id: changesets
         uses: changesets/action@v1
         with:
           commit: "chore: release codex-relay"
@@ -43,3 +93,93 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Update release pull request with mobile target
+        if: steps.changesets.outputs.hasChangesets == 'true' && steps.changesets.outputs.pullRequestNumber != ''
+        uses: actions/github-script@v9
+        env:
+          IOS_APP_VERSION: ${{ steps.ios-app-version.outputs.version }}
+          MOBILE_PATCH: ${{ steps.mobile-release-plan.outputs.deploy }}
+          PR_NUMBER: ${{ steps.changesets.outputs.pullRequestNumber }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const markerStart = "<!-- mobile-ota-target:start -->";
+            const markerEnd = "<!-- mobile-ota-target:end -->";
+            const pullNumber = Number(process.env.PR_NUMBER);
+            const { data: pullRequest } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: pullNumber,
+            });
+            const body = pullRequest.body ?? "";
+            const startIndex = body.indexOf(markerStart);
+            const endIndex = body.indexOf(markerEnd, startIndex);
+            const bodyWithoutTarget =
+              startIndex >= 0 && endIndex >= 0
+                ? `${body.slice(0, startIndex)}${body.slice(endIndex + markerEnd.length)}`.trimEnd()
+                : body.trimEnd();
+            const targetBlock = [
+              markerStart,
+              "### iOS OTA deployment",
+              "",
+              `- Target app-version: \`${process.env.IOS_APP_VERSION}\``,
+              "- Trigger: `@codex-relay/mobile` patch release",
+              markerEnd,
+            ].join("\n");
+            const nextBody =
+              process.env.MOBILE_PATCH === "true"
+                ? [bodyWithoutTarget, targetBlock].filter(Boolean).join("\n\n")
+                : bodyWithoutTarget;
+
+            if (nextBody !== body) {
+              await github.rest.pulls.update({
+                ...context.repo,
+                pull_number: pullNumber,
+                body: nextBody,
+              });
+            }
+
+      - name: Validate Hot Updater configuration
+        if: steps.mobile-release.outputs.deploy == 'true'
+        env:
+          MOBILE_ENV: ${{ secrets.MOBILE_ENV }}
+          HOT_UPDATER_ENV: ${{ secrets.HOT_UPDATER_ENV }}
+          HOT_UPDATER_PRIVATE_KEY: ${{ secrets.HOT_UPDATER_PRIVATE_KEY }}
+        run: |
+          missing=()
+          for name in MOBILE_ENV HOT_UPDATER_ENV HOT_UPDATER_PRIVATE_KEY
+          do
+            if [[ -z "${!name}" ]]; then
+              missing+=("$name")
+            fi
+          done
+
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing Hot Updater configuration: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Restore mobile deployment environment
+        if: steps.mobile-release.outputs.deploy == 'true'
+        working-directory: apps/mobile
+        env:
+          MOBILE_ENV: ${{ secrets.MOBILE_ENV }}
+          HOT_UPDATER_ENV: ${{ secrets.HOT_UPDATER_ENV }}
+          HOT_UPDATER_PRIVATE_KEY: ${{ secrets.HOT_UPDATER_PRIVATE_KEY }}
+        run: |
+          umask 077
+          printf '%s' "$MOBILE_ENV" > .env
+          printf '%s' "$HOT_UPDATER_ENV" > .env.hotupdater
+          install -d -m 700 keys
+          printf '%s' "$HOT_UPDATER_PRIVATE_KEY" > keys/private-key.pem
+
+      - name: Deploy iOS OTA update
+        if: steps.mobile-release.outputs.deploy == 'true'
+        timeout-minutes: 30
+        working-directory: apps/mobile
+        run: pnpm hot-updater deploy -p ios -t "${{ steps.ios-app-version.outputs.version }}"
+
+      - name: Verify iOS OTA update
+        if: steps.mobile-release.outputs.deploy == 'true'
+        working-directory: apps/mobile
+        run: pnpm hot-updater bundle list -p ios --limit 5 --json
