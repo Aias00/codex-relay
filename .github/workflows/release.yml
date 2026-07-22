@@ -78,9 +78,14 @@ jobs:
             if (release) process.stdout.write(release.type);
           ' /tmp/changeset-status.json)"
 
+          if [[ -n "$release_type" && "$release_type" != "patch" ]]; then
+            echo "::error::@codex-relay/mobile changesets must use patch; received $release_type"
+            exit 1
+          fi
+
           if [[ "$release_type" == "patch" ]]; then
             current_mobile_version="$(node -p 'require("./apps/mobile/package.json").version')"
-            mobile_release_version="$(node scripts/mobile-release-version.mjs next "$current_mobile_version" "$IOS_APP_VERSION")"
+            mobile_release_version="$(node scripts/mobile-release-version.mjs next "$current_mobile_version" "$IOS_APP_VERSION" "$release_type")"
             echo "deploy=true" >> "$GITHUB_OUTPUT"
             echo "package-version=$mobile_release_version" >> "$GITHUB_OUTPUT"
           else

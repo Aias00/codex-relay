@@ -17,10 +17,14 @@ function main() {
   const mobileRelease = status.releases.find(({ name }) => name === mobilePackageName);
   let targetMobileVersion;
 
-  if (mobileRelease?.type === "patch") {
+  if (mobileRelease) {
     const currentMobileVersion = readJson(mobilePackagePath).version;
     const appVersion = readConfiguredAppVersion();
-    targetMobileVersion = nextMobileShipVersion(currentMobileVersion, appVersion);
+    targetMobileVersion = nextMobileShipVersion(
+      currentMobileVersion,
+      appVersion,
+      mobileRelease.type,
+    );
   }
 
   execFileSync("pnpm", ["changeset", "version"], {

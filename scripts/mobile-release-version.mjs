@@ -5,7 +5,13 @@ const appVersionPattern = /^\d+\.\d+\.\d+$/;
 const semverPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const shipVersionPattern = /^(\d+\.\d+\.\d+)-ship\.(\d+)$/;
 
-export function nextMobileShipVersion(currentVersion, appVersion) {
+export function nextMobileShipVersion(currentVersion, appVersion, releaseType) {
+  if (releaseType !== "patch") {
+    throw new TypeError(
+      `@codex-relay/mobile changesets must use patch; received ${releaseType ?? "none"}`,
+    );
+  }
+
   if (!semverPattern.test(currentVersion) || !appVersionPattern.test(appVersion)) {
     throw new TypeError(`Invalid mobile release versions: ${currentVersion}, ${appVersion}`);
   }
@@ -48,14 +54,16 @@ function parseShipVersion(version) {
 }
 
 function main() {
-  const [command, currentVersion, appVersion] = process.argv.slice(2);
-  if (command !== "next" || !currentVersion || !appVersion) {
-    console.error("Usage: node scripts/mobile-release-version.mjs next <current> <app-version>");
+  const [command, currentVersion, appVersion, releaseType] = process.argv.slice(2);
+  if (command !== "next" || !currentVersion || !appVersion || !releaseType) {
+    console.error(
+      "Usage: node scripts/mobile-release-version.mjs next <current> <app-version> <release-type>",
+    );
     process.exitCode = 1;
     return;
   }
 
-  console.log(nextMobileShipVersion(currentVersion, appVersion));
+  console.log(nextMobileShipVersion(currentVersion, appVersion, releaseType));
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
