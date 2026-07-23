@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -23,6 +23,8 @@ type SharedSocketServer = {
   requests: JsonRpcRequest[];
 };
 
+const socketTempRoot = process.platform === "darwin" ? "/tmp" : tmpdir();
+
 describe("CodexAppServerClient shared socket mode", () => {
   afterEach(() => {
     vi.clearAllMocks();
@@ -30,7 +32,7 @@ describe("CodexAppServerClient shared socket mode", () => {
   });
 
   it("reconnects after its shared socket resets without starting another app-server", async () => {
-    const codexHome = await mkdtemp(join(tmpdir(), "codex-relay-app-server-"));
+    const codexHome = await mkdtemp(join(socketTempRoot, "codex-relay-app-server-"));
     const socketPath = join(codexHome, "app-server-control", "app-server-control.sock");
     const server = await startSharedSocketServer(socketPath);
     vi.stubEnv("CODEX_HOME", codexHome);
@@ -78,6 +80,65 @@ describe("CodexAppServerClient shared socket mode", () => {
       await rm(codexHome, { force: true, recursive: true });
     }
   });
+
+  it.skipIf(process.platform === "win32")(
+    "waits for a slow shared app-server to create its Unix socket",
+    async () => {
+      // Given: a real child process that needs four seconds before its socket is ready.
+      const codexHome = await mkdtemp(join(socketTempRoot, "codex-relay-slow-app-server-"));
+      const fakeCodexBinary = join(codexHome, "fake-codex");
+      await writeFile(
+        fakeCodexBinary,
+        `#!/usr/bin/env node
+import { mkdir } from "node:fs/promises";
+import { createServer } from "node:http";
+import { join } from "node:path";
+import { setTimeout } from "node:timers/promises";
+import { WebSocketServer } from ${JSON.stringify(import.meta.resolve("ws"))};
+
+await setTimeout(4_000);
+const socketPath = join(process.env.CODEX_HOME, "app-server-control", "app-server-control.sock");
+await mkdir(join(process.env.CODEX_HOME, "app-server-control"), { recursive: true });
+const server = createServer();
+const webSocketServer = new WebSocketServer({ server });
+webSocketServer.on("connection", (socket) => {
+  socket.on("message", (data) => {
+    const request = JSON.parse(String(data));
+    socket.send(JSON.stringify({
+      id: request.id,
+      result: request.method === "model/list" ? { data: [] } : {},
+    }));
+  });
+});
+await new Promise((resolve, reject) => {
+  server.once("error", reject);
+  server.listen(socketPath, () => {
+    server.off("error", reject);
+    resolve();
+  });
+});
+process.stdin.resume();
+`,
+      );
+      await chmod(fakeCodexBinary, 0o755);
+      vi.stubEnv("CODEX_BIN", fakeCodexBinary);
+      vi.stubEnv("CODEX_HOME", codexHome);
+      vi.stubEnv("CODEX_RELAY_APP_SERVER_MODE", "socket");
+      const client = new CodexAppServerClient();
+
+      try {
+        // When: the relay initializes its shared app-server client.
+        await client.initialize();
+
+        // Then: it connects after the slow startup instead of timing out at 2.5 seconds.
+        await expect(client.listModels()).resolves.toEqual([]);
+      } finally {
+        client.close();
+        await rm(codexHome, { force: true, recursive: true });
+      }
+    },
+    12_000,
+  );
 });
 
 async function startSharedSocketServer(socketPath: string): Promise<SharedSocketServer> {

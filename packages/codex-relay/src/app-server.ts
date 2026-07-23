@@ -787,7 +787,7 @@ async function startSharedCodexAppServer() {
   });
 
   const remoteAddress = resolveCodexSharedAppServerRemoteAddress();
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 600; attempt += 1) {
     if (spawnError) {
       throw new Error(`Failed to start the shared Codex app-server: ${spawnError.message}`);
     }
