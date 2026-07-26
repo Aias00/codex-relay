@@ -331,7 +331,10 @@ export function createApp(options: AppOptions = {}) {
   const appServerHistoryLoadsByThreadId = new Map<string, Promise<void>>();
   const steeringThreads = new Set<string>();
   const secureSessionsByTokenHash = new Map<string, SecureSession>();
-  const activeStreamControllers = new Set<ReadableStreamDefaultController<Uint8Array>>();
+  const activeStreamControllers = new Map<
+    ReadableStreamDefaultController<Uint8Array>,
+    () => void
+  >();
   const threadOptions = { workingDirectory: workspacePath };
   function runThreadOperation<T>(threadId: string, operation: () => Promise<T>) {
     const previous = threadOperationTails.get(threadId) ?? Promise.resolve();
@@ -1196,7 +1199,7 @@ export function createApp(options: AppOptions = {}) {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         streamController = controller;
-        activeStreamControllers.add(controller);
+        activeStreamControllers.set(controller, closeStream);
         send(workspaceTerminalOutputResponse(session, since));
         if (session.exitedAt) {
           return;
@@ -2685,20 +2688,32 @@ export function createApp(options: AppOptions = {}) {
     });
     const encoder = new TextEncoder();
     const secureSession = getSecureSessionForRequest(c, options.pairing, secureSessionsByTokenHash);
-    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
     let streamSettled = false;
+    let closeStream = () => {};
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
-        streamController = controller;
-        activeStreamControllers.add(controller);
+        const attachmentAbortController = new AbortController();
+        let closed = false;
+        let stopPreviewMonitor = () => {};
+        closeStream = () => {
+          if (closed) {
+            return;
+          }
+          closed = true;
+          stopPreviewMonitor();
+          attachmentAbortController.abort();
+          activeStreamControllers.delete(controller);
+          closeSseController(controller);
+        };
+        activeStreamControllers.set(controller, closeStream);
         relayDebugLog("thread.stream.started", {
           mode: !runOptions.prompt && appServer ? "attach" : "run",
           threadId,
         });
-        const stopPreviewMonitor = startWebPreviewTargetMonitor({
+        stopPreviewMonitor = startWebPreviewTargetMonitor({
           bridgeUrl: c.req.url,
           send(target) {
-            sendSse(controller, encoder, secureSession, {
+            return sendSse(controller, encoder, secureSession, {
               type: "thread.preview_target.detected",
               threadId,
               target,
@@ -2713,13 +2728,13 @@ export function createApp(options: AppOptions = {}) {
             messagesByThreadId,
             pendingApprovals,
             secureSession,
+            signal: attachmentAbortController.signal,
             threadId,
             threads,
           }).finally(() => {
             streamSettled = true;
             relayDebugLog("thread.stream.finished", { mode: "attach", threadId });
-            activeStreamControllers.delete(controller);
-            stopPreviewMonitor();
+            closeStream();
           });
           return;
         }
@@ -2733,11 +2748,9 @@ export function createApp(options: AppOptions = {}) {
               "Running-thread stream attachment requires the Codex app-server.",
             ).error,
           });
-          closeSseController(controller);
           streamSettled = true;
           relayDebugLog("thread.stream.finished", { mode: "unsupported", threadId });
-          activeStreamControllers.delete(controller);
-          stopPreviewMonitor();
+          closeStream();
           return;
         }
         const skills = runOptions.skills ?? [];
@@ -2765,14 +2778,11 @@ export function createApp(options: AppOptions = {}) {
         }).finally(() => {
           streamSettled = true;
           relayDebugLog("thread.stream.finished", { mode: "run", threadId });
-          activeStreamControllers.delete(controller);
-          stopPreviewMonitor();
+          closeStream();
         });
       },
       cancel(reason) {
-        if (streamController) {
-          activeStreamControllers.delete(streamController);
-        }
+        closeStream();
         relayDebugLog("thread.stream.cancelled_by_client", {
           reason: debugReason(reason),
           settled: streamSettled,
@@ -3299,8 +3309,6 @@ async function runPromptStreamed(input: {
       thread: threadSummary,
       error: errorBody.error,
     });
-  } finally {
-    closeSseController(input.controller);
   }
 }
 
@@ -3444,6 +3452,7 @@ async function streamRunningAppServerThread(input: {
   messagesByThreadId: Map<string, ChatMessage[]>;
   pendingApprovals: Map<string, PendingApproval>;
   secureSession?: SecureSessionHandle;
+  signal: AbortSignal;
   threadId: string;
   threads: Map<string, ThreadMetadata>;
 }) {
@@ -3453,8 +3462,20 @@ async function streamRunningAppServerThread(input: {
   let observedTurnActivity = false;
   let producedTurnOutput = false;
   let threadSummary = input.threads.get(input.threadId);
+  let cleanupNotificationHandler = (): void => undefined;
+  let cleanupRequestHandler = (): void => undefined;
+  let handlersCleaned = false;
 
-  const cleanupRequestHandler = input.appServer.onRequest((request) => {
+  const cleanupHandlers = () => {
+    if (handlersCleaned) {
+      return;
+    }
+    handlersCleaned = true;
+    cleanupRequestHandler();
+    cleanupNotificationHandler();
+  };
+
+  cleanupRequestHandler = input.appServer.onRequest((request) => {
     if (!isApprovalServerRequest(request.method)) {
       void input.appServer.rejectRequest(
         request.id,
@@ -3520,8 +3541,20 @@ async function streamRunningAppServerThread(input: {
     });
   });
 
-  let cleanupNotificationHandler = (): void => undefined;
   const completed = new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: unknown) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanupHandlers();
+      if (error === undefined) {
+        resolve();
+      } else {
+        reject(error);
+      }
+    };
     cleanupNotificationHandler = input.appServer.onNotification((notification) => {
       const params = recordParams(notification);
       const notificationThreadId = firstString(params, ["threadId"]);
@@ -3544,8 +3577,7 @@ async function streamRunningAppServerThread(input: {
               thread: threadSummary,
             });
             if (state !== "running") {
-              cleanupNotificationHandler();
-              resolve();
+              finish();
             }
             return;
           }
@@ -3689,8 +3721,7 @@ async function streamRunningAppServerThread(input: {
                 threadId: input.threadId,
                 threads: input.threads,
               });
-              cleanupNotificationHandler();
-              resolve();
+              finish();
               return;
             }
             if (assistantMessageId) {
@@ -3736,22 +3767,37 @@ async function streamRunningAppServerThread(input: {
                 error: errorBody.error,
               });
             }
-            cleanupNotificationHandler();
-            resolve();
+            finish();
             return;
           }
         }
       } catch (error) {
-        cleanupNotificationHandler();
-        reject(error);
+        finish(error);
       }
     });
   });
+  let removeAbortListener = () => {};
+  const aborted = new Promise<void>((resolve) => {
+    const onAbort = () => {
+      cleanupHandlers();
+      resolve();
+    };
+    if (input.signal.aborted) {
+      onAbort();
+      return;
+    }
+    input.signal.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => input.signal.removeEventListener("abort", onAbort);
+  });
 
   try {
-    const appServerThread = await input.appServer.readThread(input.threadId, {
-      includeTurns: false,
-    });
+    const appServerThread = await Promise.race([
+      input.appServer.readThread(input.threadId, { includeTurns: false }),
+      aborted.then(() => undefined),
+    ]);
+    if (!appServerThread || input.signal.aborted) {
+      return;
+    }
     threadSummary = rememberAppServerThread(input.threads, appServerThread);
     sendSse(input.controller, input.encoder, input.secureSession, {
       type: "thread.state.changed",
@@ -3760,8 +3806,11 @@ async function streamRunningAppServerThread(input: {
     if (threadSummary.state !== "running") {
       return;
     }
-    await completed;
+    await Promise.race([completed, aborted]);
   } catch (error) {
+    if (input.signal.aborted) {
+      return;
+    }
     threadSummary = updateThread(input.threads, input.messagesByThreadId, input.threadId, {
       state: "failed",
       lastError: errorMessage(error),
@@ -3772,9 +3821,8 @@ async function streamRunningAppServerThread(input: {
       error: apiError("codex_run_failed", threadSummary.lastError ?? "Codex run failed.").error,
     });
   } finally {
-    cleanupRequestHandler();
-    cleanupNotificationHandler();
-    closeSseController(input.controller);
+    removeAbortListener();
+    cleanupHandlers();
   }
 }
 
@@ -4427,7 +4475,6 @@ async function runAppServerPromptStreamed(input: {
       input.activeAppServerTurnIdsByThreadId.delete(activeThreadId);
       input.steeringThreads.delete(activeThreadId);
     }
-    closeSseController(input.controller);
   }
 }
 
@@ -5411,7 +5458,7 @@ function sendSse(
   encoder: TextEncoder,
   secureSession: SecureSessionHandle | undefined,
   event: StreamThreadRunEvent,
-) {
+): boolean {
   const parsed = StreamThreadRunEventSchema.parse(event);
   const threadId = threadIdFromStreamEvent(parsed);
   relayDebugLog("thread.stream.sse", {
@@ -5432,7 +5479,7 @@ function sendSse(
       stage: "event",
       threadId,
     });
-    return;
+    return false;
   }
   if (!enqueueSseChunk(controller, encoder.encode(`data: ${JSON.stringify(data)}\n\n`))) {
     relayDebugLog("thread.stream.sse.enqueue_failed", {
@@ -5440,7 +5487,9 @@ function sendSse(
       stage: "data",
       threadId,
     });
+    return false;
   }
+  return true;
 }
 
 function sendTerminalOutputSse(
@@ -5500,10 +5549,10 @@ function closeSseController(controller: ReadableStreamDefaultController<Uint8Arr
 }
 
 function closeActiveStreamControllers(
-  controllers: Set<ReadableStreamDefaultController<Uint8Array>>,
+  controllers: Map<ReadableStreamDefaultController<Uint8Array>, () => void>,
 ) {
-  for (const controller of controllers) {
-    closeSseController(controller);
+  for (const closeStream of controllers.values()) {
+    closeStream();
   }
   controllers.clear();
 }
@@ -5521,40 +5570,52 @@ function startWebPreviewTargetMonitor({
   send,
 }: {
   bridgeUrl: string;
-  send: (target: WebPreviewTarget) => void;
+  send: (target: WebPreviewTarget) => boolean;
 }) {
   const urls = webPreviewCandidateUrls(bridgeUrl);
-  const seenUrls = new Set<string>();
+  const abortController = new AbortController();
   let stopped = false;
+  let nextScan: ReturnType<typeof setTimeout> | undefined;
+
+  const stop = () => {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    abortController.abort();
+    if (nextScan) {
+      clearTimeout(nextScan);
+      nextScan = undefined;
+    }
+  };
 
   async function scan() {
     if (stopped) {
       return;
     }
 
-    const targets = await detectWebPreviewTargets(urls);
-    for (const target of targets) {
-      if (stopped || seenUrls.has(target.url)) {
-        continue;
-      }
-
-      seenUrls.add(target.url);
+    const target = await detectWebPreviewTarget(urls, abortController.signal);
+    if (stopped) {
+      return;
+    }
+    if (target) {
+      stop();
       try {
         send(target);
       } catch {
-        stopped = true;
-        return;
+        // The stream may have closed between detection and delivery.
       }
+      return;
     }
+
+    nextScan = setTimeout(() => {
+      nextScan = undefined;
+      void scan();
+    }, 1500);
   }
 
   void scan();
-  const interval = setInterval(() => void scan(), 1500);
-
-  return () => {
-    stopped = true;
-    clearInterval(interval);
-  };
+  return stop;
 }
 
 function webPreviewCandidateUrls(bridgeUrl: string) {
@@ -5591,13 +5652,22 @@ function readCollaborationModeTemplate(name: (typeof collaborationModeTemplateNa
     .trim();
 }
 
-async function detectWebPreviewTargets(urls: string[]) {
-  const targets = await Promise.all(urls.map((url) => probeWebPreviewTarget(url)));
-  return targets.filter((target): target is WebPreviewTarget => Boolean(target));
+async function detectWebPreviewTarget(urls: string[], signal: AbortSignal) {
+  const targets = await Promise.all(urls.map((url) => probeWebPreviewTarget(url, signal)));
+  return targets.find((target): target is WebPreviewTarget => Boolean(target));
 }
 
-async function probeWebPreviewTarget(url: string): Promise<WebPreviewTarget | undefined> {
+async function probeWebPreviewTarget(
+  url: string,
+  signal: AbortSignal,
+): Promise<WebPreviewTarget | undefined> {
   const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal.aborted) {
+    abort();
+  } else {
+    signal.addEventListener("abort", abort, { once: true });
+  }
   const timeout = setTimeout(() => controller.abort(), 700);
 
   try {
@@ -5625,6 +5695,7 @@ async function probeWebPreviewTarget(url: string): Promise<WebPreviewTarget | un
     return undefined;
   } finally {
     clearTimeout(timeout);
+    signal.removeEventListener("abort", abort);
   }
 }
 
