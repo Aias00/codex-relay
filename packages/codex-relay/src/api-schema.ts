@@ -1191,6 +1191,11 @@ export function createOpenApiDocument() {
               required: true,
               schema: { type: "string" },
             },
+            {
+              name: "refresh",
+              in: "query",
+              schema: { type: "boolean" },
+            },
           ],
           responses: {
             "200": jsonResponse("ThreadDetailResponse"),
