@@ -5,6 +5,7 @@ import {
   CodexAppServerClient,
   type AppServerNotification,
   type AppServerRequest,
+  type AppServerThread,
 } from "../src/app-server.js";
 import { createApp } from "../src/app.js";
 import type { CodexClient } from "../src/codex.js";
@@ -39,10 +40,7 @@ function appServerThread(id: string, parentThreadId: string | null = null) {
   };
 }
 
-function appServerWithThreads(
-  listedThreads: ReturnType<typeof appServerThread>[],
-  readableThreads = listedThreads,
-) {
+function appServerWithThreads(listedThreads: AppServerThread[], readableThreads = listedThreads) {
   const appServer = new CodexAppServerClient();
   vi.spyOn(appServer, "listThreads").mockResolvedValue(listedThreads);
   vi.spyOn(appServer, "readThread").mockImplementation(async (threadId) => {
@@ -95,6 +93,68 @@ describe("subagent thread boundaries", () => {
     // Then
     expect(detailResponse.status).toBe(404);
     expect(runResponse.status).toBe(404);
+  });
+
+  it("rejects renaming a spawned subagent thread", async () => {
+    // Given
+    const subagentThread = appServerThread("subagent-thread", "parent-thread");
+    const appServer = appServerWithThreads([], [subagentThread]);
+    const setThreadName = vi.spyOn(appServer, "setThreadName").mockResolvedValue(undefined);
+    const app = createApp({
+      appServer,
+      codex: unavailableCodex(),
+    });
+
+    // When
+    const response = await app.request(`/v1/threads/${subagentThread.id}/name`, {
+      method: "POST",
+      body: JSON.stringify({ title: "Hidden chat" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    // Then
+    expect(response.status).toBe(404);
+    expect(setThreadName).not.toHaveBeenCalled();
+  });
+
+  it("rejects rewinding a spawned subagent thread", async () => {
+    // Given
+    const now = Date.now() / 1000;
+    const subagentThread = {
+      ...appServerThread("subagent-thread", "parent-thread"),
+      turns: [
+        {
+          id: "subagent-turn",
+          items: [
+            {
+              content: [{ text: "Hidden prompt", text_elements: [], type: "text" }],
+              id: "subagent-message",
+              type: "userMessage",
+            },
+          ],
+          status: { type: "completed" },
+          startedAt: now,
+          completedAt: now + 1,
+        },
+      ],
+    } satisfies AppServerThread;
+    const appServer = appServerWithThreads([], [subagentThread]);
+    const rollbackThread = vi.spyOn(appServer, "rollbackThread").mockResolvedValue(subagentThread);
+    const app = createApp({
+      appServer,
+      codex: unavailableCodex(),
+    });
+
+    // When
+    const response = await app.request(`/v1/threads/${subagentThread.id}/rollback`, {
+      method: "POST",
+      body: JSON.stringify({ turnId: "subagent-turn" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    // Then
+    expect(response.status).toBe(404);
+    expect(rollbackThread).not.toHaveBeenCalled();
   });
 
   it("suppresses subagent pushes when the observer did not see the spawn event", async () => {
