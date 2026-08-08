@@ -67,17 +67,8 @@ import {
   setHasPairedSession,
   setThreadMessagesLoading,
 } from "@/state/chat-store";
-
-type DrawerRow =
-  | {
-      id: string;
-      kind: "project";
-      projectKey: string;
-      title: string;
-      workspacePath?: string;
-    }
-  | { id: string; kind: "thread"; projectKey: string; thread: ThreadSummary }
-  | { id: string; kind: "more"; hiddenCount: number; projectKey: string };
+import { pinnedThreadStore$, togglePinnedThread, unpinThread } from "@/state/pinned-thread-store";
+import { buildDrawerRows, type DrawerRow } from "./thread-drawer-rows";
 
 type WorkspaceBrowser = {
   directories: { name: string; path: string }[];
@@ -122,7 +113,6 @@ type ThreadDrawerContentProps = Parameters<
 
 type ThreadDrawerNavigation = ThreadDrawerContentProps["navigation"];
 
-const collapsedProjectThreadCount = 5;
 const drawerListDrawDistance = 96;
 const drawerRowEstimatedSize = 40;
 const drawerListIdleTimeoutMs = 180;
@@ -204,7 +194,8 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
         setActiveThread(context.previousActiveThreadId);
       }
     },
-    onSuccess: async () => {
+    onSuccess: async (_response, threadId) => {
+      unpinThread(threadId);
       await queryClient.invalidateQueries({ queryKey: serverStateKeys.threads() });
     },
   });
@@ -213,6 +204,7 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
       renameThreadServerState(queryClient, threadId, { title }),
   });
   const activeThreadId = useSelector(() => chatStore$.activeThreadId.get());
+  const pinnedThreadIds = useSelector(() => pinnedThreadStore$.threadIds.get());
   const statusQuery = useQuery({
     queryKey: serverStateKeys.status(),
     queryFn: serverStateQueryFns.status,
@@ -270,11 +262,15 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
         visibleThreads,
         expandedProjects,
         activeThreadId,
+        pinnedThreadIds,
         Boolean(normalizedSearchQuery),
       ),
-    [activeThreadId, expandedProjects, normalizedSearchQuery, visibleThreads],
+    [activeThreadId, expandedProjects, normalizedSearchQuery, pinnedThreadIds, visibleThreads],
   );
   const workspaceRows = useMemo(() => workspaceBrowserRows(workspaceBrowser), [workspaceBrowser]);
+  const threadWithActionsIsPinned = Boolean(
+    threadWithActions && pinnedThreadIds.includes(threadWithActions.id),
+  );
   const canSaveRenamedThread = Boolean(
     canMutateAppServerThreads &&
     threadToRename &&
@@ -298,6 +294,16 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
     setThreadToRename(undefined);
     setRenameDraft("");
   }, []);
+  const handleTogglePinnedThread = useCallback(
+    (thread: ThreadSummary) => {
+      togglePinnedThread(thread.id);
+      hapticSelection();
+      if (threadWithActions?.id === thread.id) {
+        closeThreadActions();
+      }
+    },
+    [closeThreadActions, threadWithActions?.id],
+  );
   const returnToThreadActions = useCallback(() => {
     setThreadToRename(undefined);
     setRenameDraft("");
@@ -406,9 +412,11 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
         item={item}
         onArchiveThread={confirmArchiveThread}
         onCreateThread={createNewThread}
-        onRenameThread={openThreadActions}
+        onOpenThreadActions={openThreadActions}
         onSelectThread={selectThread}
+        onTogglePinnedThread={handleTogglePinnedThread}
         onToggleProject={toggleProject}
+        pinned={item.kind === "thread" && pinnedThreadIds.includes(item.thread.id)}
         selected={item.kind === "thread" && item.thread.id === activeThreadId}
         workspacePath={workspacePath}
       />
@@ -419,8 +427,10 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
       canMutateAppServerThreads,
       confirmArchiveThread,
       createNewThread,
+      handleTogglePinnedThread,
       isCreatingThread,
       openThreadActions,
+      pinnedThreadIds,
       selectThread,
       toggleProject,
       workspacePath,
@@ -539,14 +549,24 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
               </Button>
             </View>
           </View>
-        ) : (
-          <SheetActionRow
-            accessibilityLabel="Rename chat"
-            icon="newChat"
-            onPress={openRenameThread}
-            title="Rename chat"
-          />
-        )}
+        ) : threadWithActions ? (
+          <>
+            <SheetActionRow
+              accessibilityLabel={threadWithActionsIsPinned ? "Unpin chat" : "Pin chat"}
+              icon="pin"
+              onPress={() => handleTogglePinnedThread(threadWithActions)}
+              title={threadWithActionsIsPinned ? "Unpin chat" : "Pin chat"}
+            />
+            {canMutateAppServerThreads ? (
+              <SheetActionRow
+                accessibilityLabel="Rename chat"
+                icon="newChat"
+                onPress={openRenameThread}
+                title="Rename chat"
+              />
+            ) : null}
+          </>
+        ) : null}
       </AppBottomSheet>
       {props.showResizeHandle ? (
         <GestureDetector gesture={sidebarResizeGesture}>
@@ -875,9 +895,11 @@ type DrawerRowItemProps = {
   item: DrawerRow;
   onArchiveThread: (thread: ThreadSummary) => void;
   onCreateThread: (workspacePath: string | undefined) => Promise<void>;
-  onRenameThread: (thread: ThreadSummary) => void;
+  onOpenThreadActions: (thread: ThreadSummary) => void;
   onSelectThread: (threadId: string) => void;
+  onTogglePinnedThread: (thread: ThreadSummary) => void;
   onToggleProject: (projectKey: string) => void;
+  pinned: boolean;
   selected: boolean;
   workspacePath: string | undefined;
 };
@@ -889,13 +911,26 @@ const DrawerRowItem = memo(function DrawerRowItem({
   item,
   onArchiveThread,
   onCreateThread,
-  onRenameThread,
+  onOpenThreadActions,
   onSelectThread,
+  onTogglePinnedThread,
   onToggleProject,
+  pinned,
   selected,
   workspacePath,
 }: DrawerRowItemProps) {
   const theme = useTheme();
+
+  if (item.kind === "pinned") {
+    return (
+      <View style={styles.projectHeader}>
+        <View style={styles.rowIconSlot}>
+          <Icon name="pin" size={15} tintColor={theme.textSecondary} />
+        </View>
+        <Text style={styles.projectTitle}>Pinned</Text>
+      </View>
+    );
+  }
 
   if (item.kind === "project") {
     return (
@@ -942,27 +977,27 @@ const DrawerRowItem = memo(function DrawerRowItem({
   }
 
   const running = item.thread.state === "running";
+  const relativeTime = formatRelativeTime(item.thread.lastActivityAt ?? item.thread.updatedAt);
   return (
     <View style={[styles.thread, selected && styles.threadSelected]}>
       <Pressable
-        accessibilityActions={
-          canRenameThread ? [{ label: "Rename chat", name: "rename" }] : undefined
-        }
-        accessibilityHint={canRenameThread ? "Long press for chat actions" : undefined}
+        accessibilityActions={[
+          { label: pinned ? "Unpin chat" : "Pin chat", name: "toggle-pin" },
+          ...(canRenameThread ? [{ label: "Rename chat", name: "rename" }] : []),
+        ]}
+        accessibilityHint="Long press for chat actions"
         accessibilityRole="button"
         accessibilityLabel={`Open thread ${item.thread.title}`}
         accessibilityState={{ selected }}
         delayLongPress={350}
-        onAccessibilityAction={
-          canRenameThread
-            ? (event) => {
-                if (event.nativeEvent.actionName === "rename") {
-                  onRenameThread(item.thread);
-                }
-              }
-            : undefined
-        }
-        onLongPress={canRenameThread ? () => onRenameThread(item.thread) : undefined}
+        onAccessibilityAction={(event) => {
+          if (event.nativeEvent.actionName === "toggle-pin") {
+            onTogglePinnedThread(item.thread);
+          } else if (event.nativeEvent.actionName === "rename" && canRenameThread) {
+            onOpenThreadActions(item.thread);
+          }
+        }}
+        onLongPress={() => onOpenThreadActions(item.thread)}
         onPress={() => void onSelectThread(item.thread.id)}
         style={styles.threadOpenButton}
       >
@@ -977,8 +1012,12 @@ const DrawerRowItem = memo(function DrawerRowItem({
             </View>
             <View style={[styles.threadContent, pressed && styles.drawerPressedContent]}>
               <Text style={styles.threadTitle}>{item.thread.title}</Text>
-              <Text style={styles.threadTime} numberOfLines={1}>
-                {formatRelativeTime(item.thread.lastActivityAt ?? item.thread.updatedAt)}
+              <Text
+                ellipsizeMode={item.workspaceTitle ? "middle" : "tail"}
+                numberOfLines={1}
+                style={styles.threadTime}
+              >
+                {item.workspaceTitle ? `${item.workspaceTitle} · ${relativeTime}` : relativeTime}
               </Text>
             </View>
           </>
@@ -1007,9 +1046,11 @@ function areDrawerRowItemsEqual(previous: DrawerRowItemProps, next: DrawerRowIte
     previous.item.id !== next.item.id ||
     previous.onArchiveThread !== next.onArchiveThread ||
     previous.onCreateThread !== next.onCreateThread ||
-    previous.onRenameThread !== next.onRenameThread ||
+    previous.onOpenThreadActions !== next.onOpenThreadActions ||
     previous.onSelectThread !== next.onSelectThread ||
+    previous.onTogglePinnedThread !== next.onTogglePinnedThread ||
     previous.onToggleProject !== next.onToggleProject ||
+    previous.pinned !== next.pinned ||
     previous.selected !== next.selected ||
     previous.workspacePath !== next.workspacePath
   ) {
@@ -1018,11 +1059,12 @@ function areDrawerRowItemsEqual(previous: DrawerRowItemProps, next: DrawerRowIte
 
   if (previous.item.kind === "thread" && next.item.kind === "thread") {
     return (
-      previous.item.thread === next.item.thread ||
-      (previous.item.thread.title === next.item.thread.title &&
-        previous.item.thread.state === next.item.thread.state &&
-        previous.item.thread.lastActivityAt === next.item.thread.lastActivityAt &&
-        previous.item.thread.updatedAt === next.item.thread.updatedAt)
+      previous.item.workspaceTitle === next.item.workspaceTitle &&
+      (previous.item.thread === next.item.thread ||
+        (previous.item.thread.title === next.item.thread.title &&
+          previous.item.thread.state === next.item.thread.state &&
+          previous.item.thread.lastActivityAt === next.item.thread.lastActivityAt &&
+          previous.item.thread.updatedAt === next.item.thread.updatedAt))
     );
   }
 
@@ -1401,70 +1443,6 @@ function VersionNoticeRow({ label, value }: { label: string; value: string }) {
       <Text style={styles.versionNoticeValue}>{value}</Text>
     </View>
   );
-}
-
-function buildDrawerRows(
-  threads: ThreadSummary[],
-  expandedProjects: Record<string, boolean>,
-  activeThreadId: string | undefined,
-  forceExpanded = false,
-): DrawerRow[] {
-  const groups = new Map<
-    string,
-    { title: string; threads: ThreadSummary[]; workspacePath?: string }
-  >();
-
-  for (const thread of threads) {
-    const title = workspaceName(thread.cwd) ?? "codex-relay";
-    const key = thread.cwd ?? title;
-    const group = groups.get(key);
-    if (group) {
-      group.threads.push(thread);
-    } else {
-      groups.set(key, { title, threads: [thread], workspacePath: thread.cwd });
-    }
-  }
-
-  return [...groups.entries()].flatMap(([projectKey, group]) => {
-    const isExpanded = forceExpanded || (expandedProjects[projectKey] ?? false);
-    const activeThread = activeThreadId
-      ? group.threads.find((thread) => thread.id === activeThreadId)
-      : undefined;
-    const collapsedThreads = group.threads.slice(0, collapsedProjectThreadCount);
-    const visibleThreads =
-      isExpanded || !activeThread || collapsedThreads.includes(activeThread)
-        ? isExpanded
-          ? group.threads
-          : collapsedThreads
-        : [...collapsedThreads.slice(0, collapsedProjectThreadCount - 1), activeThread];
-    const hiddenCount = group.threads.length - visibleThreads.length;
-    const projectRows: DrawerRow[] = [
-      {
-        id: `project:${projectKey}`,
-        kind: "project",
-        projectKey,
-        title: group.title,
-        workspacePath: group.workspacePath,
-      },
-      ...visibleThreads.map((thread) => ({
-        id: `thread:${thread.id}`,
-        kind: "thread" as const,
-        projectKey,
-        thread,
-      })),
-    ];
-
-    if (hiddenCount > 0) {
-      projectRows.push({
-        id: `more:${projectKey}`,
-        kind: "more",
-        hiddenCount,
-        projectKey,
-      });
-    }
-
-    return projectRows;
-  });
 }
 
 function workspaceBrowserRows(browser: WorkspaceBrowser | undefined): WorkspaceBrowserRow[] {
