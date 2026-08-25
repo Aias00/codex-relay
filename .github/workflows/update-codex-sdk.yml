@@ -1,0 +1,71 @@
+name: Update Codex SDK
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-codex-sdk
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update @openai/codex-sdk
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Update Codex SDK
+        run: pnpm --filter codex-relay add @openai/codex-sdk@latest --save-exact --lockfile-only
+
+      - name: Detect update
+        id: update
+        run: |
+          if git diff --quiet -- packages/codex-relay/package.json pnpm-lock.yaml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install updated dependencies
+        if: steps.update.outputs.changed == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Test
+        if: steps.update.outputs.changed == 'true'
+        run: pnpm test
+
+      - name: Typecheck
+        if: steps.update.outputs.changed == 'true'
+        run: pnpm typecheck
+
+      - name: Lint
+        if: steps.update.outputs.changed == 'true'
+        run: pnpm lint
+
+      - name: Commit and push update
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          version="$(node -p 'require("./packages/codex-relay/package.json").dependencies["@openai/codex-sdk"]')"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/codex-relay/package.json pnpm-lock.yaml
+          git commit -m "chore: update @openai/codex-sdk to $version"
+          git push origin HEAD:main
