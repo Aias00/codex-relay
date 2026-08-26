@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -44,7 +45,10 @@ jobs:
           fi
 
           pnpm --filter codex-relay add "@openai/codex-sdk@$latest_version" --save-exact --lockfile-only
+          changeset_path=".changeset/update-codex-sdk-$latest_version.md"
+          printf -- '---\n"codex-relay": patch\n---\n\nUpdate `@openai/codex-sdk` to `%s`.\n' "$latest_version" > "$changeset_path"
           echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "changeset=$changeset_path" >> "$GITHUB_OUTPUT"
           echo "version=$latest_version" >> "$GITHUB_OUTPUT"
 
       - name: Install updated dependencies
@@ -66,10 +70,17 @@ jobs:
       - name: Commit and push update
         if: steps.update.outputs.changed == 'true'
         env:
+          CHANGESET_PATH: ${{ steps.update.outputs.changeset }}
           CODEX_SDK_VERSION: ${{ steps.update.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add packages/codex-relay/package.json pnpm-lock.yaml
+          git add "$CHANGESET_PATH" packages/codex-relay/package.json pnpm-lock.yaml
           git commit -m "chore: update @openai/codex-sdk to $CODEX_SDK_VERSION"
           git push origin HEAD:main
+
+      - name: Trigger release workflow
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release.yml --ref main
