@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
   contents: write
+  pull-requests: write
 
 concurrency:
   group: update-codex-sdk
@@ -22,6 +22,7 @@ jobs:
       - name: Check out main
         uses: actions/checkout@v6
         with:
+          fetch-depth: 0
           ref: main
 
       - name: Set up pnpm
@@ -67,20 +68,33 @@ jobs:
         if: steps.update.outputs.changed == 'true'
         run: pnpm lint
 
-      - name: Commit and push update
+      - name: Commit update branch
         if: steps.update.outputs.changed == 'true'
         env:
           CHANGESET_PATH: ${{ steps.update.outputs.changeset }}
           CODEX_SDK_VERSION: ${{ steps.update.outputs.version }}
+          UPDATE_BRANCH: automation/update-codex-sdk
         run: |
+          git switch --create "$UPDATE_BRANCH"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$CHANGESET_PATH" packages/codex-relay/package.json pnpm-lock.yaml
           git commit -m "chore: update @openai/codex-sdk to $CODEX_SDK_VERSION"
-          git push origin HEAD:main
+          git push --force-with-lease origin "HEAD:refs/heads/$UPDATE_BRANCH"
 
-      - name: Trigger release workflow
+      - name: Create or update pull request
         if: steps.update.outputs.changed == 'true'
         env:
+          CODEX_SDK_VERSION: ${{ steps.update.outputs.version }}
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run release.yml --ref main
+          UPDATE_BRANCH: automation/update-codex-sdk
+        run: |
+          title="chore: update @openai/codex-sdk to $CODEX_SDK_VERSION"
+          body="Update @openai/codex-sdk to $CODEX_SDK_VERSION and add a codex-relay patch changeset."
+          pull_request="$(gh pr list --base main --head "$UPDATE_BRANCH" --state open --json number --jq '.[0].number')"
+
+          if [[ -n "$pull_request" ]]; then
+            gh pr edit "$pull_request" --title "$title" --body "$body"
+          else
+            gh pr create --base main --head "$UPDATE_BRANCH" --title "$title" --body "$body"
+          fi
