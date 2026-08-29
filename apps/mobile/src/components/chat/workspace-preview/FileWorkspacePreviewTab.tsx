@@ -19,7 +19,10 @@ import { Icon } from "@/components/ui/icon";
 import { Colors, Fonts, Spacing } from "@/constants/theme";
 import { getWorkspaceFileContent, listWorkspaceFiles } from "@/lib/codex-relay-api";
 import { hapticSelection } from "@/lib/haptics";
-import { workspaceFileContentQueryKey } from "@/lib/workspace-file-queries";
+import {
+  workspaceFileContentQueryKey,
+  workspaceFilesQueryKeyPrefix,
+} from "@/lib/workspace-file-queries";
 
 import { WorkspaceCodeWebView } from "./WorkspaceCodeWebView";
 
@@ -47,8 +50,12 @@ const folderAccentColor = "#7AB7FF";
 const fileAccentColor = "#A9B4C2";
 
 export const FileWorkspacePreviewTab = memo(function FileWorkspacePreviewTab({
+  serverUrl,
+  workspaceId,
   workspacePath,
 }: {
+  serverUrl: string;
+  workspaceId?: string;
   workspacePath?: string;
 }) {
   const [query, setQuery] = useState("");
@@ -57,9 +64,9 @@ export const FileWorkspacePreviewTab = memo(function FileWorkspacePreviewTab({
   const [isExplorerExpanded, setExplorerExpanded] = useState(true);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [isPullRefreshing, setPullRefreshing] = useState(false);
+  const workspaceSelection = { workspaceId, workspacePath };
   const fileListQueryKey = [
-    "codex-relay-workspace-preview-files",
-    workspacePath ?? null,
+    ...workspaceFilesQueryKeyPrefix(serverUrl, workspaceSelection),
     currentDirectory,
     debouncedQuery,
   ];
@@ -68,6 +75,7 @@ export const FileWorkspacePreviewTab = memo(function FileWorkspacePreviewTab({
       listWorkspaceFiles({
         directory: currentDirectory,
         query: debouncedQuery,
+        workspaceId,
         workspacePath,
       }),
     queryKey: fileListQueryKey,
@@ -94,13 +102,15 @@ export const FileWorkspacePreviewTab = memo(function FileWorkspacePreviewTab({
     () => fileEntries.find((file) => file.kind === "file" && file.path === selectedPath),
     [fileEntries, selectedPath],
   );
-  const fileContentQueryKey = useMemo(
-    () => workspaceFileContentQueryKey(workspacePath, selectedPath),
-    [selectedPath, workspacePath],
+  const fileContentQueryKey = workspaceFileContentQueryKey(
+    serverUrl,
+    workspaceSelection,
+    selectedPath,
   );
   const fileContentQuery = useQuery({
     enabled: Boolean(selectedPath),
-    queryFn: () => getWorkspaceFileContent({ path: selectedPath ?? "", workspacePath }),
+    queryFn: () =>
+      getWorkspaceFileContent({ path: selectedPath ?? "", workspaceId, workspacePath }),
     queryKey: fileContentQueryKey,
     staleTime: 10_000,
   });
@@ -158,10 +168,11 @@ export const FileWorkspacePreviewTab = memo(function FileWorkspacePreviewTab({
       pathname: "/workspace-file-editor",
       params: {
         path: selectedPath,
+        workspaceId: workspaceId ?? "",
         workspacePath: workspacePath ?? "",
       },
     });
-  }, [canEditFile, selectedPath, workspacePath]);
+  }, [canEditFile, selectedPath, workspaceId, workspacePath]);
 
   const refreshPreview = useCallback(async () => {
     hapticSelection();

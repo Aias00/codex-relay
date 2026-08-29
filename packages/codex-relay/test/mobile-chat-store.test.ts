@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { ChatMessage, ThreadSummary } from "../src/api-schema.js";
 
 import {
+  activateWorkspaceThread,
   activateThreadSnapshot,
   applyStreamEvent,
   chatStore$,
@@ -22,6 +23,7 @@ import {
   setWorkspaceRuntimePreferences,
   stopThreadLocally,
 } from "../../../apps/mobile/src/state/chat-store.js";
+import { readCachedChatNavigation } from "../../../apps/mobile/src/lib/chat-navigation-cache.js";
 
 describe("mobile chat store stream handling", () => {
   beforeEach(() => {
@@ -146,6 +148,22 @@ describe("mobile chat store stream handling", () => {
     expect(chatStore$.activeThreadId.peek()).toBe("new-chat");
     expect(chatStore$.threadsById["new-chat"].state.peek()).toBe("completed");
     expect(chatStore$.messagesByThreadId["new-chat"].peek()).toEqual([]);
+  });
+
+  it("persists an atomic workspace thread activation for cold starts", () => {
+    activateWorkspaceThread("thread-workspace", {
+      workspaceId: "workspace-1",
+      workspacePath: "/workspace/one",
+    });
+
+    expect(chatStore$.activeThreadId.peek()).toBe("thread-workspace");
+    expect(chatStore$.workspaceId.peek()).toBe("workspace-1");
+    expect(chatStore$.workspacePath.peek()).toBe("/workspace/one");
+    expect(readCachedChatNavigation()).toEqual({
+      activeThreadId: "thread-workspace",
+      workspaceId: "workspace-1",
+      workspacePath: "/workspace/one",
+    });
   });
 
   it("optimistically clears running UI state when stopping the active thread", () => {

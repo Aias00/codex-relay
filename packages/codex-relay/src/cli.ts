@@ -5,7 +5,7 @@ import qrcode from "qrcode-terminal";
 import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { access, mkdir, readFile, rm, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
@@ -17,6 +17,8 @@ import {
 } from "./background-process.js";
 import { createTursoPairingSessionStore } from "./pairing-store.js";
 import { getConnectUrlGuidance } from "./pairing-url-candidates.js";
+import { backupRelayDatabases, inspectRelayState } from "./operator-tools.js";
+import { createRelayStateStore } from "./relay-state-store.js";
 
 import { codexRelayDataPath, codexRelayHome, legacyCodexRelayDataPath } from "./paths.js";
 
@@ -60,6 +62,10 @@ Examples:
   ${npxCommand} stop         Stop the background relay
   ${npxCommand} qr           Print the current pairing QR
   ${npxCommand} clear        Sign out every paired mobile app
+  ${npxCommand} diagnostics  Inspect durable Relay state without conversation content
+  ${npxCommand} backup       Create consistent SQLite backups
+  ${npxCommand} compact THREAD --through N Compact one thread's durable event log
+  ${npxCommand} repair-owner THREAD Repair an expired owner lease
   ${npxCommand} approve CODE Approve a pending mobile pairing request`,
   )
   .action(async (options) => {
@@ -111,6 +117,85 @@ program
     await clearPairings({
       clearDebugLog: Boolean(options.debug || command.optsWithGlobals().debug),
     });
+  });
+
+program
+  .command("diagnostics")
+  .description("Inspect durable Relay state without reading conversation content.")
+  .option("--json", "print machine-readable JSON")
+  .action(async (options) => {
+    const diagnostics = await inspectRelayState(relayStateDbPath());
+    if (options.json) {
+      console.log(JSON.stringify(diagnostics, null, 2));
+      return;
+    }
+    console.log(`State DB: ${diagnostics.path}`);
+    console.log(`Exists: ${diagnostics.exists ? "yes" : "no"}`);
+    if (!diagnostics.exists) {
+      return;
+    }
+    console.log(`Schema: ${diagnostics.schemaVersion ?? "unknown"}`);
+    console.log(`Events: ${diagnostics.eventCount}`);
+    console.log(`Pending approvals: ${diagnostics.pendingApprovalCount}`);
+    console.log(`Owners: ${diagnostics.ownerCount} (${diagnostics.expiredOwnerCount} expired)`);
+    console.log(`Active claims: ${diagnostics.activeClaimCount}`);
+  });
+
+program
+  .command("backup")
+  .description("Create consistent SQLite backups of Relay state and paired sessions.")
+  .option("-o, --output <directory>", "backup destination directory")
+  .action(async (options) => {
+    const destination = options.output
+      ? resolve(options.output)
+      : codexRelayDataPath(`backups/${backupTimestamp()}`);
+    const result = await backupRelayDatabases({
+      destinationDirectory: destination,
+      paths: [relayStateDbPath(), authDbPath()],
+    });
+    if (result.backedUp.length === 0) {
+      console.log("No Relay databases were found.");
+      return;
+    }
+    console.log(`Backup directory: ${result.destinationDirectory}`);
+    for (const entry of result.backedUp) {
+      console.log(`Backed up ${entry.source} -> ${entry.destination}`);
+    }
+  });
+
+program
+  .command("compact")
+  .description("Compact durable events for one thread through an explicit sequence.")
+  .argument("<thread-id>", "thread to compact")
+  .requiredOption("--through <sequence>", "highest event sequence to remove")
+  .action(async (threadId, options) => {
+    const throughSequence = positiveInteger(options.through, "--through");
+    const store = await createRelayStateStore(relayStateDbPath());
+    const result = await store.compactThreadEvents!({ threadId, throughSequence });
+    console.log(
+      `Compacted ${result.deletedCount} event(s) for ${threadId} through sequence ${result.compactedThroughSequence}; latest sequence ${result.lastSequence}.`,
+    );
+  });
+
+program
+  .command("repair-owner")
+  .description("Remove an expired thread owner lease and cancel its stale active claim.")
+  .argument("<thread-id>", "thread whose expired owner should be repaired")
+  .action(async (threadId) => {
+    const store = await createRelayStateStore(relayStateDbPath());
+    const result = await store.repairExpiredThreadOwner({ threadId });
+    if (result.kind === "not_found") {
+      console.log(`Thread ${threadId} has no durable owner.`);
+      return;
+    }
+    if (result.kind === "not_expired") {
+      console.error(`Thread ${threadId} owner lease is not expired; no changes were made.`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(
+      `Repaired expired owner for ${threadId}; cancelled ${result.cancelledClaimCount} stale claim(s).`,
+    );
   });
 
 await program.parseAsync();
@@ -339,6 +424,26 @@ async function resolveAuthDbPath() {
   }
 
   return undefined;
+}
+
+function relayStateDbPath() {
+  return process.env.CODEX_RELAY_STATE_DB_PATH ?? codexRelayDataPath("relay-state.db");
+}
+
+function authDbPath() {
+  return process.env.CODEX_RELAY_AUTH_DB_PATH ?? codexRelayDataPath("auth.db");
+}
+
+function backupTimestamp() {
+  return new Date().toISOString().replaceAll(":", "-");
+}
+
+function positiveInteger(value: string, flag: string) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`${flag} must be a positive integer.`);
+  }
+  return parsed;
 }
 
 async function clearDebugLogs() {

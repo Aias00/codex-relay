@@ -57,6 +57,36 @@ export const VersionResponseSchema = z.object({
   packageVersion: z.string().min(1),
 });
 
+export const HealthResponseSchema = z.object({
+  ok: z.literal(true),
+  relayId: z.string().min(1),
+  serverEpoch: z.string().min(1),
+  service: z.literal("codex-relay-server"),
+});
+
+export const ConnectionRouteKindSchema = z.enum([
+  "last_success",
+  "tailscale",
+  "lan",
+  "link_local",
+  "public_https",
+]);
+
+export const ConnectionPlanCandidateSchema = z.object({
+  routeId: z.string().min(1),
+  url: z.string().url(),
+  kind: ConnectionRouteKindSchema,
+  priority: z.number().int(),
+});
+
+export const ConnectionPlanResponseSchema = z.object({
+  relayId: z.string().min(1),
+  serverEpoch: z.string().min(1),
+  expiresAt: IsoDateTimeSchema,
+  refreshPath: z.string().min(1),
+  candidates: z.array(ConnectionPlanCandidateSchema),
+});
+
 export const ThreadRunOptionsSchema = z.object({
   model: z.string().trim().min(1).optional(),
   serviceTier: z.string().trim().min(1).optional(),
@@ -85,6 +115,7 @@ export const UpdateRuntimePreferencesRequestSchema = z.object({
   runtimeMode: RuntimeModeSchema.optional(),
   reasoningEffort: ReasoningEffortSchema.nullable().optional(),
   threadId: z.string().trim().min(1).optional(),
+  workspaceId: z.string().trim().min(1).optional(),
   workspacePath: z.string().trim().min(1).optional(),
 });
 
@@ -92,6 +123,7 @@ export const RuntimePreferencesResponseSchema = z.object({
   preferences: RuntimePreferencesSchema,
   runtimePreferencesByWorkspacePath: RuntimePreferencesByWorkspacePathSchema.default({}),
   threadId: z.string().trim().min(1).optional(),
+  workspaceId: z.string().trim().min(1).optional(),
   workspacePath: z.string().trim().min(1).optional(),
 });
 
@@ -249,6 +281,7 @@ export const ListWorkspaceFilesResponseSchema = z.object({
   files: z.array(WorkspaceFileMentionSchema),
   parentDirectory: z.string().nullable(),
   query: z.string(),
+  workspaceId: z.string().min(1).optional(),
   workspacePath: z.string().min(1),
 });
 
@@ -261,12 +294,14 @@ export const WorkspaceFileContentResponseSchema = z.object({
   path: z.string().min(1),
   size: z.number().int().nonnegative(),
   truncated: z.boolean(),
+  workspaceId: z.string().min(1).optional(),
   workspacePath: z.string().min(1),
 });
 
 export const UpdateWorkspaceFileContentRequestSchema = z.object({
   content: z.string().max(1024 * 1024),
   path: z.string().trim().min(1),
+  workspaceId: z.string().trim().min(1).optional(),
   workspacePath: z.string().trim().min(1).optional(),
 });
 
@@ -317,6 +352,8 @@ export const ThreadSummarySchema = z.object({
   sandboxMode: SandboxModeSchema.optional(),
   reasoningEffort: ReasoningEffortSchema.optional(),
   collaborationMode: ThreadCollaborationModeSchema.optional(),
+  ownerEpoch: z.number().int().positive().optional(),
+  workspaceId: z.string().min(1).optional(),
   cwd: z.string().optional(),
   source: z.string().optional(),
   messageCount: z.number().int().nonnegative().default(0),
@@ -333,11 +370,28 @@ export const StatusResponseSchema = z.object({
   service: z.literal("codex-relay-server"),
   sdkAvailable: z.boolean(),
   machineName: z.string().min(1),
+  workspaceId: z.string().min(1).optional(),
   workspacePath: z.string(),
   threadCount: z.number().int().nonnegative(),
   appServerAvailable: z.boolean().default(false),
   preferences: RuntimePreferencesSchema.default({ runtimeMode: "default" }),
   runtimePreferencesByWorkspacePath: RuntimePreferencesByWorkspacePathSchema.default({}),
+});
+
+export const WorkspaceStateSchema = z.enum(["available", "missing", "unauthorized"]);
+
+export const WorkspaceSchema = z.object({
+  workspaceId: z.string().min(1),
+  canonicalPath: z.string().min(1),
+  displayName: z.string().min(1),
+  repositoryIdentity: z.string().min(1).optional(),
+  createdAt: IsoDateTimeSchema,
+  lastSeenAt: IsoDateTimeSchema,
+  state: WorkspaceStateSchema,
+});
+
+export const ListWorkspacesResponseSchema = z.object({
+  workspaces: z.array(WorkspaceSchema),
 });
 
 export const WorkspaceDirectoryEntrySchema = z.object({
@@ -353,6 +407,7 @@ export const ListWorkspaceDirectoriesResponseSchema = z.object({
 });
 
 export const WorkspaceChangesResponseSchema = z.object({
+  workspaceId: z.string().min(1).optional(),
   workspacePath: z.string().min(1),
   status: z.string(),
   diff: z.string(),
@@ -391,6 +446,7 @@ export const WorkspaceChangesResponseSchema = z.object({
 });
 
 export const WorkspaceSelectionRequestSchema = z.object({
+  workspaceId: z.string().trim().min(1).optional(),
   workspacePath: z.string().trim().min(1).optional(),
 });
 
@@ -410,6 +466,8 @@ export const WorkspaceGitActionResponseSchema = z.object({
   branch: z.string().nullable(),
   message: z.string().min(1),
   output: z.string().default(""),
+  workspaceId: z.string().min(1).optional(),
+  workspacePath: z.string().min(1).optional(),
 });
 
 export const WORKSPACE_PREVIEW_TAB_VALUES = ["git", "files", "markdown", "web", "ssh"] as const;
@@ -479,6 +537,7 @@ export const WorkspaceTerminalSessionResponseSchema = z.object({
   rows: z.number().int().positive(),
   sessionId: z.string().min(1),
   startedAt: IsoDateTimeSchema,
+  workspaceId: z.string().min(1).optional(),
   workspacePath: z.string().min(1),
 });
 
@@ -567,6 +626,7 @@ export const CreateThreadRequestSchema = z
   .object({
     prompt: z.string().trim().min(1).optional(),
     title: z.string().trim().min(1).max(120).optional(),
+    workspaceId: z.string().trim().min(1).optional(),
     workspacePath: z.string().trim().min(1).optional(),
   })
   .merge(PromptContextInputSchema)
@@ -580,6 +640,8 @@ export const CreateThreadResponseSchema = z.object({
 
 export const RunThreadRequestSchema = z
   .object({
+    clientEventId: z.string().uuid().optional(),
+    expectedOwnerEpoch: z.number().int().positive().optional(),
     prompt: z.string().trim().min(1),
   })
   .merge(PromptContextInputSchema)
@@ -588,6 +650,7 @@ export const RunThreadRequestSchema = z
 export const StreamThreadRunRequestSchema = RunThreadRequestSchema.or(
   ThreadRunOptionsSchema.partial()
     .extend({
+      expectedOwnerEpoch: z.number().int().positive().optional(),
       prompt: z.string().trim().min(1).optional(),
     })
     .merge(PromptContextInputSchema),
@@ -618,14 +681,32 @@ export const ImageAttachmentUploadResponseSchema = z.object({
 
 export const QueuedThreadInputSchema = z.object({
   attachments: PromptContextSchema.shape.attachments,
+  clientEventId: z.string().uuid().optional(),
   id: z.string().min(1),
   prompt: z.string().min(1),
   skills: PromptContextSchema.shape.skills,
 });
 
+export const ThreadInputDeliveryStateSchema = z.enum([
+  "created",
+  "persisted",
+  "dispatched",
+  "accepted",
+  "queued",
+  "steered",
+  "running",
+  "completed",
+  "failed",
+  "rejected",
+  "cancelled",
+]);
+
 export const SubmitThreadInputResponseSchema = z.object({
   acceptedAs: z.enum(["steering", "queued"]),
+  clientEventId: z.string().uuid().optional(),
+  deliveryState: ThreadInputDeliveryStateSchema.optional(),
   input: QueuedThreadInputSchema.optional(),
+  inputId: z.string().min(1).optional(),
   queueLength: z.number().int().nonnegative(),
   thread: ThreadSummarySchema,
 });
@@ -638,6 +719,7 @@ export const QueuedThreadInputActionResponseSchema = z.object({
 
 export const UpdateThreadGoalRequestSchema = z
   .object({
+    expectedOwnerEpoch: z.number().int().positive().optional(),
     objective: z.string().trim().min(1).optional(),
     status: ThreadGoalStatusSchema.optional(),
     tokenBudget: z.number().int().positive().nullable().optional(),
@@ -655,6 +737,10 @@ export const InterruptThreadRunResponseSchema = z.object({
   thread: ThreadSummarySchema,
 });
 
+export const ThreadOwnerMutationRequestSchema = z.object({
+  expectedOwnerEpoch: z.number().int().positive().optional(),
+});
+
 export const ListQueuedThreadInputsResponseSchema = z.object({
   inputs: z.array(QueuedThreadInputSchema),
   queueLength: z.number().int().nonnegative(),
@@ -665,6 +751,7 @@ export const ApprovalDecisionSchema = z.enum(["approve", "approve-for-session", 
 export const ResolveApprovalRequestSchema = z.object({
   decision: ApprovalDecisionSchema,
   answers: z.array(z.string()).optional(),
+  expectedOwnerEpoch: z.number().int().positive().optional(),
 });
 
 export const ResolveApprovalResponseSchema = z.object({
@@ -691,6 +778,7 @@ export const RenameThreadResponseSchema = z.object({
 });
 
 export const RewindThreadRequestSchema = z.object({
+  expectedOwnerEpoch: z.number().int().positive().optional(),
   turnId: z.string().trim().min(1),
 });
 
@@ -706,6 +794,13 @@ export const ThreadDetailResponseSchema = z.object({
   thread: ThreadSummarySchema,
   messages: z.array(ChatMessageSchema),
   pendingInputRequests: z.array(PendingInputRequestSchema).default([]),
+  hasOlderMessages: z.boolean().default(false),
+  olderMessagesCursor: z.string().min(1).optional(),
+});
+
+export const ThreadDetailQuerySchema = z.object({
+  beforeMessageId: z.string().min(1).optional(),
+  refresh: z.enum(["true", "false"]).optional(),
 });
 
 export const ThreadMessageDetailFieldSchema = z.enum(["output", "patch"]);
@@ -717,51 +812,94 @@ export const ThreadMessageDetailResponseSchema = z.object({
   value: z.string(),
 });
 
+const ThreadEventCursorShape = {
+  eventId: z.string().min(1).optional(),
+  sequence: z.number().int().positive().optional(),
+};
+
 export const StreamThreadRunEventSchema = z.discriminatedUnion("type", [
   z.object({
+    ...ThreadEventCursorShape,
     type: z.literal("thread.message.created"),
     thread: ThreadSummarySchema,
     message: ChatMessageSchema,
   }),
   z.object({
+    ...ThreadEventCursorShape,
     type: z.literal("thread.message.delta"),
     threadId: z.string().min(1),
     messageId: z.string().min(1),
     delta: z.string(),
   }),
   z.object({
+    ...ThreadEventCursorShape,
     type: z.literal("thread.message.completed"),
     thread: ThreadSummarySchema,
     message: ChatMessageSchema,
   }),
   z.object({
+    ...ThreadEventCursorShape,
     type: z.literal("thread.state.changed"),
     thread: ThreadSummarySchema,
   }),
   z.object({
+    ...ThreadEventCursorShape,
     type: z.literal("thread.goal.updated"),
     thread: ThreadSummarySchema,
     goal: ThreadGoalSchema.nullable(),
   }),
   z.object({
+    ...ThreadEventCursorShape,
     type: z.literal("thread.error"),
     thread: ThreadSummarySchema.optional(),
     error: ErrorResponseSchema.shape.error,
   }),
   z.object({
+    ...ThreadEventCursorShape,
     type: z.literal("thread.preview_target.detected"),
     threadId: z.string().min(1),
     target: WebPreviewTargetSchema,
   }),
   z.object({
+    ...ThreadEventCursorShape,
     type: z.literal("thread.input_request.created"),
     request: PendingInputRequestSchema,
     thread: ThreadSummarySchema,
   }),
   z.object({
+    ...ThreadEventCursorShape,
     type: z.literal("thread.input_request.resolved"),
     requestId: z.string().min(1),
     threadId: z.string().min(1),
+  }),
+]);
+
+export const ThreadEventSchema = z.object({
+  eventId: z.string().min(1),
+  threadId: z.string().min(1),
+  workspaceId: z.string().min(1).optional(),
+  sequence: z.number().int().positive(),
+  event: StreamThreadRunEventSchema,
+  createdAt: IsoDateTimeSchema,
+});
+
+export const ListThreadEventsQuerySchema = z.object({
+  afterSequence: z.coerce.number().int().nonnegative().default(0),
+  limit: z.coerce.number().int().min(1).max(500).default(200),
+});
+
+const ListThreadEventsResponseBaseSchema = z.object({
+  events: z.array(ThreadEventSchema),
+  hasMore: z.boolean(),
+  lastSequence: z.number().int().nonnegative(),
+});
+
+export const ListThreadEventsResponseSchema = z.discriminatedUnion("resetRequired", [
+  ListThreadEventsResponseBaseSchema.extend({ resetRequired: z.literal(false) }),
+  ListThreadEventsResponseBaseSchema.extend({
+    events: z.array(ThreadEventSchema).length(0),
+    hasMore: z.literal(false),
+    resetRequired: z.literal(true),
   }),
 ]);
 
@@ -809,6 +947,8 @@ export type PendingInputRequestOption = z.infer<typeof PendingInputRequestOption
 export type ChatMessage = z.infer<typeof ChatMessageSchema>;
 export type ThreadSummary = z.infer<typeof ThreadSummarySchema>;
 export type StatusResponse = z.infer<typeof StatusResponseSchema>;
+export type Workspace = z.infer<typeof WorkspaceSchema>;
+export type ListWorkspacesResponse = z.infer<typeof ListWorkspacesResponseSchema>;
 export type WorkspaceDirectoryEntry = z.infer<typeof WorkspaceDirectoryEntrySchema>;
 export type ListWorkspaceDirectoriesResponse = z.infer<
   typeof ListWorkspaceDirectoriesResponseSchema
@@ -849,12 +989,17 @@ export type SubmitThreadInputResponse = z.infer<typeof SubmitThreadInputResponse
 export type QueuedThreadInputActionResponse = z.infer<typeof QueuedThreadInputActionResponseSchema>;
 export type UpdateThreadGoalRequest = z.infer<typeof UpdateThreadGoalRequestSchema>;
 export type InterruptThreadRunResponse = z.infer<typeof InterruptThreadRunResponseSchema>;
+export type ThreadOwnerMutationRequest = z.infer<typeof ThreadOwnerMutationRequestSchema>;
 export type ListQueuedThreadInputsResponse = z.infer<typeof ListQueuedThreadInputsResponseSchema>;
 export type ApprovalDecision = z.infer<typeof ApprovalDecisionSchema>;
 export type ResolveApprovalRequest = z.infer<typeof ResolveApprovalRequestSchema>;
 export type ResolveApprovalResponse = z.infer<typeof ResolveApprovalResponseSchema>;
 export type UpdateRuntimePreferencesRequest = z.infer<typeof UpdateRuntimePreferencesRequestSchema>;
 export type VersionResponse = z.infer<typeof VersionResponseSchema>;
+export type HealthResponse = z.infer<typeof HealthResponseSchema>;
+export type ConnectionRouteKind = z.infer<typeof ConnectionRouteKindSchema>;
+export type ConnectionPlanCandidate = z.infer<typeof ConnectionPlanCandidateSchema>;
+export type ConnectionPlanResponse = z.infer<typeof ConnectionPlanResponseSchema>;
 export type ListThreadsResponse = z.infer<typeof ListThreadsResponseSchema>;
 export type ArchiveThreadResponse = z.infer<typeof ArchiveThreadResponseSchema>;
 export type RenameThreadRequest = z.infer<typeof RenameThreadRequestSchema>;
@@ -1061,21 +1206,27 @@ function escapePromptSkillRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 export type ThreadDetailResponse = z.infer<typeof ThreadDetailResponseSchema>;
+export type ThreadDetailQuery = z.infer<typeof ThreadDetailQuerySchema>;
 export type ThreadMessageDetailField = z.infer<typeof ThreadMessageDetailFieldSchema>;
 export type ThreadMessageDetailResponse = z.infer<typeof ThreadMessageDetailResponseSchema>;
 export type StreamThreadRunEvent = z.infer<typeof StreamThreadRunEventSchema>;
+export type ThreadEvent = z.infer<typeof ThreadEventSchema>;
+export type ListThreadEventsResponse = z.infer<typeof ListThreadEventsResponseSchema>;
 export type UpdateWorkspaceFileContentRequest = z.infer<
   typeof UpdateWorkspaceFileContentRequestSchema
 >;
 
 export const apiPaths = {
   version: "/version",
+  health: "/v1/health",
+  connectionPlan: "/v1/connection-plan",
   pair: "/v1/pair",
   pairApproval: (approvalCode: string) => `/v1/pair/${encodeURIComponent(approvalCode)}`,
   pairApprove: "/v1/pair/approve",
   sessionsClear: "/v1/sessions/clear",
   sessionRefresh: "/v1/session/refresh",
   status: "/v1/status",
+  workspaces: "/v1/workspaces",
   preferences: "/v1/preferences",
   pushNotifications: "/v1/notifications/push",
   rateLimits: "/v1/rate-limits",
@@ -1122,6 +1273,9 @@ export const apiPaths = {
   threadRunInterrupt: (threadId: string) =>
     `/v1/threads/${encodeURIComponent(threadId)}/runs/interrupt`,
   threadRunStream: (threadId: string) => `/v1/threads/${encodeURIComponent(threadId)}/runs/stream`,
+  threadEvents: (threadId: string) => `/v1/threads/${encodeURIComponent(threadId)}/events`,
+  threadEventsStream: (threadId: string) =>
+    `/v1/threads/${encodeURIComponent(threadId)}/events/stream`,
 } as const;
 
 export function createOpenApiDocument() {
@@ -1140,11 +1294,39 @@ export function createOpenApiDocument() {
           },
         },
       },
+      "/v1/health": {
+        get: {
+          summary: "Confirm the Relay identity and current server process epoch",
+          responses: {
+            "200": jsonResponse("HealthResponse"),
+            "401": jsonResponse("ErrorResponse"),
+          },
+        },
+      },
+      "/v1/connection-plan": {
+        get: {
+          summary: "Get current routes for this Relay",
+          responses: {
+            "200": jsonResponse("ConnectionPlanResponse"),
+            "401": jsonResponse("ErrorResponse"),
+          },
+        },
+      },
       "/v1/status": {
         get: {
           summary: "Local server status",
+          parameters: workspaceSelectionParameters(),
           responses: {
             "200": jsonResponse("StatusResponse"),
+          },
+        },
+      },
+      "/v1/workspaces": {
+        get: {
+          summary: "List trusted workspaces known to this Relay",
+          responses: {
+            "200": jsonResponse("ListWorkspacesResponse"),
+            "401": jsonResponse("ErrorResponse"),
           },
         },
       },
@@ -1186,6 +1368,7 @@ export function createOpenApiDocument() {
       "/v1/threads": {
         get: {
           summary: "List locally known threads",
+          parameters: workspaceSelectionParameters(),
           responses: {
             "200": jsonResponse("ListThreadsResponse"),
           },
@@ -1201,7 +1384,7 @@ export function createOpenApiDocument() {
       },
       "/v1/threads/{threadId}": {
         get: {
-          summary: "Read a Codex thread with full available message history",
+          summary: "Read the newest Codex thread messages and page older history by cursor",
           parameters: [
             {
               name: "threadId",
@@ -1213,6 +1396,11 @@ export function createOpenApiDocument() {
               name: "refresh",
               in: "query",
               schema: { type: "boolean" },
+            },
+            {
+              name: "beforeMessageId",
+              in: "query",
+              schema: { type: "string" },
             },
           ],
           responses: {
@@ -1230,6 +1418,7 @@ export function createOpenApiDocument() {
               schema: { type: "string" },
             },
           ],
+          requestBody: jsonRequest("ThreadOwnerMutationRequest", { required: false }),
           responses: {
             "200": jsonResponse("ArchiveThreadResponse"),
             "404": jsonResponse("ErrorResponse"),
@@ -1360,6 +1549,7 @@ export function createOpenApiDocument() {
               schema: { type: "string" },
             },
           ],
+          requestBody: jsonRequest("ThreadOwnerMutationRequest", { required: false }),
           responses: {
             "200": jsonResponse("InterruptThreadRunResponse"),
             "404": jsonResponse("ErrorResponse"),
@@ -1389,6 +1579,7 @@ export function createOpenApiDocument() {
         },
         delete: {
           summary: "Clear the active goal for a Codex app-server thread",
+          requestBody: jsonRequest("ThreadOwnerMutationRequest", { required: false }),
           responses: {
             "200": jsonResponse("ThreadGoalResponse"),
             "404": jsonResponse("ErrorResponse"),
@@ -1434,6 +1625,66 @@ export function createOpenApiDocument() {
           },
         },
       },
+      "/v1/threads/{threadId}/events": {
+        get: {
+          summary: "Replay durable thread events after a sequence cursor",
+          parameters: [
+            {
+              name: "threadId",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            {
+              name: "afterSequence",
+              in: "query",
+              schema: { type: "integer", minimum: 0, default: 0 },
+            },
+            {
+              name: "limit",
+              in: "query",
+              schema: { type: "integer", minimum: 1, maximum: 500, default: 200 },
+            },
+          ],
+          responses: {
+            "200": jsonResponse("ListThreadEventsResponse"),
+            "400": jsonResponse("ErrorResponse"),
+            "404": jsonResponse("ErrorResponse"),
+            "503": jsonResponse("ErrorResponse"),
+          },
+        },
+      },
+      "/v1/threads/{threadId}/events/stream": {
+        get: {
+          summary: "Replay and follow durable thread events after a sequence cursor",
+          parameters: [
+            {
+              name: "threadId",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+            {
+              name: "afterSequence",
+              in: "query",
+              schema: { type: "integer", minimum: 0, default: 0 },
+            },
+          ],
+          responses: {
+            "200": {
+              description: "Server-sent durable StreamThreadRunEvent payloads",
+              content: {
+                "text/event-stream": {
+                  schema: { $ref: "#/components/schemas/StreamThreadRunEvent" },
+                },
+              },
+            },
+            "400": jsonResponse("ErrorResponse"),
+            "404": jsonResponse("ErrorResponse"),
+            "503": jsonResponse("ErrorResponse"),
+          },
+        },
+      },
     },
     components: {
       schemas: {
@@ -1474,6 +1725,8 @@ export function createOpenApiDocument() {
               enum: ["workspace-write", "danger-full-access", "read-only"],
             },
             reasoningEffort: { $ref: "#/components/schemas/ReasoningEffort" },
+            ownerEpoch: { type: "integer", minimum: 1 },
+            workspaceId: { type: "string" },
             cwd: { type: "string" },
             source: { type: "string" },
             lastMessagePreview: { type: "string" },
@@ -1512,6 +1765,7 @@ export function createOpenApiDocument() {
         UpdateThreadGoalRequest: {
           type: "object",
           properties: {
+            expectedOwnerEpoch: { type: "integer", minimum: 1 },
             objective: { type: "string" },
             status: { type: "string", enum: ThreadGoalStatusSchema.options },
             tokenBudget: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
@@ -1535,6 +1789,7 @@ export function createOpenApiDocument() {
           type: "object",
           required: ["turnId"],
           properties: {
+            expectedOwnerEpoch: { type: "integer", minimum: 1 },
             turnId: { type: "string", minLength: 1 },
           },
         },
@@ -1563,6 +1818,7 @@ export function createOpenApiDocument() {
             service: { type: "string", const: "codex-relay-server" },
             sdkAvailable: { type: "boolean" },
             machineName: { type: "string" },
+            workspaceId: { type: "string" },
             workspacePath: { type: "string" },
             threadCount: { type: "integer", minimum: 0 },
             appServerAvailable: { type: "boolean" },
@@ -1570,6 +1826,36 @@ export function createOpenApiDocument() {
             runtimePreferencesByWorkspacePath: {
               type: "object",
               additionalProperties: { $ref: "#/components/schemas/RuntimePreferences" },
+            },
+          },
+        },
+        Workspace: {
+          type: "object",
+          required: [
+            "workspaceId",
+            "canonicalPath",
+            "displayName",
+            "createdAt",
+            "lastSeenAt",
+            "state",
+          ],
+          properties: {
+            workspaceId: { type: "string" },
+            canonicalPath: { type: "string" },
+            displayName: { type: "string" },
+            repositoryIdentity: { type: "string" },
+            createdAt: { type: "string", format: "date-time" },
+            lastSeenAt: { type: "string", format: "date-time" },
+            state: { type: "string", enum: WorkspaceStateSchema.options },
+          },
+        },
+        ListWorkspacesResponse: {
+          type: "object",
+          required: ["workspaces"],
+          properties: {
+            workspaces: {
+              type: "array",
+              items: { $ref: "#/components/schemas/Workspace" },
             },
           },
         },
@@ -1581,6 +1867,40 @@ export function createOpenApiDocument() {
             service: { type: "string", const: "codex-relay-server" },
             packageName: { type: "string", const: "codex-relay" },
             packageVersion: { type: "string" },
+          },
+        },
+        HealthResponse: {
+          type: "object",
+          required: ["ok", "relayId", "serverEpoch", "service"],
+          properties: {
+            ok: { const: true },
+            relayId: { type: "string" },
+            serverEpoch: { type: "string" },
+            service: { const: "codex-relay-server" },
+          },
+        },
+        ConnectionPlanCandidate: {
+          type: "object",
+          required: ["routeId", "url", "kind", "priority"],
+          properties: {
+            routeId: { type: "string" },
+            url: { type: "string", format: "uri" },
+            kind: { type: "string", enum: ConnectionRouteKindSchema.options },
+            priority: { type: "integer" },
+          },
+        },
+        ConnectionPlanResponse: {
+          type: "object",
+          required: ["relayId", "serverEpoch", "expiresAt", "refreshPath", "candidates"],
+          properties: {
+            relayId: { type: "string" },
+            serverEpoch: { type: "string" },
+            expiresAt: { type: "string", format: "date-time" },
+            refreshPath: { type: "string" },
+            candidates: {
+              type: "array",
+              items: { $ref: "#/components/schemas/ConnectionPlanCandidate" },
+            },
           },
         },
         RuntimePreferences: {
@@ -1604,6 +1924,7 @@ export function createOpenApiDocument() {
           type: "object",
           properties: {
             threadId: { type: "string" },
+            workspaceId: { type: "string" },
             workspacePath: { type: "string" },
             model: { type: "string", nullable: true },
             serviceTier: { type: "string", nullable: true },
@@ -1628,6 +1949,7 @@ export function createOpenApiDocument() {
               additionalProperties: { $ref: "#/components/schemas/RuntimePreferences" },
             },
             threadId: { type: "string" },
+            workspaceId: { type: "string" },
             workspacePath: { type: "string" },
           },
         },
@@ -1701,6 +2023,7 @@ export function createOpenApiDocument() {
             },
             parentDirectory: { type: "string", nullable: true },
             query: { type: "string" },
+            workspaceId: { type: "string" },
             workspacePath: { type: "string" },
           },
         },
@@ -1726,6 +2049,7 @@ export function createOpenApiDocument() {
             path: { type: "string" },
             size: { type: "integer", minimum: 0 },
             truncated: { type: "boolean" },
+            workspaceId: { type: "string" },
             workspacePath: { type: "string" },
           },
         },
@@ -1735,6 +2059,7 @@ export function createOpenApiDocument() {
           properties: {
             content: { type: "string", maxLength: 1048576 },
             path: { type: "string" },
+            workspaceId: { type: "string" },
             workspacePath: { type: "string" },
           },
         },
@@ -1768,6 +2093,7 @@ export function createOpenApiDocument() {
               items: { $ref: "#/components/schemas/PromptSkill" },
             },
             title: { type: "string", maxLength: 120 },
+            workspaceId: { type: "string" },
             workspacePath: { type: "string" },
             collaborationMode: { type: "string", enum: ["default", "plan"], default: "default" },
           },
@@ -1804,6 +2130,8 @@ export function createOpenApiDocument() {
           type: "object",
           required: ["prompt"],
           properties: {
+            clientEventId: { type: "string", format: "uuid" },
+            expectedOwnerEpoch: { type: "integer", minimum: 1 },
             attachments: {
               type: "array",
               maxItems: 6,
@@ -1821,6 +2149,8 @@ export function createOpenApiDocument() {
         StreamThreadRunRequest: {
           type: "object",
           properties: {
+            clientEventId: { type: "string", format: "uuid" },
+            expectedOwnerEpoch: { type: "integer", minimum: 1 },
             attachments: {
               type: "array",
               maxItems: 6,
@@ -1849,7 +2179,25 @@ export function createOpenApiDocument() {
           required: ["acceptedAs", "queueLength", "thread"],
           properties: {
             acceptedAs: { type: "string", enum: ["steering", "queued"] },
+            clientEventId: { type: "string", format: "uuid" },
+            deliveryState: {
+              type: "string",
+              enum: [
+                "created",
+                "persisted",
+                "dispatched",
+                "accepted",
+                "queued",
+                "steered",
+                "running",
+                "completed",
+                "failed",
+                "rejected",
+                "cancelled",
+              ],
+            },
             input: { $ref: "#/components/schemas/QueuedThreadInput" },
+            inputId: { type: "string" },
             queueLength: { type: "integer", minimum: 0 },
             thread: { $ref: "#/components/schemas/ThreadSummary" },
           },
@@ -1863,6 +2211,7 @@ export function createOpenApiDocument() {
               maxItems: 6,
               items: { $ref: "#/components/schemas/PromptAttachment" },
             },
+            clientEventId: { type: "string", format: "uuid" },
             id: { type: "string" },
             prompt: { type: "string" },
             skills: {
@@ -1886,6 +2235,12 @@ export function createOpenApiDocument() {
           required: ["thread"],
           properties: {
             thread: { $ref: "#/components/schemas/ThreadSummary" },
+          },
+        },
+        ThreadOwnerMutationRequest: {
+          type: "object",
+          properties: {
+            expectedOwnerEpoch: { type: "integer", minimum: 1 },
           },
         },
         ListQueuedThreadInputsResponse: {
@@ -1935,7 +2290,7 @@ export function createOpenApiDocument() {
         },
         ThreadDetailResponse: {
           type: "object",
-          required: ["thread", "messages"],
+          required: ["thread", "messages", "hasOlderMessages"],
           properties: {
             thread: { $ref: "#/components/schemas/ThreadSummary" },
             messages: { type: "array", items: { $ref: "#/components/schemas/ChatMessage" } },
@@ -1943,6 +2298,8 @@ export function createOpenApiDocument() {
               type: "array",
               items: { $ref: "#/components/schemas/PendingInputRequest" },
             },
+            hasOlderMessages: { type: "boolean" },
+            olderMessagesCursor: { type: "string" },
           },
         },
         ThreadMessageDetailResponse: {
@@ -1967,6 +2324,31 @@ export function createOpenApiDocument() {
               properties: { type: { const: "thread.preview_target.detected" } },
             },
           ],
+        },
+        ThreadEvent: {
+          type: "object",
+          required: ["eventId", "threadId", "sequence", "event", "createdAt"],
+          properties: {
+            eventId: { type: "string" },
+            threadId: { type: "string" },
+            workspaceId: { type: "string" },
+            sequence: { type: "integer", minimum: 1 },
+            event: { $ref: "#/components/schemas/StreamThreadRunEvent" },
+            createdAt: { type: "string", format: "date-time" },
+          },
+        },
+        ListThreadEventsResponse: {
+          type: "object",
+          required: ["events", "hasMore", "lastSequence", "resetRequired"],
+          properties: {
+            events: {
+              type: "array",
+              items: { $ref: "#/components/schemas/ThreadEvent" },
+            },
+            hasMore: { type: "boolean" },
+            lastSequence: { type: "integer", minimum: 0 },
+            resetRequired: { const: false },
+          },
         },
         ListThreadsResponse: {
           type: "object",
@@ -2010,15 +2392,32 @@ export function createOpenApiDocument() {
   };
 }
 
-function jsonRequest(schemaName: string) {
+function jsonRequest(schemaName: string, options: { required?: boolean } = {}) {
   return {
-    required: true,
+    required: options.required ?? true,
     content: {
       "application/json": {
         schema: { $ref: `#/components/schemas/${schemaName}` },
       },
     },
   };
+}
+
+function workspaceSelectionParameters() {
+  return [
+    {
+      name: "workspaceId",
+      in: "query",
+      schema: { type: "string" },
+      description: "Stable Relay workspace identity.",
+    },
+    {
+      name: "workspacePath",
+      in: "query",
+      schema: { type: "string" },
+      description: "Compatibility path; must match workspaceId when both are supplied.",
+    },
+  ];
 }
 
 function jsonResponse(schemaName: string) {

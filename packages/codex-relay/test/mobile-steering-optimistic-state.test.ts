@@ -38,8 +38,8 @@ describe("mobile optimistic queued-input steering state", () => {
 
     const streamedMessages = upsertMessage(optimisticDetail?.messages ?? [], canonicalMessage);
     const refreshedDetail = mergeThreadDetailState(
-      { thread, messages: streamedMessages, pendingInputRequests: [] },
-      { thread, messages: [canonicalMessage], pendingInputRequests: [] },
+      { hasOlderMessages: false, thread, messages: streamedMessages, pendingInputRequests: [] },
+      { hasOlderMessages: false, thread, messages: [canonicalMessage], pendingInputRequests: [] },
     );
 
     expect(refreshedDetail.messages).toHaveLength(1);
@@ -79,8 +79,14 @@ describe("mobile optimistic queued-input steering state", () => {
         thread: completedThread,
         messages: [completedMessage],
         pendingInputRequests: [],
+        hasOlderMessages: false,
       },
-      { thread: staleThread, messages: [staleMessage], pendingInputRequests: [] },
+      {
+        thread: staleThread,
+        messages: [staleMessage],
+        pendingInputRequests: [],
+        hasOlderMessages: false,
+      },
     );
 
     expect(merged.thread).toMatchObject({ state: "completed" });
@@ -100,8 +106,13 @@ describe("mobile optimistic queued-input steering state", () => {
     };
 
     const merged = mergeThreadDetailState(
-      { thread: completedThread, messages: [], pendingInputRequests: [] },
-      { thread: staleRunningThread, messages: [], pendingInputRequests: [] },
+      { thread: completedThread, messages: [], pendingInputRequests: [], hasOlderMessages: false },
+      {
+        thread: staleRunningThread,
+        messages: [],
+        pendingInputRequests: [],
+        hasOlderMessages: false,
+      },
     );
 
     expect(merged.thread.state).toBe("completed");
@@ -153,6 +164,7 @@ describe("mobile optimistic queued-input steering state", () => {
       thread,
       messages: [canonicalMessage],
       pendingInputRequests: [],
+      hasOlderMessages: false,
     };
 
     expect(upsertMessage([canonicalMessage], localMessage)).toEqual([canonicalMessage]);
@@ -161,6 +173,7 @@ describe("mobile optimistic queued-input steering state", () => {
         thread,
         messages: [localMessage],
         pendingInputRequests: [],
+        hasOlderMessages: false,
       }).messages,
     ).toEqual([canonicalMessage]);
   });

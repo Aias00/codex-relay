@@ -85,7 +85,8 @@ export function MessageTimeline({
   const contentRevealProgress = useSharedValue(0);
   const hasRows = rows.length > 0;
   const isTimelineReady = !hasRows || settledTimelineKey === timelineKey;
-  const showLoadingConversation = isLoading || (hasRows && !isTimelineReady);
+  const showBlockingLoadingConversation = isLoading && !hasRows;
+  const showLoadingConversation = showBlockingLoadingConversation || (hasRows && !isTimelineReady);
   const timelineContentStyle = useAnimatedStyle(() => ({
     opacity: contentRevealProgress.value,
     transform: [{ translateY: TIMELINE_CONTENT_SETTLE_OFFSET * (1 - contentRevealProgress.value) }],
@@ -111,7 +112,7 @@ export function MessageTimeline({
   );
 
   useEffect(() => {
-    if (isLoading || !hasRows) {
+    if (!hasRows) {
       return;
     }
     let didCancel = false;
@@ -130,7 +131,7 @@ export function MessageTimeline({
         cancelAnimationFrame(settleFrame);
       }
     };
-  }, [hasRows, isLoading, timelineKey]);
+  }, [hasRows, timelineKey]);
 
   useEffect(() => {
     contentRevealProgress.value = withTiming(showLoadingConversation ? 0 : 1, {
@@ -173,7 +174,7 @@ export function MessageTimeline({
 
   return (
     <View onTouchStart={onKeyboardDismissRequest} style={styles.transitionHost}>
-      {!isLoading ? (
+      {!showBlockingLoadingConversation ? (
         rows.length === 0 && !isRunning ? (
           <Animated.View style={[styles.transitionScene, timelineContentStyle]}>
             <View style={styles.empty}>

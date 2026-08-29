@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   createPairingQrPayload,
+  getConnectUrlCandidates,
   getConnectUrlGuidance,
   normalizeUrl,
 } from "../src/pairing-url-candidates.js";
@@ -48,11 +49,40 @@ describe("pairing URL candidates", () => {
     expect(parsed.searchParams.has("serverUrls")).toBe(false);
   });
 
+  it("keeps compact QR fallbacks short and skips unusable local hosts", () => {
+    const payload = createPairingQrPayload({
+      serverPublicKey: "server-public-key",
+      serverUrls: [
+        "http://100.64.0.10:8787",
+        "http://0.0.0.0:8787",
+        "http://192.168.139.0:8787",
+        "http://169.254.51.1:8787",
+        "http://192.168.1.10:8787",
+        "http://192.168.1.11:8787",
+        "http://192.168.1.12:8787",
+        "http://192.168.1.13:8787",
+      ],
+    });
+
+    const parsed = new URL(payload);
+    expect(parsed.searchParams.get("h")).toBe("192.168.1.10,192.168.1.11,192.168.1.12");
+  });
+
   it("normalizes only http and https URLs", () => {
     expect(normalizeUrl(" http://192.168.1.10:8787/ ")).toBe("http://192.168.1.10:8787");
     expect(normalizeUrl("https://relay.example.com/")).toBe("https://relay.example.com");
     expect(normalizeUrl("ftp://relay.example.com")).toBeUndefined();
     expect(normalizeUrl("")).toBeUndefined();
+  });
+
+  it("prefers a configured public URL for mobile pairing", () => {
+    const candidates = getConnectUrlCandidates({
+      listenUrl: "http://0.0.0.0:8788",
+      port: 8788,
+      publicUrl: " https://relay.example.com/ ",
+    });
+
+    expect(candidates[0]).toEqual({ label: "Public", url: "https://relay.example.com" });
   });
 
   it("explains local network addresses as same-Wi-Fi pairing", () => {

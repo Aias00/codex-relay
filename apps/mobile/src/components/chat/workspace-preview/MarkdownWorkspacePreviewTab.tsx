@@ -7,32 +7,39 @@ import { ThemedText } from "@/components/themed-text";
 import { Icon } from "@/components/ui/icon";
 import { Colors, Spacing } from "@/constants/theme";
 import { getWorkspaceFileContent } from "@/lib/codex-relay-api";
+import { workspaceFileContentQueryKey } from "@/lib/workspace-file-queries";
 
 import { HighlightedCodeBlock } from "../MessageBubble";
 import type { WorkspaceMarkdownPreviewTarget } from "./markdown-target";
 import { isMarkdownLanguage, WorkspaceMarkdownPreview } from "./WorkspaceMarkdownPreview";
 
 export const MarkdownWorkspacePreviewTab = memo(function MarkdownWorkspacePreviewTab({
+  serverUrl,
   target,
+  workspaceId,
   workspacePath,
 }: {
+  serverUrl: string;
   target?: WorkspaceMarkdownPreviewTarget;
+  workspaceId?: string;
   workspacePath?: string;
 }) {
   const targetWorkspacePath = target?.workspacePath ?? workspacePath;
+  const targetWorkspaceId = target?.workspacePath === workspacePath ? workspaceId : undefined;
   const [isPullRefreshing, setPullRefreshing] = useState(false);
   const fileContentQuery = useQuery({
     enabled: Boolean(target?.path),
     queryFn: () =>
       getWorkspaceFileContent({
         path: target?.path ?? "",
+        workspaceId: targetWorkspaceId,
         workspacePath: targetWorkspacePath,
       }),
-    queryKey: [
-      "codex-relay-workspace-preview-markdown",
-      targetWorkspacePath ?? null,
+    queryKey: workspaceFileContentQueryKey(
+      serverUrl,
+      { workspaceId: targetWorkspaceId, workspacePath: targetWorkspacePath },
       target?.path ?? null,
-    ],
+    ),
     staleTime: 10_000,
   });
   const fileContent = fileContentQuery.data;

@@ -56,6 +56,7 @@ import { useTheme } from "@/hooks/use-theme";
 import { listWorkspaceFiles } from "@/lib/codex-relay-api";
 import { hapticMediumImpact, hapticSelection, hapticWarning } from "@/lib/haptics";
 import { formatRateLimitRemaining, visibleRateLimitRows } from "@/lib/rate-limits";
+import { workspaceFilesQueryKeyPrefix } from "@/lib/workspace-file-queries";
 import {
   chatStore$,
   composerThreadKey,
@@ -72,8 +73,8 @@ const ATTACH_SHEET_DISMISS_DELAY_MS = 260;
 const ADD_SHEET_KEYBOARD_DISMISS_FALLBACK_MS = 360;
 const FILE_MENTION_INDICATOR = "@";
 const SKILL_MENTION_INDICATOR = "$";
-const DEFAULT_COMPOSER_PLACEHOLDER = "Ask Codex anything. Try $skills or @files.";
-const PLAN_COMPOSER_PLACEHOLDER = "Ask Codex for a plan. Try $skills or @files.";
+const DEFAULT_COMPOSER_PLACEHOLDER = "";
+const PLAN_COMPOSER_PLACEHOLDER = "";
 const SUGGESTION_ROW_ESTIMATED_SIZE = 44;
 const SUGGESTION_LIST_GAP = 2;
 const SUGGESTION_LIST_MAX_HEIGHT = 270;
@@ -257,8 +258,10 @@ export const ChatComposer = memo(function ChatComposer({
   onSaveGoal,
   onToggleGoalPause,
   rateLimitBuckets,
+  serverUrl,
   skills,
   skillsLoadState,
+  workspaceId,
   workspacePath,
 }: {
   contextWindowUsage?: ContextWindowUsage;
@@ -295,8 +298,10 @@ export const ChatComposer = memo(function ChatComposer({
   onSaveGoal?: (objective: string) => void;
   onToggleGoalPause?: () => void;
   rateLimitBuckets: RateLimitBucket[];
+  serverUrl: string;
   skills: AgentSkill[];
   skillsLoadState: "idle" | "loading" | "loaded" | "failed";
+  workspaceId?: string;
   workspacePath?: string;
 }) {
   const theme = useTheme();
@@ -363,8 +368,15 @@ export const ChatComposer = memo(function ChatComposer({
   const shouldFetchFileSuggestions = Boolean(fileMentionQuery !== undefined && !disabled);
   const fileSuggestionsQuery = useQuery({
     enabled: shouldFetchFileSuggestions,
-    queryFn: () => listWorkspaceFiles({ query: fileMentionQuery, workspacePath }),
-    queryKey: ["codex-relay-workspace-files", workspacePath ?? null, fileMentionQuery ?? ""],
+    queryFn: () => listWorkspaceFiles({ query: fileMentionQuery, workspaceId, workspacePath }),
+    queryKey: [
+      ...workspaceFilesQueryKeyPrefix(serverUrl, {
+        workspaceId,
+        workspacePath,
+      }),
+      "mentions",
+      fileMentionQuery ?? "",
+    ],
     staleTime: 10_000,
   });
   const visibleFiles = fileSuggestionsQuery.data?.files ?? [];

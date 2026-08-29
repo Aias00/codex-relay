@@ -1,7 +1,20 @@
-export const workspaceFileContentQueryKey = (
-  workspacePath: string | undefined,
-  path: string | null,
-) => ["codex-relay-workspace-preview-file", workspacePath ?? null, path] as const;
+import type { WorkspaceSelectionRequest } from "codex-relay/api-schema";
 
-export const workspaceFilesQueryKeyPrefix = (workspacePath: string | undefined) =>
-  ["codex-relay-workspace-preview-files", workspacePath ?? null] as const;
+import { workspaceCacheIdentity } from "./server-state-workspace-cache";
+
+export const workspaceFileContentQueryKey = (
+  serverUrl: string,
+  selection: WorkspaceSelectionRequest,
+  path: string | null,
+) =>
+  [
+    "codex-relay-workspace-preview-file",
+    serverUrl,
+    workspaceCacheIdentity(selection),
+    path,
+  ] as const;
+
+export const workspaceFilesQueryKeyPrefix = (
+  serverUrl: string,
+  selection: WorkspaceSelectionRequest,
+) => ["codex-relay-workspace-preview-files", serverUrl, workspaceCacheIdentity(selection)] as const;

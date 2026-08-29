@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { isMobileShipRelease, nextMobileShipVersion } from "./mobile-release-version.mjs";
-import { splitMixedChangesets } from "./version-packages.mjs";
+import { replaceIosMarketingVersions, splitMixedChangesets } from "./version-packages.mjs";
 
 const mixedReleaseChangeset = {
   id: "mixed-release",
@@ -116,4 +116,14 @@ test("waits for the relay package release before preparing the mobile OTA", () =
     releaseWorkflow,
     /if \(process\.env\.MOBILE_RELEASE_VERSION && !process\.env\.RELAY_RELEASE_VERSION\)/,
   );
+});
+
+test("updates every iOS marketing version during a mobile release", () => {
+  const outdatedProject = "MARKETING_VERSION = 1.0;\nMARKETING_VERSION = 1.0;\n";
+
+  assert.equal(
+    replaceIosMarketingVersions(outdatedProject, "1.4.0"),
+    "MARKETING_VERSION = 1.4.0;\nMARKETING_VERSION = 1.4.0;\n",
+  );
+  assert.throws(() => replaceIosMarketingVersions("VERSION = 1.0;", "1.4.0"));
 });

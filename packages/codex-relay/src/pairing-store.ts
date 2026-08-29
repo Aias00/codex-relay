@@ -52,6 +52,7 @@ export type PairingSessionStore = {
     clientSessionId: string,
   ): Promise<PushNotificationSubscription | undefined>;
   getValidSession(tokenHash: string): Promise<ClientSession | undefined>;
+  listPendingPairings(now: number): Promise<PendingPairing[]>;
   listActivePushNotificationSubscriptions(): Promise<PushNotificationSubscription[]>;
   pruneExpiredPendingPairings(now: number): Promise<void>;
   rotateSession(
@@ -324,6 +325,34 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
         expiresAt: Number(row.expiresAt),
         secureSession: decodeSecureSession(row),
       };
+    },
+    async listPendingPairings(now) {
+      await db.prepare("DELETE FROM pending_pairings WHERE expires_at <= ?").run(now);
+      const rows = await db
+        .prepare(
+          `SELECT approval_code AS approvalCode,
+                  client_session_id AS clientSessionId,
+                  client_name AS clientName,
+                  client_ephemeral_public_key AS clientEphemeralPublicKey,
+                  client_nonce AS clientNonce,
+                  server_url AS serverUrl,
+                  approved,
+                  expires_at AS expiresAt
+           FROM pending_pairings
+           WHERE expires_at > ?
+           ORDER BY updated_at DESC, created_at DESC, rowid DESC`,
+        )
+        .all(now);
+      return resultRows(rows).map((row) => ({
+        approvalCode: String(row.approvalCode),
+        approved: Number(row.approved) === 1,
+        clientEphemeralPublicKey: String(row.clientEphemeralPublicKey),
+        clientSessionId: typeof row.clientSessionId === "string" ? row.clientSessionId : undefined,
+        clientName: typeof row.clientName === "string" ? row.clientName : undefined,
+        clientNonce: String(row.clientNonce),
+        expiresAt: Number(row.expiresAt),
+        serverUrl: String(row.serverUrl),
+      }));
     },
     async listActivePushNotificationSubscriptions() {
       const rows = await db

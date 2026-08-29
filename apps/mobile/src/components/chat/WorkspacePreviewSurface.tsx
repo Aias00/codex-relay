@@ -78,6 +78,7 @@ export function WorkspacePreviewSurface({
   serverUrl,
   workspaceChanges,
   workspaceChangesError,
+  workspaceId,
   workspacePath,
   markdownPreviewTarget,
   webPreviewTarget,
@@ -94,6 +95,7 @@ export function WorkspacePreviewSurface({
   serverUrl: string;
   workspaceChanges?: WorkspaceChangesResponse;
   workspaceChangesError?: string;
+  workspaceId?: string;
   workspacePath?: string;
   markdownPreviewTarget?: WorkspaceMarkdownPreviewTarget;
   webPreviewTarget?: WebPreviewTarget;
@@ -299,10 +301,16 @@ export function WorkspacePreviewSurface({
                   onRefreshChanges={onRefreshChanges}
                 />
               ) : tab === "files" ? (
-                <FileWorkspacePreviewTab workspacePath={workspacePath} />
+                <FileWorkspacePreviewTab
+                  serverUrl={serverUrl}
+                  workspaceId={workspaceId}
+                  workspacePath={workspacePath}
+                />
               ) : tab === "markdown" ? (
                 <MarkdownWorkspacePreviewTab
+                  serverUrl={serverUrl}
                   target={markdownPreviewTarget}
+                  workspaceId={workspaceId}
                   workspacePath={workspacePath}
                 />
               ) : tab === "web" ? (
@@ -312,7 +320,7 @@ export function WorkspacePreviewSurface({
                   webPreviewTarget={webPreviewTarget}
                 />
               ) : (
-                <WorkspaceSshTerminalTab workspacePath={workspacePath} />
+                <WorkspaceSshTerminalTab workspaceId={workspaceId} workspacePath={workspacePath} />
               )}
             </Animated.View>
           ))

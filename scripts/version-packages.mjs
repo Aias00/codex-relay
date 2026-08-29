@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,10 @@ const workspaceRoot = fileURLToPath(new URL("..", import.meta.url));
 const mobileRoot = resolve(workspaceRoot, "apps/mobile");
 const mobilePackagePath = resolve(workspaceRoot, "apps/mobile/package.json");
 const mobileChangelogPath = resolve(workspaceRoot, "apps/mobile/CHANGELOG.md");
+const iosProjectPath = resolve(
+  workspaceRoot,
+  "apps/mobile/ios/CodexRelay.xcodeproj/project.pbxproj",
+);
 const changesetDirectory = resolve(workspaceRoot, ".changeset");
 const ignoredPackagesByTarget = {
   npm: [mobilePackageName, "react-native-direct-fetch"],
@@ -63,6 +67,7 @@ function main() {
 
   if (targetMobileVersion) {
     applyMobileShipVersion(targetMobileVersion);
+    syncIosMarketingVersion(readConfiguredAppVersion());
   }
 }
 
@@ -122,6 +127,22 @@ function applyMobileShipVersion(targetVersion) {
   writeFileSync(mobileChangelogPath, changelog.replace(generatedHeading, `## ${targetVersion}`));
 
   console.log(`Versioned ${mobilePackageName} as ${targetVersion}`);
+}
+
+export function syncIosMarketingVersion(appVersion) {
+  if (!existsSync(iosProjectPath)) {
+    return false;
+  }
+  const xcodeProject = readFileSync(iosProjectPath, "utf8");
+  writeFileSync(iosProjectPath, replaceIosMarketingVersions(xcodeProject, appVersion));
+  return true;
+}
+
+export function replaceIosMarketingVersions(xcodeProject, appVersion) {
+  if (!/MARKETING_VERSION = [^;]+;/.test(xcodeProject)) {
+    throw new Error("Could not find MARKETING_VERSION in apps/mobile/ios project.");
+  }
+  return xcodeProject.replace(/MARKETING_VERSION = [^;]+;/g, `MARKETING_VERSION = ${appVersion};`);
 }
 
 function readJson(path) {

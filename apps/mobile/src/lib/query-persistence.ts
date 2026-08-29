@@ -2,7 +2,7 @@ import { createAsyncStoragePersister } from "@tanstack/query-async-storage-persi
 import { defaultShouldDehydrateQuery, type Query } from "@tanstack/react-query";
 import { createMMKV } from "react-native-mmkv";
 
-import { isPersistableServerStateQueryKey } from "@/lib/server-state";
+import { isPersistableServerStateQueryKey } from "@/lib/server-state-persistence";
 
 const storage = createMMKV({ id: "codex-relay-query-cache" });
 

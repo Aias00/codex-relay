@@ -9,7 +9,7 @@ vi.mock("../src/debug-log.js", () => ({
   relayDebugLog: vi.fn<(event: string, fields?: Record<string, unknown>) => void>(),
 }));
 
-import { CodexAppServerClient } from "../src/app-server.js";
+import { CodexAppServerClient, type AppServerConnectionStateEvent } from "../src/app-server.js";
 import { relayDebugLog } from "../src/debug-log.js";
 
 type JsonRpcRequest = {
@@ -42,6 +42,11 @@ describe("CodexAppServerClient shared socket mode", () => {
       throw new Error("Expected the client to attach to the existing shared app-server.");
     });
     const client = new CodexAppServerClient({ startSharedServer });
+    const connectionStates: AppServerConnectionStateEvent[] = [];
+    client.onConnectionState(() => {
+      throw new Error("broken connection listener");
+    });
+    client.onConnectionState((event) => connectionStates.push(event));
 
     try {
       await client.initialize();
@@ -96,6 +101,20 @@ describe("CodexAppServerClient shared socket mode", () => {
       expect(relayDebugLog).toHaveBeenCalledWith("app_server.shared_socket.reconnected", {
         ownership: "attached",
         socketPath,
+      });
+      expect(connectionStates).toEqual([
+        { mode: "socket", ownership: "attached", state: "disconnected" },
+        { mode: "socket", ownership: "attached", state: "reconnected" },
+      ]);
+      expect(relayDebugLog).toHaveBeenCalledWith("app_server.connection_state_handler.failed", {
+        message: "broken connection listener",
+        ownership: "attached",
+        state: "disconnected",
+      });
+      expect(relayDebugLog).toHaveBeenCalledWith("app_server.connection_state_handler.failed", {
+        message: "broken connection listener",
+        ownership: "attached",
+        state: "reconnected",
       });
     } finally {
       client.close();

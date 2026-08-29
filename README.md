@@ -181,28 +181,35 @@ release pull request and publishes it after that pull request is merged. See
 
 ## Common Commands
 
-| Command                                      | What it does                                        |
-| -------------------------------------------- | --------------------------------------------------- |
-| `npx codex-relay@latest`                     | Start the relay and print a pairing QR.             |
-| `npx codex-relay@latest --bg`                | Keep the relay running in the background.           |
-| `npx codex-relay@latest --shared-app-server` | Share live sessions with an attached terminal TUI.  |
-| `npx codex-relay@latest qr`                  | Print the current pairing QR for an existing relay. |
-| `npx codex-relay@latest approve XXXX-XXXX`   | Approve a pending mobile pairing request.           |
-| `npx codex-relay@latest clear`               | Sign out every paired mobile app.                   |
+| Command                                             | What it does                                        |
+| --------------------------------------------------- | --------------------------------------------------- |
+| `npx codex-relay@latest`                            | Start the relay and print a pairing QR.             |
+| `npx codex-relay@latest --bg`                       | Keep the relay running in the background.           |
+| `npx codex-relay@latest --shared-app-server`        | Share live sessions with an attached terminal TUI.  |
+| `npx codex-relay@latest qr`                         | Print the current pairing QR for an existing relay. |
+| `npx codex-relay@latest approve XXXX-XXXX`          | Approve a pending mobile pairing request.           |
+| `npx codex-relay@latest clear`                      | Sign out every paired mobile app.                   |
+| `npx codex-relay@latest diagnostics`                | Inspect content-safe durable state counts.          |
+| `npx codex-relay@latest backup`                     | Create consistent SQLite backups.                   |
+| `npx codex-relay@latest compact THREAD --through N` | Compact one thread through an event sequence.       |
+| `npx codex-relay@latest repair-owner THREAD`        | Repair an expired owner lease.                      |
 
 ## Configuration
 
 The relay listens on `0.0.0.0:8787` by default.
 
-| Variable                      | Purpose                                                             |
-| ----------------------------- | ------------------------------------------------------------------- |
-| `PORT`                        | Server port. Defaults to `8787`.                                    |
-| `HOST`                        | Listen host. Defaults to `0.0.0.0`.                                 |
-| `CODEX_RELAY_WORKSPACE_PATH`  | Workspace path Codex should use. Defaults to the current directory. |
-| `CODEX_RELAY_AUTH_DB_PATH`    | Pairing and session database path.                                  |
-| `CODEX_RELAY_APP_SERVER_MODE` | `socket` for shared terminal/mobile sessions; defaults to `stdio`.  |
-| `CODEX_BIN`                   | Codex CLI executable path.                                          |
-| `CODEX_HOME`                  | Codex home directory for reading local session metadata.            |
+| Variable                        | Purpose                                                                                        |
+| ------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `PORT`                          | Server port. Defaults to `8787`.                                                               |
+| `HOST`                          | Listen host. Defaults to `0.0.0.0`.                                                            |
+| `CODEX_RELAY_WORKSPACE_PATH`    | Workspace path Codex should use. Defaults to the current directory.                            |
+| `CODEX_RELAY_AUTH_DB_PATH`      | Pairing and session database path.                                                             |
+| `CODEX_RELAY_MAX_THREAD_EVENTS` | Optional per-thread durable event retention limit. Unset keeps all events.                     |
+| `CODEX_RELAY_OWNER_LEASE_MS`    | Optional cross-process owner lease duration in milliseconds. Unset disables lease enforcement. |
+| `CODEX_RELAY_PUBLIC_URL`        | Public URL to prefer in the pairing QR, such as a Cloudflare Tunnel URL.                       |
+| `CODEX_RELAY_APP_SERVER_MODE`   | `socket` for shared terminal/mobile sessions; defaults to `stdio`.                             |
+| `CODEX_BIN`                     | Codex CLI executable path.                                                                     |
+| `CODEX_HOME`                    | Codex home directory for reading local session metadata.                                       |
 
 Background mode writes runtime files under `.codex-relay/` in the current
 workspace, including server logs, process state, and pairing data.

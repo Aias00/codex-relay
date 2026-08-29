@@ -183,6 +183,16 @@ export function reconcileThreadRunEventAfterTerminal(
   }
 }
 
+export function isThreadMessageStreamEvent(event: StreamThreadRunEvent) {
+  return event.type.startsWith("thread.message.");
+}
+
+export function isThreadActiveWriterStreamEvent(
+  event: StreamThreadRunEvent,
+): event is Extract<StreamThreadRunEvent, { type: "thread.error" }> {
+  return event.type === "thread.error" && event.error.code === "thread_active_writer";
+}
+
 export function handleThreadRunStreamEvent(
   event: StreamThreadRunEvent,
   options: HandleThreadRunStreamEventOptions,

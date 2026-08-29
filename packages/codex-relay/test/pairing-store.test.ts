@@ -142,6 +142,42 @@ describe("pairing session store", () => {
     });
   });
 
+  it("lists unexpired pending pairing requests newest first", async () => {
+    const sessions = await createTursoPairingSessionStore(":memory:");
+    const now = Date.now();
+    await sessions.createPendingPairing({
+      approvalCode: "OLD1-CODE",
+      approved: false,
+      clientEphemeralPublicKey: "old-public-key",
+      clientName: "old phone",
+      clientNonce: "old-nonce",
+      expiresAt: now + 60_000,
+      serverUrl: "http://127.0.0.1:8787",
+    });
+    await sessions.createPendingPairing({
+      approvalCode: "NEW1-CODE",
+      approved: false,
+      clientEphemeralPublicKey: "new-public-key",
+      clientName: "new phone",
+      clientNonce: "new-nonce",
+      expiresAt: now + 60_000,
+      serverUrl: "http://127.0.0.1:8787",
+    });
+    await sessions.createPendingPairing({
+      approvalCode: "EXPI-REDD",
+      approved: false,
+      clientEphemeralPublicKey: "expired-public-key",
+      clientNonce: "expired-nonce",
+      expiresAt: now - 1,
+      serverUrl: "http://127.0.0.1:8787",
+    });
+
+    expect(await sessions.listPendingPairings(now)).toEqual([
+      expect.objectContaining({ approvalCode: "NEW1-CODE", clientName: "new phone" }),
+      expect.objectContaining({ approvalCode: "OLD1-CODE", clientName: "old phone" }),
+    ]);
+  });
+
   it("rolls back a token rotation when the replacement token already exists", async () => {
     const sessions = await createTursoPairingSessionStore(":memory:");
     const expiresAt = Date.now() + 60_000;

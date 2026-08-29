@@ -1,7 +1,7 @@
 import { LegendList, type LegendListRenderItemProps } from "@legendapp/list/react-native";
 import { useSelector } from "@legendapp/state/react";
 import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
-import type { ThreadSummary } from "codex-relay/api-schema";
+import type { ThreadDetailResponse, ThreadSummary } from "codex-relay/api-schema";
 import { router } from "expo-router";
 import type { Drawer } from "expo-router/drawer";
 import type { ComponentProps } from "react";
@@ -45,21 +45,29 @@ import { hapticLightImpact, hapticSelection, hapticSuccess } from "@/lib/haptics
 import {
   archiveThreadServerState,
   createThreadServerState,
+  fetchStatusState,
   fetchThreadState,
   fetchThreadsState,
   fetchWorkspaceDirectoriesState,
   optimisticallyArchiveThreadState,
+  replayThreadEventsState,
   renameThreadServerState,
   restoreOptimisticArchiveThreadState,
   serverStateKeys,
   serverStateQueryFns,
+  setStatusState,
   setThreadDetailState,
-  setThreadRunningState,
   setThreadsState,
 } from "@/lib/server-state";
+import {
+  shouldBlockThreadActivation,
+  threadDetailSwitchStaleTimeMs,
+  workspaceSelectionForThread,
+} from "@/lib/thread-activation";
 import { evaluateRelayVersion, type RelayVersionCompatibility } from "@/lib/version-policy";
 import { workspaceName } from "@/lib/workspace-name";
 import {
+  activateWorkspaceThread,
   chatStore$,
   requestThreadStreamReconnect,
   setActiveThread,
@@ -163,11 +171,22 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
   const insets = useSafeAreaInsets();
   const theme = useTheme();
   const queryClient = useQueryClient();
+  const selectedWorkspaceId = useSelector(() => chatStore$.workspaceId.get());
+  const selectedWorkspacePath = useSelector(() => chatStore$.workspacePath.get());
+  const selectedWorkspaceSelection = useMemo(
+    () => ({ workspaceId: selectedWorkspaceId, workspacePath: selectedWorkspacePath }),
+    [selectedWorkspaceId, selectedWorkspacePath],
+  );
   const createThreadMutation = useMutation({
     mutationFn: (body: Parameters<typeof createThreadServerState>[1]) =>
       createThreadServerState(queryClient, body),
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: serverStateKeys.threads() });
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: serverStateKeys.threads(selectedWorkspaceSelection),
+        }),
+        queryClient.invalidateQueries({ queryKey: serverStateKeys.threads({}) }),
+      ]);
     },
   });
   const archiveThreadMutation = useMutation({
@@ -176,10 +195,10 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
       const previousActiveThreadId = chatStore$.activeThreadId.peek();
       const currentThreads =
         queryClient.getQueryData<Awaited<ReturnType<typeof serverStateQueryFns.threads>>>(
-          serverStateKeys.threads(),
+          serverStateKeys.threads({}),
         )?.threads ?? [];
       const nextActiveThreadId = currentThreads.find((thread) => thread.id !== threadId)?.id;
-      const snapshot = await optimisticallyArchiveThreadState(queryClient, threadId);
+      const snapshot = await optimisticallyArchiveThreadState(queryClient, threadId, {});
       if (previousActiveThreadId === threadId) {
         setActiveThread(nextActiveThreadId);
       }
@@ -196,7 +215,12 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
     },
     onSuccess: async (_response, threadId) => {
       unpinThread(threadId);
-      await queryClient.invalidateQueries({ queryKey: serverStateKeys.threads() });
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: serverStateKeys.threads(selectedWorkspaceSelection),
+        }),
+        queryClient.invalidateQueries({ queryKey: serverStateKeys.threads({}) }),
+      ]);
     },
   });
   const renameThreadMutation = useMutation({
@@ -206,14 +230,14 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
   const activeThreadId = useSelector(() => chatStore$.activeThreadId.get());
   const pinnedThreadIds = useSelector(() => pinnedThreadStore$.threadIds.get());
   const statusQuery = useQuery({
-    queryKey: serverStateKeys.status(),
-    queryFn: serverStateQueryFns.status,
+    queryKey: serverStateKeys.status(selectedWorkspaceSelection),
+    queryFn: () => serverStateQueryFns.status(selectedWorkspaceSelection),
     enabled: false,
   });
   const threadsQuery = useQuery({
-    queryKey: serverStateKeys.threads(),
-    queryFn: serverStateQueryFns.threads,
-    enabled: false,
+    queryKey: serverStateKeys.threads({}),
+    queryFn: () => serverStateQueryFns.threads({}),
+    enabled: isDrawerVisible,
   });
   const versionQuery = useQuery({
     queryKey: serverStateKeys.version(),
@@ -631,13 +655,39 @@ function useThreadDrawerActions({
   const activateSelectedThread = useCallback(
     async (threadId: string, selectionGeneration: number) => {
       const selectedThread = threadsById[threadId];
-      setActiveThread(threadId);
-      setThreadMessagesLoading(threadId, true);
+      const targetSelection = selectedThread
+        ? workspaceSelectionForThread(selectedThread)
+        : {
+            workspaceId: chatStore$.workspaceId.peek(),
+            workspacePath: chatStore$.workspacePath.peek(),
+          };
+      const cachedDetail = queryClient.getQueryData<ThreadDetailResponse>(
+        serverStateKeys.thread(threadId, targetSelection),
+      );
+      if (selectedThread) {
+        activateWorkspaceThread(threadId, targetSelection);
+      } else {
+        setActiveThread(threadId);
+      }
+      setThreadMessagesLoading(threadId, shouldBlockThreadActivation(cachedDetail));
       try {
-        const response = await fetchThreadState(queryClient, threadId);
+        const [response, status] = await Promise.all([
+          fetchThreadState(queryClient, threadId, {
+            staleTime: threadDetailSwitchStaleTimeMs,
+          }),
+          fetchStatusState(queryClient, targetSelection),
+        ]);
         if (selectionGeneration !== threadSelectionGenerationRef.current) {
           return;
         }
+        setThreadDetailState(
+          queryClient,
+          response.thread,
+          response.messages,
+          response.pendingInputRequests,
+        );
+        setStatusState(queryClient, status);
+        void replayThreadEventsState(queryClient, threadId).catch(() => undefined);
         setActiveThread(response.thread.id);
         if (response.thread.state === "running") {
           requestThreadStreamReconnect(threadId);
@@ -648,7 +698,6 @@ function useThreadDrawerActions({
           return;
         }
         syncPairedSessionState();
-        setThreadRunningState(queryClient, selectedThread?.id ?? threadId, false);
         setConnection(
           "offline",
           caught instanceof Error ? caught.message : "Unable to load this Codex thread.",
@@ -721,6 +770,13 @@ function useThreadDrawerActions({
           workspacePath: selectedWorkspacePath,
         });
         setThreadDetailState(queryClient, response.thread, response.messages);
+        if (response.thread.cwd) {
+          const status = await fetchStatusState(queryClient, {
+            workspaceId: response.thread.workspaceId,
+            workspacePath: response.thread.cwd,
+          });
+          setStatusState(queryClient, status);
+        }
         setActiveThread(response.thread.id);
         setConnection("connected");
         hapticSuccess();
@@ -763,8 +819,8 @@ function useThreadDrawerActions({
     setConnection("checking");
     hapticLightImpact();
     try {
-      const response = await fetchThreadsState(queryClient);
-      setThreadsState(queryClient, response.threads, response.source);
+      const response = await fetchThreadsState(queryClient, {});
+      setThreadsState(queryClient, response.threads, response.source, {});
       const currentActiveThreadId = chatStore$.activeThreadId.peek();
       if (
         currentActiveThreadId &&

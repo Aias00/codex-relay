@@ -43,7 +43,13 @@ const terminalArrowSequences = {
   up: "\x1b[A",
 };
 
-export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: string }) {
+export function WorkspaceSshTerminalTab({
+  workspaceId,
+  workspacePath,
+}: {
+  workspaceId?: string;
+  workspacePath?: string;
+}) {
   const terminalIdRef = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
   const terminalInputRef = useRef<TextInput>(null);
@@ -296,6 +302,7 @@ export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: str
           createWorkspaceTerminalSession({
             cols,
             rows,
+            workspaceId,
             workspacePath,
           }),
         );
@@ -319,7 +326,7 @@ export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: str
         );
       },
     });
-  }, [reconnectRequestId, terminalFontSize, terminalId, workspacePath]);
+  }, [reconnectRequestId, terminalFontSize, terminalId, workspaceId, workspacePath]);
 
   useEffect(() => {
     postWorkspaceSshTerminalState({
@@ -328,7 +335,7 @@ export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: str
       terminalId,
       workspacePath,
     });
-  }, [reconnectRequestId, terminalFontSize, terminalId, workspacePath]);
+  }, [reconnectRequestId, terminalFontSize, terminalId, workspaceId, workspacePath]);
 
   useEffect(
     () => () => {

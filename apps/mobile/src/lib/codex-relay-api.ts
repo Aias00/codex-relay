@@ -4,12 +4,15 @@ import {
   ArchiveThreadResponseSchema,
   CheckoutWorkspaceBranchRequestSchema,
   CommitPushWorkspaceRequestSchema,
+  ConnectionPlanResponseSchema,
   CreateThreadResponseSchema,
+  HealthResponseSchema,
   InterruptThreadRunResponseSchema,
   ImageAttachmentUploadResponseSchema,
   ListModelsResponseSchema,
   ListQueuedThreadInputsResponseSchema,
   ListSkillsResponseSchema,
+  ListThreadEventsResponseSchema,
   ListThreadsResponseSchema,
   ListWorkspaceFilesResponseSchema,
   ListWorkspaceDirectoriesResponseSchema,
@@ -51,6 +54,7 @@ import {
   type ListModelsResponse,
   type ListQueuedThreadInputsResponse,
   type ListSkillsResponse,
+  type ListThreadEventsResponse,
   type ListThreadsResponse,
   type ListWorkspaceFilesResponse,
   type ListWorkspaceDirectoriesResponse,
@@ -75,6 +79,7 @@ import {
   type ThreadGoalResponse,
   type ThreadMessageDetailField,
   type ThreadMessageDetailResponse,
+  type ThreadOwnerMutationRequest,
   type UpdateThreadGoalRequest,
   type UpdateWorkspaceFileContentRequest,
   type UpdateRuntimePreferencesRequest,
@@ -108,6 +113,12 @@ import {
 } from "./thread-run-stream";
 import { requestWithNetworkTimeout, withTimeout } from "./network-timeout";
 import {
+  clearCodexRelayConnectionPlanState,
+  clearStoredConnectionPlan,
+  requestWithConnectionCandidateRefresh,
+  resolveConnectionPlanRoute,
+} from "./codex-relay-connection-plan";
+import {
   clearCodexRelayServerUrlState,
   codexRelayStorage as storage,
   dedupeServerUrls,
@@ -115,13 +126,16 @@ import {
   getCodexRelayServerUrl,
   getCodexRelayServerUrlCandidates,
   isCarrierGradePrivateIPv4Host,
+  isConnectableServerUrl,
   isLocalIPv6Host,
   isPrivateIPv4Host,
   normalizeServerUrl,
   saveCodexRelayServerUrlCandidates,
   setCodexRelayServerUrl,
+  sortServerUrlsByConnectionPreference,
   type CodexRelayServerUrlCandidate,
 } from "./codex-relay-server-url-storage";
+import { workspaceSelectionQuery } from "./server-state-workspace-cache";
 
 const skillsPath = "/v1/skills";
 const skillsRequestTimeoutMs = 8000;
@@ -129,11 +143,22 @@ const clientSessionIdStorageKey = "codex-relay.client-session-id";
 const legacyClientTokenExpiresAtStorageKey = "codex-relay.client-token-expires-at";
 const clientTokenStorageKey = "codex-relay.client-token";
 const pairingConnectTimeoutMs = 2500;
+const fullThreadRefreshTimeoutMs = 45_000;
 const streamRequestTimeoutMs = 10 * 60 * 1000;
 const terminalStreamRequestTimeoutMs = 24 * 60 * 60 * 1000;
 
+let connectionPlanUnavailableForCurrentSession = false;
+let connectionPlanPreparedForCurrentSession = false;
+let connectionPlanRefreshPromise: Promise<boolean> | undefined;
+let connectionPlanSessionGeneration = 0;
+
 type NetworkRequestInit = RequestInit & {
   timeoutMs?: number;
+};
+
+type RequestAttempt = {
+  response: Response;
+  serverUrl: string;
 };
 
 type PairingQrPayload = {
@@ -211,7 +236,11 @@ export function signOutCodexRelaySession() {
   storage.remove(clientTokenStorageKey);
   storage.remove(legacyClientTokenExpiresAtStorageKey);
   clearSecureSession();
+  clearCodexRelayConnectionPlanState();
   clearCodexRelayServerUrlState();
+  connectionPlanUnavailableForCurrentSession = false;
+  connectionPlanPreparedForCurrentSession = false;
+  connectionPlanSessionGeneration += 1;
 }
 
 export function hasCodexRelaySession() {
@@ -224,11 +253,20 @@ export async function pairWithQrPayload(
 ) {
   const pairingPayload = parsePairingQrPayload(payload);
   const connectionErrors: PairingCandidateConnectionError[] = [];
+  const serverUrls = sortServerUrlsByConnectionPreference(pairingPayload.serverUrls).filter(
+    isConnectableServerUrl,
+  );
 
-  for (const serverUrl of pairingPayload.serverUrls) {
+  for (const serverUrl of serverUrls) {
     try {
-      const paired = await pairWithApproval(serverUrl, pairingPayload.serverPublicKey, handlers);
-      saveCodexRelayServerUrlCandidates([paired.serverUrl, ...pairingPayload.serverUrls]);
+      const paired = await pairWithApproval(
+        serverUrl,
+        pairingPayload.serverPublicKey,
+        serverUrls,
+        handlers,
+      );
+      saveCodexRelayServerUrlCandidates([paired.serverUrl, ...serverUrls]);
+      await refreshCodexRelayConnectionPlan().catch(() => undefined);
       return {
         ...pairingPayload,
         serverUrl: paired.serverUrl,
@@ -247,6 +285,7 @@ export async function pairWithQrPayload(
 async function pairWithApproval(
   serverUrl: string,
   serverPublicKey: string,
+  serverUrls: string[],
   handlers?: { onApprovalCode?: (approvalCode: string, serverUrl: string) => void },
 ) {
   const normalizedServerUrl = normalizeServerUrl(serverUrl);
@@ -290,38 +329,61 @@ async function pairWithApproval(
 
   attachApprovalCode(securePairing, parsed.approvalCode);
   handlers?.onApprovalCode?.(parsed.approvalCode, normalizedServerUrl);
-  const approved = await waitForPairingApproval(normalizedServerUrl, parsed.approvalCode);
-  const session = completeSecurePairing(securePairing, approved);
-  saveSession(normalizedServerUrl, session.clientToken);
+  const approved = await waitForPairingApproval(
+    [normalizedServerUrl, ...serverUrls],
+    parsed.approvalCode,
+  );
+  const session = completeSecurePairing(securePairing, approved.response);
+  saveSession(approved.serverUrl, session.clientToken);
   await startPairingTrialIfNeeded();
-  return { approvalCode: parsed.approvalCode, serverUrl: normalizedServerUrl };
+  return { approvalCode: parsed.approvalCode, serverUrl: approved.serverUrl };
 }
 
-async function waitForPairingApproval(serverUrl: string, approvalCode: string) {
+async function waitForPairingApproval(serverUrls: string[], approvalCode: string) {
   const deadline = Date.now() + 5 * 60 * 1000;
+  const pollUrls = sortServerUrlsByConnectionPreference(serverUrls).filter(isConnectableServerUrl);
+  let lastError: string | undefined;
+
   while (Date.now() < deadline) {
-    const response = await fetchWithNetworkContext(
-      `${serverUrl}${apiPaths.pairApproval(approvalCode)}`,
-      {
-        headers: {
-          accept: "application/json",
-        },
-      },
-    );
-    const responsePayload = await response.json().catch(() => undefined);
-    if (response.status === 202) {
-      await sleep(1000);
-      continue;
+    for (const serverUrl of pollUrls) {
+      try {
+        const response = await fetchWithNetworkContext(
+          `${serverUrl}${apiPaths.pairApproval(approvalCode)}`,
+          {
+            headers: {
+              accept: "application/json",
+            },
+            timeoutMs: pairingConnectTimeoutMs,
+          },
+        );
+        const responsePayload = await response.json().catch(() => undefined);
+        if (response.status === 202) {
+          continue;
+        }
+        if (!response.ok) {
+          lastError = errorMessage(
+            responsePayload,
+            `Codex Relay server returned ${response.status}`,
+          );
+          continue;
+        }
+        return {
+          response: PairResponseSchema.parse(responsePayload),
+          serverUrl,
+        };
+      } catch (error) {
+        lastError = errorMessage(error, "network error");
+      }
     }
-    if (!response.ok) {
-      throw new Error(
-        errorMessage(responsePayload, `Codex Relay server returned ${response.status}`),
-      );
-    }
-    return PairResponseSchema.parse(responsePayload);
+
+    await sleep(1000);
   }
 
-  throw new Error("Pairing approval timed out.");
+  throw new Error(
+    lastError
+      ? `Pairing approval timed out after trying ${pollUrls.join(", ")}. Last error: ${lastError}`
+      : "Pairing approval timed out.",
+  );
 }
 
 async function fetchWithNetworkContext(url: string, init?: NetworkRequestInit) {
@@ -343,6 +405,18 @@ async function fetchWithNetworkContext(url: string, init?: NetworkRequestInit) {
     }
     return await requestWithNetworkTimeout(nitroFetch(url, init), init?.timeoutMs);
   } catch (error) {
+    if (useDirectFetch) {
+      try {
+        return await requestWithNetworkTimeout(fetch(url, init), init?.timeoutMs);
+      } catch (fallbackError) {
+        throw new Error(
+          `Network request failed via dfetch and fetch for ${url}: ${errorMessage(
+            fallbackError,
+            errorMessage(error, "network error"),
+          )}`,
+        );
+      }
+    }
     throw new Error(
       `Network request failed via ${transport} for ${url}: ${errorMessage(error, "network error")}`,
     );
@@ -402,7 +476,101 @@ function isLocalhostUrl(url: string) {
 
 export async function refreshSession() {
   storage.remove(legacyClientTokenExpiresAtStorageKey);
-  return hasCodexRelaySession();
+  if (!hasCodexRelaySession()) {
+    return false;
+  }
+  await refreshCodexRelayConnectionPlan({ force: true }).catch(() => undefined);
+  return true;
+}
+
+async function refreshCodexRelayConnectionPlan(options: { force?: boolean } = {}) {
+  if (connectionPlanUnavailableForCurrentSession || !storage.getString(clientTokenStorageKey)) {
+    return false;
+  }
+  if (!options.force && connectionPlanPreparedForCurrentSession) {
+    return false;
+  }
+  const generation = connectionPlanSessionGeneration;
+  if (connectionPlanRefreshPromise) {
+    const refreshed = await connectionPlanRefreshPromise;
+    if (generation !== connectionPlanSessionGeneration) {
+      return refreshCodexRelayConnectionPlan(options);
+    }
+    return refreshed;
+  }
+
+  const clientToken = storage.getString(clientTokenStorageKey);
+  const request = (async () => {
+    const bootstrapUrls = getCodexRelayServerUrlCandidates().map(({ url }) => url);
+    const resolution = await resolveConnectionPlanRoute({
+      bootstrapUrls,
+      fetchPlan: fetchConnectionPlanFromServer,
+      probeHealth: probeConnectionPlanCandidate,
+    });
+    if (
+      generation !== connectionPlanSessionGeneration ||
+      clientToken !== storage.getString(clientTokenStorageKey)
+    ) {
+      return false;
+    }
+    if (resolution.status === "legacy") {
+      if (resolution.planUnavailable) {
+        connectionPlanUnavailableForCurrentSession = true;
+      }
+      return false;
+    }
+
+    connectionPlanUnavailableForCurrentSession = false;
+    setCodexRelayServerUrl(resolution.candidate.url);
+    saveCodexRelayServerUrlCandidates([
+      resolution.candidate.url,
+      ...resolution.plan.candidates.map(({ url }) => url),
+      ...bootstrapUrls,
+    ]);
+    return true;
+  })();
+  connectionPlanRefreshPromise = request;
+  try {
+    return await request;
+  } finally {
+    if (generation === connectionPlanSessionGeneration) {
+      connectionPlanPreparedForCurrentSession = true;
+    }
+    if (connectionPlanRefreshPromise === request) {
+      connectionPlanRefreshPromise = undefined;
+    }
+  }
+}
+
+async function fetchConnectionPlanFromServer(serverUrl: string, timeoutMs: number) {
+  const response = await fetchWithNetworkContext(`${serverUrl}${apiPaths.connectionPlan}`, {
+    headers: requestHeaders(undefined, { jsonContentType: false }),
+    timeoutMs,
+  });
+  const payload = decryptResponsePayload(await response.json().catch(() => undefined));
+  if (response.status === 404) {
+    return { status: "unsupported" as const };
+  }
+  if (!response.ok) {
+    throw new CodexRelayApiError(
+      errorMessage(payload, `Codex Relay server returned ${response.status}`),
+      response.status,
+      errorCode(payload),
+    );
+  }
+  return {
+    plan: ConnectionPlanResponseSchema.parse(payload),
+    status: "available" as const,
+  };
+}
+
+async function probeConnectionPlanCandidate(candidate: { url: string }, timeoutMs: number) {
+  const response = await fetchWithNetworkContext(`${candidate.url}${apiPaths.health}`, {
+    headers: requestHeaders(undefined, { jsonContentType: false }),
+    timeoutMs,
+  });
+  const payload = decryptResponsePayload(await response.json().catch(() => undefined));
+  return response.ok ? HealthResponseSchema.parse(payload) : undefined;
 }
 
 function parsePairingQrPayload(payload: unknown): PairingQrPayload {
@@ -490,8 +658,16 @@ function pairingCandidateFailureMessage(errors: PairingCandidateConnectionError[
     : "Could not reach the server URL from the pairing QR.";
 }
 
-export async function getStatus(): Promise<StatusResponse> {
-  return request(apiPaths.status, undefined, StatusResponseSchema.parse);
+function workspaceQuery(input: WorkspaceSelectionRequest | string = {}) {
+  return workspaceSelectionQuery(input);
+}
+
+export async function getStatus(options: WorkspaceSelectionRequest = {}): Promise<StatusResponse> {
+  return request(
+    `${apiPaths.status}${workspaceQuery(options)}`,
+    undefined,
+    StatusResponseSchema.parse,
+  );
 }
 
 export async function getVersion(): Promise<VersionResponse> {
@@ -540,14 +716,23 @@ export async function unregisterPushNotifications(): Promise<PushNotificationSet
   );
 }
 
-export async function listThreads(): Promise<ListThreadsResponse> {
-  return request(apiPaths.threads, undefined, ListThreadsResponseSchema.parse);
+export async function listThreads(
+  options: WorkspaceSelectionRequest = {},
+): Promise<ListThreadsResponse> {
+  return request(
+    `${apiPaths.threads}${workspaceQuery(options)}`,
+    undefined,
+    ListThreadsResponseSchema.parse,
+  );
 }
 
-export async function archiveThread(threadId: string): Promise<ArchiveThreadResponse> {
+export async function archiveThread(
+  threadId: string,
+  body: ThreadOwnerMutationRequest = {},
+): Promise<ArchiveThreadResponse> {
   return request(
     apiPaths.threadArchive(threadId),
-    { method: "DELETE" },
+    { method: "DELETE", body: encryptRequestPayload(body) },
     ArchiveThreadResponseSchema.parse,
   );
 }
@@ -570,8 +755,10 @@ export async function listModels(): Promise<ListModelsResponse> {
   return request(apiPaths.models, undefined, ListModelsResponseSchema.parse);
 }
 
-export async function listSkills(workspacePath?: string): Promise<ListSkillsResponse> {
-  const query = workspacePath ? `?workspacePath=${encodeURIComponent(workspacePath)}` : "";
+export async function listSkills(
+  selection?: WorkspaceSelectionRequest | string,
+): Promise<ListSkillsResponse> {
+  const query = workspaceQuery(selection);
   return withTimeout(
     request(`${skillsPath}${query}`, undefined, ListSkillsResponseSchema.parse),
     skillsRequestTimeoutMs,
@@ -579,7 +766,12 @@ export async function listSkills(workspacePath?: string): Promise<ListSkillsResp
 }
 
 export async function listWorkspaceFiles(
-  input: { directory?: string; query?: string; workspacePath?: string } = {},
+  input: {
+    directory?: string;
+    query?: string;
+    workspaceId?: string;
+    workspacePath?: string;
+  } = {},
 ): Promise<ListWorkspaceFilesResponse> {
   const params = new URLSearchParams();
   if (input.directory) {
@@ -591,6 +783,9 @@ export async function listWorkspaceFiles(
   if (input.workspacePath) {
     params.set("workspacePath", input.workspacePath);
   }
+  if (input.workspaceId) {
+    params.set("workspaceId", input.workspaceId);
+  }
   const query = params.toString();
   return request(
     `${apiPaths.workspaceFiles}${query ? `?${query}` : ""}`,
@@ -601,12 +796,16 @@ export async function listWorkspaceFiles(
 
 export async function getWorkspaceFileContent(input: {
   path: string;
+  workspaceId?: string;
   workspacePath?: string;
 }): Promise<WorkspaceFileContentResponse> {
   const params = new URLSearchParams();
   params.set("path", input.path);
   if (input.workspacePath) {
     params.set("workspacePath", input.workspacePath);
+  }
+  if (input.workspaceId) {
+    params.set("workspaceId", input.workspaceId);
   }
   return request(
     `${apiPaths.workspaceFileContent}?${params.toString()}`,
@@ -642,10 +841,8 @@ export async function listWorkspaceDirectories(
 export async function getWorkspaceChanges(
   input?: WorkspaceSelectionRequest,
 ): Promise<WorkspaceChangesResponse> {
-  const workspacePath = input?.workspacePath?.trim();
-  const query = workspacePath ? `?workspacePath=${encodeURIComponent(workspacePath)}` : "";
   return request(
-    `${apiPaths.workspaceChanges}${query}`,
+    `${apiPaths.workspaceChanges}${workspaceQuery(input)}`,
     undefined,
     WorkspaceChangesResponseSchema.parse,
   );
@@ -693,6 +890,7 @@ export async function startWorkspaceTailscaleServe(
 export async function createWorkspaceTerminalSession(body: {
   cols: number;
   rows: number;
+  workspaceId?: string;
   workspacePath?: string;
 }): Promise<WorkspaceTerminalSessionResponse> {
   return request(
@@ -876,12 +1074,12 @@ export async function closeWorkspaceTerminalSession(sessionId: string) {
 
 async function requestNoContent(path: string, init: RequestInit) {
   const headers = requestHeaders(init.headers);
-  const serverRequestUrl = `${getCodexRelayServerUrl()}${path}`;
-  const response = await fetchWithNetworkContext(serverRequestUrl, {
+  const { response, serverUrl } = await fetchWithServerUrlFallback(path, {
     ...init,
     headers,
   });
   if (response.ok) {
+    promoteCodexRelayServerUrl(serverUrl);
     return;
   }
 
@@ -896,12 +1094,41 @@ export async function getRateLimits(): Promise<RateLimitsResponse> {
 
 export async function getThread(
   threadId: string,
-  options: { refresh?: boolean } = {},
+  options: { beforeMessageId?: string; refresh?: boolean } = {},
 ): Promise<ThreadDetailResponse> {
-  const path = options.refresh
-    ? `${apiPaths.thread(threadId)}?refresh=true`
-    : apiPaths.thread(threadId);
-  return request(path, undefined, ThreadDetailResponseSchema.parse);
+  const query = new URLSearchParams();
+  if (options.beforeMessageId) {
+    query.set("beforeMessageId", options.beforeMessageId);
+  }
+  if (options.refresh) {
+    query.set("refresh", "true");
+  }
+  const path = query.size > 0 ? `${apiPaths.thread(threadId)}?${query}` : apiPaths.thread(threadId);
+  return request(path, undefined, ThreadDetailResponseSchema.parse, {
+    timeoutMs: options.refresh ? fullThreadRefreshTimeoutMs : undefined,
+  });
+}
+
+export async function listThreadEvents(
+  threadId: string,
+  options: { afterSequence?: number; limit?: number } = {},
+): Promise<ListThreadEventsResponse> {
+  const query = new URLSearchParams({
+    afterSequence: String(options.afterSequence ?? 0),
+    limit: String(options.limit ?? 500),
+  });
+  return request(
+    `${apiPaths.threadEvents(threadId)}?${query}`,
+    undefined,
+    ListThreadEventsResponseSchema.parse,
+  );
+}
+
+export function isThreadEventReplayUnavailable(error: unknown) {
+  return (
+    error instanceof CodexRelayApiError &&
+    (error.status === 404 || (error.status === 503 && error.code === "event_replay_unavailable"))
+  );
 }
 
 export async function rewindThread(
@@ -958,11 +1185,15 @@ export async function updateThreadGoal(
   );
 }
 
-export async function clearThreadGoal(threadId: string): Promise<ThreadGoalResponse> {
+export async function clearThreadGoal(
+  threadId: string,
+  body: ThreadOwnerMutationRequest = {},
+): Promise<ThreadGoalResponse> {
   return request(
     apiPaths.threadGoal(threadId),
     {
       method: "DELETE",
+      body: encryptRequestPayload(body),
     },
     ThreadGoalResponseSchema.parse,
   );
@@ -1029,6 +1260,126 @@ export function streamThreadRun(
 
   return () => {
     source.close();
+  };
+}
+
+export function streamThreadEvents(
+  threadId: string,
+  afterSequence: number,
+  handlers: {
+    onEvent: (event: StreamThreadRunEvent) => void;
+    onError: (error: Error) => void;
+    onClose?: () => void;
+  },
+) {
+  const query = new URLSearchParams({ afterSequence: String(afterSequence) });
+  const requestUrl =
+    `${getCodexRelayServerUrl()}${apiPaths.threadEventsStream(threadId)}` + `?${query}`;
+  if (shouldUseDirectFetch(requestUrl)) {
+    return streamThreadEventsWithDirectFetch(requestUrl, handlers);
+  }
+
+  const source = new EventSource<StreamThreadRunEvent["type"]>(requestUrl, {
+    method: "GET",
+    headers: {
+      accept: "text/event-stream",
+      ...authorizationHeader(),
+    },
+    pollingInterval: 0,
+  });
+
+  for (const type of threadRunStreamEventTypes) {
+    source.addEventListener(type, (event) => {
+      if (!event.data) {
+        return;
+      }
+      try {
+        handlers.onEvent(parseThreadRunStreamPayload(event.data, decryptResponsePayload));
+      } catch {
+        handlers.onError(new Error("Codex Relay server returned an invalid stream event."));
+      }
+    });
+  }
+  source.addEventListener("error", (event) => {
+    const message = "message" in event ? event.message : "Codex Relay event stream failed.";
+    handlers.onError(new Error(message));
+  });
+  source.addEventListener("close", () => {
+    handlers.onClose?.();
+  });
+
+  return () => {
+    source.close();
+  };
+}
+
+function streamThreadEventsWithDirectFetch(
+  requestUrl: string,
+  handlers: {
+    onEvent: (event: StreamThreadRunEvent) => void;
+    onError: (error: Error) => void;
+    onClose?: () => void;
+  },
+) {
+  let closed = false;
+  const dispatcher = createThreadRunSseDispatcher(handlers, decryptResponsePayload);
+
+  function close() {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    handlers.onClose?.();
+  }
+
+  function fail(error: Error) {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    handlers.onError(error);
+  }
+
+  dfetchStream(
+    requestUrl,
+    {
+      method: "GET",
+      headers: streamRequestHeaders({ jsonContentType: false }),
+      timeoutMs: streamRequestTimeoutMs,
+    },
+    (text) => {
+      if (closed || dispatcher.push(text)) {
+        return;
+      }
+      closed = true;
+    },
+  )
+    .then((response) => {
+      if (closed) {
+        return;
+      }
+      if (!response.ok) {
+        void response.text().then((text) => {
+          let payload: unknown = text;
+          try {
+            payload = decryptResponsePayload(JSON.parse(text));
+          } catch {}
+          fail(new Error(errorMessage(payload, `Codex Relay server returned ${response.status}`)));
+        });
+        return;
+      }
+      if (!dispatcher.flush()) {
+        closed = true;
+        return;
+      }
+      close();
+    })
+    .catch((error: unknown) => {
+      fail(new Error(errorMessage(error, "Codex Relay event stream failed.")));
+    });
+
+  return () => {
+    closed = true;
   };
 }
 
@@ -1173,11 +1524,12 @@ export async function submitThreadInput(
   );
 }
 
-export async function interruptThreadRun(threadId: string) {
+export async function interruptThreadRun(threadId: string, body: ThreadOwnerMutationRequest = {}) {
   return request(
     apiPaths.threadRunInterrupt(threadId),
     {
       method: "POST",
+      body: encryptRequestPayload(body),
     },
     InterruptThreadRunResponseSchema.parse,
   );
@@ -1196,11 +1548,13 @@ export async function listQueuedThreadInputs(
 export async function removeQueuedThreadInput(
   threadId: string,
   inputId: string,
+  body: ThreadOwnerMutationRequest = {},
 ): Promise<QueuedThreadInputActionResponse> {
   return request(
     apiPaths.threadQueuedInput(threadId, inputId),
     {
       method: "DELETE",
+      body: encryptRequestPayload(body),
     },
     QueuedThreadInputActionResponseSchema.parse,
   );
@@ -1209,11 +1563,13 @@ export async function removeQueuedThreadInput(
 export async function steerQueuedThreadInput(
   threadId: string,
   inputId: string,
+  body: ThreadOwnerMutationRequest = {},
 ): Promise<QueuedThreadInputActionResponse> {
   return request(
     apiPaths.threadQueuedInputSteer(threadId, inputId),
     {
       method: "POST",
+      body: encryptRequestPayload(body),
     },
     QueuedThreadInputActionResponseSchema.parse,
   );
@@ -1244,13 +1600,13 @@ async function request<T>(
   path: string,
   init: RequestInit | undefined,
   parse: (payload: unknown) => T,
-  options?: { jsonContentType?: boolean },
+  options?: { jsonContentType?: boolean; timeoutMs?: number },
 ) {
   const headers = requestHeaders(init?.headers, options);
-  const serverRequestUrl = `${getCodexRelayServerUrl()}${path}`;
-  const response = await fetchWithNetworkContext(serverRequestUrl, {
+  const { response, serverUrl } = await fetchWithServerUrlFallback(path, {
     ...init,
     headers,
+    timeoutMs: options?.timeoutMs,
   });
   const payload = decryptResponsePayload(await response.json().catch(() => undefined));
 
@@ -1259,7 +1615,31 @@ async function request<T>(
     throw new CodexRelayApiError(message, response.status, errorCode(payload));
   }
 
-  return parse(payload);
+  const parsed = parse(payload);
+  promoteCodexRelayServerUrl(serverUrl);
+  return parsed;
+}
+
+async function fetchWithServerUrlFallback(
+  path: string,
+  init: NetworkRequestInit,
+): Promise<RequestAttempt> {
+  await refreshCodexRelayConnectionPlan().catch(() => undefined);
+  const attempt = await requestWithConnectionCandidateRefresh({
+    getCandidateUrls: () => {
+      const candidates = getCodexRelayServerUrlCandidates().map(({ url }) => url);
+      return candidates.length ? candidates : [getCodexRelayServerUrl()];
+    },
+    refreshCandidates: () => refreshCodexRelayConnectionPlan({ force: true }).catch(() => false),
+    request: (serverUrl) => fetchWithNetworkContext(`${serverUrl}${path}`, init),
+  });
+  return { response: attempt.value, serverUrl: attempt.serverUrl };
+}
+
+function promoteCodexRelayServerUrl(serverUrl: string) {
+  if (serverUrl !== getCodexRelayServerUrl()) {
+    setCodexRelayServerUrl(serverUrl);
+  }
 }
 
 function requestHeaders(
@@ -1288,6 +1668,10 @@ function requestHeaders(
 }
 
 function saveSession(serverUrl: string, clientToken: string) {
+  clearStoredConnectionPlan();
+  connectionPlanUnavailableForCurrentSession = false;
+  connectionPlanPreparedForCurrentSession = false;
+  connectionPlanSessionGeneration += 1;
   setCodexRelayServerUrl(serverUrl);
   storage.set(clientTokenStorageKey, clientToken);
   storage.remove(legacyClientTokenExpiresAtStorageKey);
@@ -1302,6 +1686,10 @@ export function getClientSessionId() {
   const next = createUuidV4();
   storage.set(clientSessionIdStorageKey, next);
   return next;
+}
+
+export function createClientEventId() {
+  return createUuidV4();
 }
 
 function createUuidV4() {

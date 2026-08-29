@@ -5,17 +5,37 @@ import {
 } from "codex-relay/api-schema";
 import { createMMKV } from "react-native-mmkv";
 
+import {
+  normalizeWorkspaceCacheSelection,
+  workspaceCacheIdentity,
+  type WorkspaceCacheSelection,
+} from "./server-state-workspace-cache";
+
 const storage = createMMKV({ id: "codex-relay-workspace-runtime-preferences" });
 
 export function readCachedWorkspaceRuntimePreferences(
   serverUrl: string,
-  workspacePath: string | undefined,
+  selection: WorkspaceCacheSelection | string | undefined,
 ): RuntimePreferences | undefined {
-  if (!workspacePath) {
+  const normalized = normalizeWorkspaceCacheSelection(selection);
+  const identity = workspaceCacheIdentity(normalized);
+  if (!identity) {
     return undefined;
   }
 
-  const raw = storage.getString(cacheKey(serverUrl, workspacePath));
+  const raw = storage.getString(cacheKey(serverUrl, identity));
+  if (!raw && normalized.workspaceId && normalized.workspacePath) {
+    const legacyRaw = storage.getString(cacheKey(serverUrl, normalized.workspacePath));
+    const legacyPreferences = parseCachedPreferences(legacyRaw);
+    if (legacyPreferences) {
+      storage.set(cacheKey(serverUrl, identity), JSON.stringify(legacyPreferences));
+    }
+    return legacyPreferences;
+  }
+  return parseCachedPreferences(raw);
+}
+
+function parseCachedPreferences(raw: string | undefined) {
   if (!raw) {
     return undefined;
   }
@@ -30,24 +50,31 @@ export function readCachedWorkspaceRuntimePreferences(
 
 export function cacheWorkspaceRuntimePreferences(
   serverUrl: string,
-  workspacePath: string | undefined,
+  selection: WorkspaceCacheSelection | string | undefined,
   preferences: RuntimePreferences,
 ) {
-  if (!workspacePath) {
+  const normalized = normalizeWorkspaceCacheSelection(selection);
+  const identity = workspaceCacheIdentity(normalized);
+  if (!identity) {
     return;
   }
 
-  storage.set(
-    cacheKey(serverUrl, workspacePath),
-    JSON.stringify(RuntimePreferencesSchema.parse(preferences)),
-  );
+  const serialized = JSON.stringify(RuntimePreferencesSchema.parse(preferences));
+  storage.set(cacheKey(serverUrl, identity), serialized);
+  if (normalized.workspaceId && normalized.workspacePath) {
+    storage.set(cacheKey(serverUrl, normalized.workspacePath), serialized);
+  }
 }
 
 export function cacheWorkspaceRuntimePreferencesFromStatus(
   serverUrl: string,
   status: StatusResponse,
 ) {
-  cacheWorkspaceRuntimePreferences(serverUrl, status.workspacePath, status.preferences);
+  cacheWorkspaceRuntimePreferences(
+    serverUrl,
+    { workspaceId: status.workspaceId, workspacePath: status.workspacePath },
+    status.preferences,
+  );
   for (const [workspacePath, preferences] of Object.entries(
     status.runtimePreferencesByWorkspacePath ?? {},
   )) {
@@ -55,8 +82,8 @@ export function cacheWorkspaceRuntimePreferencesFromStatus(
   }
 }
 
-function cacheKey(serverUrl: string, workspacePath: string) {
-  return `${normalizeServerUrl(serverUrl)}::${workspacePath}`;
+function cacheKey(serverUrl: string, workspaceIdentity: string) {
+  return `${normalizeServerUrl(serverUrl)}::${workspaceIdentity}`;
 }
 
 function normalizeServerUrl(serverUrl: string) {

@@ -1,4 +1,4 @@
-import { observable } from "@legendapp/state";
+import { batch, observable } from "@legendapp/state";
 import type {
   AgentSkill,
   ChatMessage,
@@ -14,6 +14,11 @@ import type {
   ThreadSummary,
 } from "codex-relay/api-schema";
 
+import {
+  cacheChatNavigation,
+  clearCachedChatNavigation,
+  readCachedChatNavigation,
+} from "../lib/chat-navigation-cache";
 import { resetWorkspacePreviewState } from "./workspace-preview-store";
 
 type ConnectionState = "checking" | "connected" | "offline";
@@ -60,11 +65,14 @@ type ChatState = {
   serverUrl: string;
   threadIds: string[];
   threadsById: Record<string, ThreadSummary>;
+  workspaceId?: string;
   workspacePath?: string;
 };
 
+const cachedChatNavigation = readCachedChatNavigation();
+
 export const chatStore$ = observable<ChatState>({
-  activeThreadId: undefined,
+  activeThreadId: cachedChatNavigation.activeThreadId,
   composerAttachmentsByThreadId: {},
   composerDraftByThreadId: {},
   composerSkillsByThreadId: {},
@@ -87,7 +95,8 @@ export const chatStore$ = observable<ChatState>({
   serverUrl: "",
   threadIds: [],
   threadsById: {},
-  workspacePath: undefined,
+  workspaceId: cachedChatNavigation.workspaceId,
+  workspacePath: cachedChatNavigation.workspacePath,
 });
 
 export function setConnection(connection: ConnectionState, error?: string) {
@@ -249,6 +258,27 @@ export function setHasPairedSession(hasPairedSession: boolean) {
 
 export function setWorkspacePath(workspacePath: string | undefined) {
   chatStore$.workspacePath.set(workspacePath);
+  persistChatNavigation();
+}
+
+export function setWorkspaceSelection(selection: { workspaceId?: string; workspacePath?: string }) {
+  batch(() => {
+    chatStore$.workspaceId.set(selection.workspaceId);
+    chatStore$.workspacePath.set(selection.workspacePath);
+  });
+  persistChatNavigation();
+}
+
+export function activateWorkspaceThread(
+  threadId: string,
+  selection: { workspaceId?: string; workspacePath?: string },
+) {
+  batch(() => {
+    chatStore$.workspaceId.set(selection.workspaceId);
+    chatStore$.workspacePath.set(selection.workspacePath);
+    chatStore$.activeThreadId.set(threadId);
+  });
+  persistChatNavigation();
 }
 
 export function setMachineName(machineName: string | undefined) {
@@ -425,6 +455,7 @@ export function replaceWorkspaceRuntimePreferences(
 
 export function setActiveThread(threadId: string | undefined) {
   chatStore$.activeThreadId.set(threadId);
+  persistChatNavigation();
 }
 
 export function activateThreadSnapshot(thread: ThreadSummary, messages?: ChatMessage[]) {
@@ -458,7 +489,9 @@ export function resetChatSessionState() {
   chatStore$.selectedModel.set(undefined);
   chatStore$.threadIds.set([]);
   chatStore$.threadsById.set({});
+  chatStore$.workspaceId.set(undefined);
   chatStore$.workspacePath.set(undefined);
+  clearCachedChatNavigation();
 }
 
 export function replaceThreads(threads: ThreadSummary[]) {
@@ -472,9 +505,17 @@ export function replaceThreads(threads: ThreadSummary[]) {
   const activeThreadId = chatStore$.activeThreadId.get();
   if (!activeThreadId || !threadsById[activeThreadId]) {
     const nextActiveThreadId = threads[0]?.id;
-    chatStore$.activeThreadId.set(nextActiveThreadId);
+    setActiveThread(nextActiveThreadId);
     return;
   }
+}
+
+function persistChatNavigation() {
+  cacheChatNavigation({
+    activeThreadId: chatStore$.activeThreadId.peek(),
+    workspaceId: chatStore$.workspaceId.peek(),
+    workspacePath: chatStore$.workspacePath.peek(),
+  });
 }
 
 export function upsertThread(thread: ThreadSummary) {

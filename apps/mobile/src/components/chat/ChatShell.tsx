@@ -65,6 +65,7 @@ export function ChatShell({
   onToggleGoalPause,
   queuedPrompts,
   rateLimitBuckets,
+  serverUrl = "",
   pendingInputRequest,
   skills,
   skillsLoadState,
@@ -72,6 +73,7 @@ export function ChatShell({
   threadId,
   title,
   trailingActions,
+  workspaceId,
   workspacePath,
 }: {
   banner?: ReactNode;
@@ -110,6 +112,7 @@ export function ChatShell({
   onToggleGoalPause?: () => void;
   queuedPrompts: QueuedComposerPrompt[];
   rateLimitBuckets: RateLimitBucket[];
+  serverUrl?: string;
   pendingInputRequest?: PendingInputRequest;
   skills: AgentSkill[];
   skillsLoadState: "idle" | "loading" | "loaded" | "failed";
@@ -117,6 +120,7 @@ export function ChatShell({
   threadId?: string;
   title: string;
   trailingActions: ChatShellAction[];
+  workspaceId?: string;
   workspacePath?: string;
 }) {
   const insets = useSafeAreaInsets();
@@ -216,9 +220,11 @@ export function ChatShell({
                 pendingInputRequest={pendingInputRequest}
                 queuedPrompts={queuedPrompts}
                 rateLimitBuckets={rateLimitBuckets}
+                serverUrl={serverUrl}
                 skills={skills}
                 skillsLoadState={skillsLoadState}
                 footer={composerFooter}
+                workspaceId={workspaceId}
                 workspacePath={workspacePath}
               />
             </KeyboardStickyView>

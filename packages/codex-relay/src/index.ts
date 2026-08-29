@@ -2,16 +2,18 @@ import { serve } from "@hono/node-server";
 import { fromByteArray, toByteArray } from "base64-js";
 import { createHash, randomBytes } from "node:crypto";
 import { access, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import pc from "picocolors";
 import qrcode from "qrcode-terminal";
 
-import { createApp } from "./app.js";
+import { createApp, relayThreadOwnerCapabilities } from "./app.js";
 import { CodexAppServerClient } from "./app-server.js";
+import { recoverActiveAppServerTurnClaims } from "./app-server-turn-recovery.js";
 import {
   resolveCodexAppServerMode,
   resolveCodexSharedAppServerRemoteAddress,
 } from "./codex-binary.js";
+import { createServerEpoch, relayIdFromServerPublicKey } from "./connection-plan.js";
 import { isRelayDebugEnabled, relayDebugLog } from "./debug-log.js";
 import {
   createPairingQrPayload,
@@ -22,6 +24,7 @@ import {
 import { createTursoPairingSessionStore } from "./pairing-store.js";
 import { codexRelayDataPath, legacyCodexRelayDataPath } from "./paths.js";
 import { createFileRuntimePreferencesStore } from "./preferences-store.js";
+import { createRelayStateStore } from "./relay-state-store.js";
 import {
   createServerIdentity,
   createServerIdentityFromPrivateKey,
@@ -31,7 +34,11 @@ import {
 const port = Number(process.env.PORT ?? 8787);
 const hostname = process.env.HOST ?? "0.0.0.0";
 const dangerouslyAutoApprove = process.env.CODEX_RELAY_DANGEROUSLY_AUTO_APPROVE === "1";
+const maxThreadEventRetention = parsePositiveIntegerEnv("CODEX_RELAY_MAX_THREAD_EVENTS");
+const threadOwnerLeaseMs = parseNonnegativeIntegerEnv("CODEX_RELAY_OWNER_LEASE_MS");
 const serverIdentity = await getServerIdentity();
+const relayId = relayIdFromServerPublicKey(serverIdentity.publicKey);
+const serverEpoch = createServerEpoch();
 const approvalSecret = await getApprovalSecret();
 const debugLogPath = isRelayDebugEnabled()
   ? (process.env.CODEX_RELAY_DEBUG_LOG_PATH ?? (await prepareCodexRelayDataPath("debug.log")))
@@ -51,14 +58,48 @@ const color = {
   url: colors.blue,
 };
 const npxCommand = "npx codex-relay@latest";
+const workspacePath = resolve(process.env.CODEX_RELAY_WORKSPACE_PATH ?? process.cwd());
 
 const sessionStore = await createTursoPairingSessionStore(
   process.env.CODEX_RELAY_AUTH_DB_PATH ??
     (await prepareCodexRelayDataPath("auth.db", ["auth.db-shm", "auth.db-wal"])),
 );
+const threadEvents = await createRelayStateStore(
+  process.env.CODEX_RELAY_STATE_DB_PATH ?? codexRelayDataPath("relay-state.db"),
+).catch((error) => {
+  relayDebugLog("relay_state.initialization_failed", {
+    error: error instanceof Error ? error.message : String(error),
+  });
+  logRuntimeEvent(
+    "Warning",
+    "Durable event replay is unavailable; continuing with the existing mobile API.",
+  );
+  return undefined;
+});
+if (threadEvents) {
+  await threadEvents
+    .registerWorkspace({ path: workspacePath, source: "relay_startup" })
+    .catch((error) => {
+      relayDebugLog("workspace_registry.startup_registration_failed", {
+        error: error instanceof Error ? error.message : String(error),
+        workspacePath,
+      });
+      logRuntimeEvent(
+        "Warning",
+        "Workspace identity registration failed; continuing with path-based APIs.",
+      );
+    });
+}
 const preferencesStore = createFileRuntimePreferencesStore(
   process.env.CODEX_RELAY_PREFERENCES_PATH ?? (await prepareCodexRelayDataPath("preferences.json")),
 );
+const managementState: {
+  connectUrl?: string;
+  connectUrlCandidates?: ConnectUrlCandidate[];
+  listenUrl?: string;
+  pairingPayload?: string;
+  port?: number;
+} = {};
 const appServerMode = resolveCodexAppServerMode();
 const relayAppServer =
   appServerMode.mode === "socket"
@@ -78,11 +119,33 @@ if (relayAppServer) {
   process.once("SIGTERM", () => stopRelayAppServer(143));
   process.once("exit", () => relayAppServer.close());
 }
+const recoveredTurnClaims =
+  relayAppServer && threadEvents
+    ? await recoverActiveAppServerTurnClaims({
+        appServer: relayAppServer,
+        capabilities: relayThreadOwnerCapabilities,
+        coordinator: threadEvents,
+        ownerId: relayId,
+        ownerInstanceId: serverEpoch,
+        ownerType: "shared_app_server",
+      })
+        .then((result) => result.recovered)
+        .catch((error) => {
+          relayDebugLog("thread.claim.startup_recovery_failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return [];
+        })
+    : [];
 
 serve(
   {
     fetch: createApp({
+      approvalStore: relayAppServer ? threadEvents : undefined,
       appServer: relayAppServer,
+      connectionPlan: { relayId, serverEpoch },
+      management: managementState,
+      maxThreadEventRetention,
       pairing: {
         approvalSecret,
         dangerouslyAutoApprove,
@@ -132,13 +195,24 @@ serve(
         },
       },
       preferences: preferencesStore,
+      recoveredTurnClaims,
+      threadCoordinator: threadEvents,
+      threadEvents,
+      threadInputs: threadEvents,
+      threadOwnerLeaseMs,
+      workspacePath,
+      workspaceRegistry: threadEvents,
     }).fetch,
     hostname,
     port,
   },
   (info) => {
     const listenUrl = `http://${info.address}:${info.port}`;
-    const connectUrlCandidates = getConnectUrlCandidates({ listenUrl, port: info.port });
+    const connectUrlCandidates = getConnectUrlCandidates({
+      listenUrl,
+      port: info.port,
+      publicUrl: process.env.CODEX_RELAY_PUBLIC_URL,
+    });
     const connectUrl = connectUrlCandidates[0]?.url ?? listenUrl;
     const connectUrls = connectUrlCandidates.map((candidate) => candidate.url);
     const pairingPayload = createPairingQrPayload({
@@ -154,6 +228,13 @@ serve(
       pairingPayload,
       port: info.port,
     });
+    Object.assign(managementState, {
+      connectUrl,
+      connectUrlCandidates,
+      listenUrl,
+      pairingPayload,
+      port: info.port,
+    });
     void writeBackgroundPid();
     if (debugLogPath) {
       logRuntimeEvent("Debug", `Writing diagnostics to ${debugLogPath}`);
@@ -162,7 +243,9 @@ serve(
         connectUrlCandidates,
         listenUrl,
         port: info.port,
-        workspacePath: process.env.CODEX_RELAY_WORKSPACE_PATH ?? process.cwd(),
+        relayId,
+        serverEpoch,
+        workspacePath,
       });
     }
     console.log("");
@@ -254,6 +337,30 @@ function formatConnectUrlCandidates(candidates: ConnectUrlCandidate[]) {
 
 function logRuntimeEvent(label: string, message: string) {
   console.log(`${color.prompt("›")} ${color.event(label.padEnd(8))} ${message}`);
+}
+
+function parsePositiveIntegerEnv(name: string) {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  return parsed;
+}
+
+function parseNonnegativeIntegerEnv(name: string) {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a nonnegative integer.`);
+  }
+  return parsed;
 }
 
 function formatClientCount(tokenCount: number) {

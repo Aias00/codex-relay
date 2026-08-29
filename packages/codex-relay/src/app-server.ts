@@ -33,7 +33,13 @@ type PendingRequest = {
   resolve(value: unknown): void;
 };
 
-type SharedAppServerOwnership = "attached" | "relay-owned";
+export type SharedAppServerOwnership = "attached" | "relay-owned";
+
+export type AppServerConnectionStateEvent = {
+  mode: "socket";
+  ownership: SharedAppServerOwnership;
+  state: "disconnected" | "reconnected";
+};
 
 export type CodexAppServerClientOptions = {
   readonly mode?: CodexAppServerModeResolution;
@@ -282,6 +288,7 @@ export class CodexAppServerClient {
   private activeMode: CodexAppServerMode;
   private child: ChildProcessWithoutNullStreams | undefined;
   private closed = false;
+  private connectionStateHandlers = new Set<(event: AppServerConnectionStateEvent) => void>();
   private fallbackToStdio: boolean;
   private initialized: Promise<void> | undefined;
   private notificationHandlers = new Set<(notification: AppServerNotification) => void>();
@@ -445,6 +452,11 @@ export class CodexAppServerClient {
   onRequest(handler: (request: AppServerRequest) => void) {
     this.requestHandlers.add(handler);
     return () => this.requestHandlers.delete(handler);
+  }
+
+  onConnectionState(handler: (event: AppServerConnectionStateEvent) => void) {
+    this.connectionStateHandlers.add(handler);
+    return () => this.connectionStateHandlers.delete(handler);
   }
 
   async respondToRequest(id: number | string, result: unknown) {
@@ -752,7 +764,7 @@ export class CodexAppServerClient {
         ownership: "relay-owned",
       });
       if (this.socket) {
-        this.handleSharedSocketFailure(this.socket, error);
+        this.handleSharedSocketFailure(this.socket, error, "relay-owned");
       }
     });
   }
@@ -804,7 +816,11 @@ export class CodexAppServerClient {
     });
   }
 
-  private handleSharedSocketFailure(socket: WebSocket, error: Error) {
+  private handleSharedSocketFailure(
+    socket: WebSocket,
+    error: Error,
+    ownership = this.sharedAppServerOwnership(),
+  ) {
     if (this.socket !== socket) {
       return;
     }
@@ -813,8 +829,9 @@ export class CodexAppServerClient {
     this.initialized = undefined;
     relayDebugLog("app_server.shared_socket.disconnected", {
       message: error.message,
-      ownership: this.sharedAppServerOwnership(),
+      ownership,
     });
+    this.emitConnectionState("disconnected", ownership);
     this.scheduleSharedSocketReconnect();
   }
 
@@ -865,6 +882,7 @@ export class CodexAppServerClient {
           ownership: this.sharedAppServerOwnership(),
           socketPath: sharedCodexAppServerSocketPath(),
         });
+        this.emitConnectionState("reconnected");
         return;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
@@ -893,6 +911,28 @@ export class CodexAppServerClient {
         }
       });
     });
+  }
+
+  private emitConnectionState(
+    state: AppServerConnectionStateEvent["state"],
+    ownership = this.sharedAppServerOwnership(),
+  ) {
+    const event: AppServerConnectionStateEvent = {
+      mode: "socket",
+      ownership,
+      state,
+    };
+    for (const handler of this.connectionStateHandlers) {
+      try {
+        handler(event);
+      } catch (error) {
+        relayDebugLog("app_server.connection_state_handler.failed", {
+          message: asError(error).message,
+          ownership,
+          state,
+        });
+      }
+    }
   }
 
   private handleLine(line: string) {

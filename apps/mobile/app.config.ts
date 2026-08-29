@@ -11,7 +11,7 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
     userInterfaceStyle: "automatic",
     ios: {
       icon: "./assets/images/icon.png",
-      bundleIdentifier: "com.gronstudio.codexrelay",
+      bundleIdentifier: process.env.IOS_BUNDLE_IDENTIFIER ?? "com.gronstudio.codexrelay",
       supportsTablet: true,
       infoPlist: {
         NSAppTransportSecurity: {

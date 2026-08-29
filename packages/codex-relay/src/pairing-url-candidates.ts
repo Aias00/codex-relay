@@ -1,6 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { networkInterfaces } from "node:os";
 
+const maxPairingQrFallbackHosts = 3;
+const ignoredLocalInterfaceNamePattern = /^(awdl|bridge|llw|lo|utun)/i;
+
 export type ConnectUrlCandidate = {
   label: string;
   url: string;
@@ -43,8 +46,13 @@ export function createPairingQrPayload(details: { serverPublicKey: string; serve
   return url.toString();
 }
 
-export function getConnectUrlCandidates(details: { listenUrl: string; port: number }) {
+export function getConnectUrlCandidates(details: {
+  listenUrl: string;
+  port: number;
+  publicUrl?: string;
+}) {
   return dedupeCandidates([
+    ...publicConnectUrlCandidates(details.publicUrl),
     ...tailscaleConnectUrlCandidates(details.port),
     ...localNetworkConnectUrlCandidates(details.port),
     { label: "Server", url: details.listenUrl },
@@ -98,11 +106,23 @@ function tailscaleConnectUrlCandidates(port: number) {
   return candidates;
 }
 
+function publicConnectUrlCandidates(publicUrl: string | undefined) {
+  const url = normalizeUrl(publicUrl);
+  return url ? [{ label: "Public", url }] : [];
+}
+
 function localNetworkConnectUrlCandidates(port: number) {
   const candidates: ConnectUrlCandidate[] = [];
   for (const [name, addresses] of Object.entries(networkInterfaces())) {
+    if (ignoredLocalInterfaceNamePattern.test(name)) {
+      continue;
+    }
     for (const address of addresses ?? []) {
-      if (address.family === "IPv4" && !address.internal) {
+      if (
+        address.family === "IPv4" &&
+        !address.internal &&
+        isUsableLocalIPv4Host(address.address)
+      ) {
         candidates.push({ label: name, url: `http://${address.address}:${port}` });
       }
     }
@@ -134,9 +154,13 @@ function compactCandidateHosts(primaryServerUrl: string, serverUrls: string[]) {
       candidate &&
       candidate.protocol === primary.protocol &&
       candidate.port === primary.port &&
+      isPairingQrFallbackHost(candidate.hostname) &&
       !hosts.includes(candidate.hostname)
     ) {
       hosts.push(candidate.hostname);
+      if (hosts.length >= maxPairingQrFallbackHosts) {
+        break;
+      }
     }
   }
   return hosts;
@@ -164,6 +188,30 @@ function isLocalhost(host: string) {
 
 function isUnspecifiedHost(host: string) {
   return host === "0.0.0.0" || host === "::";
+}
+
+function isPairingQrFallbackHost(host: string) {
+  return !isLocalhost(host) && !isUnspecifiedHost(host) && isUsableLocalIPv4Host(host);
+}
+
+function isUsableLocalIPv4Host(host: string) {
+  const octets = host.split(".").map(Number);
+  if (
+    octets.length !== 4 ||
+    octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)
+  ) {
+    return true;
+  }
+  if (
+    octets[0] === 0 ||
+    octets[0] === 127 ||
+    (octets[0] === 169 && octets[1] === 254) ||
+    octets[3] === 0 ||
+    octets[3] === 255
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function isTailscaleHost(host: string) {

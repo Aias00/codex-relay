@@ -1,7 +1,7 @@
 import type { WorkspaceFileContentResponse } from "codex-relay/api-schema";
 import { router, useLocalSearchParams } from "expo-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Alert, Pressable, View } from "react-native";
 import {
   KeyboardAvoidingView,
@@ -18,6 +18,7 @@ import { Text } from "@/components/ui/text";
 import { WorkspaceCodeWebView } from "@/components/chat/workspace-preview/WorkspaceCodeWebView";
 import { Colors, Spacing } from "@/constants/theme";
 import { getWorkspaceFileContent, updateWorkspaceFileContent } from "@/lib/codex-relay-api";
+import { getCodexRelayServerUrl } from "@/lib/codex-relay-api";
 import { hapticSelection } from "@/lib/haptics";
 import {
   workspaceFileContentQueryKey,
@@ -25,21 +26,29 @@ import {
 } from "@/lib/workspace-file-queries";
 
 export default function WorkspaceFileEditorScreen() {
-  const params = useLocalSearchParams<{ path?: string; workspacePath?: string }>();
+  const params = useLocalSearchParams<{
+    path?: string;
+    workspaceId?: string;
+    workspacePath?: string;
+  }>();
   const path = normalizedParam(params.path);
+  const workspaceId = normalizedParam(params.workspaceId);
   const workspacePath = normalizedParam(params.workspacePath);
+  const serverUrl = getCodexRelayServerUrl();
+  const workspaceSelection = { workspaceId, workspacePath };
   const queryClient = useQueryClient();
   const keyboardAvoidingEnabled = useKeyboardState(
     (state) => state.isVisible && state.height > 120,
   );
   const [draftContent, setDraftContent] = useState("");
-  const fileContentQueryKey = useMemo(
-    () => workspaceFileContentQueryKey(workspacePath, path ?? null),
-    [path, workspacePath],
+  const fileContentQueryKey = workspaceFileContentQueryKey(
+    serverUrl,
+    workspaceSelection,
+    path ?? null,
   );
   const fileContentQuery = useQuery({
     enabled: Boolean(path),
-    queryFn: () => getWorkspaceFileContent({ path: path ?? "", workspacePath }),
+    queryFn: () => getWorkspaceFileContent({ path: path ?? "", workspaceId, workspacePath }),
     queryKey: fileContentQueryKey,
     staleTime: 10_000,
   });
@@ -54,13 +63,20 @@ export default function WorkspaceFileEditorScreen() {
       updateWorkspaceFileContent({
         content: input.content,
         path: input.path,
+        workspaceId,
         workspacePath,
       }),
     onSuccess: (nextFile, input) => {
-      const nextFileContentQueryKey = workspaceFileContentQueryKey(workspacePath, input.path);
+      const nextFileContentQueryKey = workspaceFileContentQueryKey(
+        serverUrl,
+        workspaceSelection,
+        input.path,
+      );
       queryClient.setQueryData(nextFileContentQueryKey, nextFile);
       void queryClient.invalidateQueries({ queryKey: nextFileContentQueryKey });
-      void queryClient.invalidateQueries({ queryKey: workspaceFilesQueryKeyPrefix(workspacePath) });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceFilesQueryKeyPrefix(serverUrl, workspaceSelection),
+      });
       setDraftContent(nextFile.content);
       hapticSelection();
     },

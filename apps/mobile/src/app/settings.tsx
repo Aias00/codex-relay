@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import Constants from "expo-constants";
 import { router } from "expo-router";
 import { Heart } from "lucide-react-native";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Linking, Pressable, ScrollView, Switch, View } from "react-native";
 import Animated, { FadeIn, FadeOut, LinearTransition } from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -71,9 +71,15 @@ export default function SettingsScreen() {
   const connection = useSelector(() => chatStore$.connection.get());
   const hasPairedSession = useSelector(() => chatStore$.hasPairedSession.get());
   const serverUrl = useSelector(() => chatStore$.serverUrl.get());
+  const selectedWorkspaceId = useSelector(() => chatStore$.workspaceId.get());
+  const selectedWorkspacePath = useSelector(() => chatStore$.workspacePath.get());
+  const selectedWorkspaceSelection = useMemo(
+    () => ({ workspaceId: selectedWorkspaceId, workspacePath: selectedWorkspacePath }),
+    [selectedWorkspaceId, selectedWorkspacePath],
+  );
   const statusQuery = useQuery({
-    queryKey: serverStateKeys.status(),
-    queryFn: serverStateQueryFns.status,
+    queryKey: serverStateKeys.status(selectedWorkspaceSelection),
+    queryFn: () => serverStateQueryFns.status(selectedWorkspaceSelection),
     enabled: false,
   });
   const rateLimitsQuery = useQuery({

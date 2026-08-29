@@ -133,6 +133,15 @@ npx codex-relay@latest --dangerously-auto-approve
 
 Start the relay and automatically approve mobile pairing requests. Use this only for controlled review or demo environments.
 
+```sh
+npx codex-relay@latest diagnostics
+npx codex-relay@latest backup
+npx codex-relay@latest compact THREAD_ID --through 2000
+npx codex-relay@latest repair-owner THREAD_ID
+```
+
+Inspect content-safe state counts, create online-consistent database backups, compact one thread at an explicit durable sequence, or repair an expired owner lease. `repair-owner` refuses active and non-expiring owners.
+
 ## Configuration
 
 The relay listens on `0.0.0.0:8787` by default. Configure it with environment variables:
@@ -143,7 +152,10 @@ The relay listens on `0.0.0.0:8787` by default. Configure it with environment va
 | `HOST`                                 | Listen host. Defaults to `0.0.0.0`.                                                                                                                             |
 | `CODEX_RELAY_WORKSPACE_PATH`           | Workspace path Codex should use. Defaults to the directory where you run `npx codex-relay@latest`.                                                              |
 | `CODEX_RELAY_AUTH_DB_PATH`             | Pairing and session database path. Defaults to `.codex-relay/auth.db`.                                                                                          |
+| `CODEX_RELAY_MAX_THREAD_EVENTS`        | Optional per-thread durable event retention limit. Unset keeps all events; clients with compacted cursors reset from the authoritative thread detail.           |
+| `CODEX_RELAY_OWNER_LEASE_MS`           | Optional cross-process owner lease duration in milliseconds. Unset disables lease enforcement; an active lease prevents another Relay from starting a turn.     |
 | `CODEX_RELAY_APPROVAL_SECRET`          | Secret used by the local approve command. Usually generated automatically.                                                                                      |
+| `CODEX_RELAY_PUBLIC_URL`               | Public URL printed first and embedded first in the pairing QR, for example a Cloudflare Tunnel URL proxying the relay port.                                     |
 | `CODEX_RELAY_DANGEROUSLY_AUTO_APPROVE` | Set to `1` to auto-approve mobile pairing requests. Prefer the CLI flag for local use.                                                                          |
 | `CODEX_RELAY_APP_SERVER_MODE`          | Set to `socket` to require shared mode or `stdio` to require private mode. Unset prefers shared mode with startup fallback on macOS and private mode elsewhere. |
 | `CODEX_HOME`                           | Codex home directory, used when reading Codex session metadata.                                                                                                 |
@@ -153,6 +165,10 @@ Examples:
 
 ```sh
 PORT=8788 npx codex-relay@latest
+```
+
+```sh
+PORT=8788 CODEX_RELAY_PUBLIC_URL=https://codex-relay.example.com npx codex-relay@latest
 ```
 
 ```sh

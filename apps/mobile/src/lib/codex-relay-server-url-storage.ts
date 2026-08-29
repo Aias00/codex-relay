@@ -19,10 +19,21 @@ export function getCodexRelayServerUrl() {
 }
 
 export function getCodexRelayServerUrlCandidates(): CodexRelayServerUrlCandidate[] {
-  return serverUrlCandidatesFromUrls([
-    getCodexRelayServerUrl(),
+  const selectedServerUrl = getCodexRelayServerUrl();
+  const candidates = serverUrlCandidatesFromUrls([
+    selectedServerUrl,
+    fallbackCodexRelayServerUrl,
     ...readStoredServerUrlCandidates(),
   ]);
+  const selectedIndex = candidates.findIndex(({ url }) => url === selectedServerUrl);
+  if (selectedIndex <= 0) {
+    return candidates;
+  }
+  return [
+    candidates[selectedIndex],
+    ...candidates.slice(0, selectedIndex),
+    ...candidates.slice(selectedIndex + 1),
+  ];
 }
 
 export function setCodexRelayServerUrl(url: string) {
@@ -37,7 +48,10 @@ export function clearCodexRelayServerUrlState() {
 }
 
 export function saveCodexRelayServerUrlCandidates(urls: string[]) {
-  codexRelayStorage.set(serverUrlCandidatesStorageKey, JSON.stringify(dedupeServerUrls(urls)));
+  codexRelayStorage.set(
+    serverUrlCandidatesStorageKey,
+    JSON.stringify(sortServerUrlsByConnectionPreference(urls).filter(isConnectableServerUrl)),
+  );
 }
 
 export function normalizeServerUrl(url: string) {
@@ -66,6 +80,24 @@ export function dedupeServerUrls(urls: string[]) {
   return [...deduped];
 }
 
+export function isConnectableServerUrl(url: string) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    if (host === "0.0.0.0") {
+      return false;
+    }
+    return !isIPv4NetworkOrBroadcastHost(host);
+  } catch {
+    return false;
+  }
+}
+
+export function sortServerUrlsByConnectionPreference(urls: string[]) {
+  return dedupeServerUrls(urls).sort(
+    (left, right) => serverUrlConnectionScore(right) - serverUrlConnectionScore(left),
+  );
+}
+
 export function isPrivateIPv4Host(host: string) {
   const octets = host.split(".").map(Number);
   if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet))) {
@@ -76,6 +108,20 @@ export function isPrivateIPv4Host(host: string) {
     (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
     (octets[0] === 192 && octets[1] === 168) ||
     (octets[0] === 169 && octets[1] === 254)
+  );
+}
+
+export function isLinkLocalIPv4Host(host: string) {
+  const octets = host.split(".").map(Number);
+  return octets.length === 4 && octets[0] === 169 && octets[1] === 254;
+}
+
+export function isIPv4NetworkOrBroadcastHost(host: string) {
+  const octets = host.split(".").map(Number);
+  return (
+    octets.length === 4 &&
+    octets.every((octet) => Number.isInteger(octet)) &&
+    (octets[3] === 0 || octets[3] === 255)
   );
 }
 
@@ -108,10 +154,46 @@ function readStoredServerUrlCandidates() {
 }
 
 function serverUrlCandidatesFromUrls(urls: string[]): CodexRelayServerUrlCandidate[] {
-  return dedupeServerUrls(urls).map((url) => ({
-    label: serverUrlCandidateLabel(url),
-    url,
-  }));
+  return sortServerUrlsByConnectionPreference(urls)
+    .filter(isConnectableServerUrl)
+    .map((url) => ({
+      label: serverUrlCandidateLabel(url),
+      url,
+    }));
+}
+
+function serverUrlConnectionScore(url: string) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "::1") {
+      return 10;
+    }
+    if (host === "0.0.0.0" || isIPv4NetworkOrBroadcastHost(host)) {
+      return -100;
+    }
+    if (isCarrierGradePrivateIPv4Host(host)) {
+      return 550;
+    }
+    if (parsed.protocol === "https:" && !isPrivateIPv4Host(host) && !isLocalIPv6Host(host)) {
+      return 525;
+    }
+    if (host.endsWith(".ts.net") || host.endsWith(".beta.tailscale.net")) {
+      return 500;
+    }
+    if (host.endsWith(".local")) {
+      return 350;
+    }
+    if (isLinkLocalIPv4Host(host)) {
+      return 100;
+    }
+    if (isPrivateIPv4Host(host) || isLocalIPv6Host(host)) {
+      return 300;
+    }
+    return 250;
+  } catch {
+    return -100;
+  }
 }
 
 function serverUrlCandidateLabel(url: string) {

@@ -20,6 +20,7 @@ import {
   type RuntimePreferencesStore,
 } from "../src/preferences-store.js";
 import type { PushNotificationSender, RelayPushNotification } from "../src/push-notifications.js";
+import { createRelayStateStore } from "../src/relay-state-store.js";
 import { createServerIdentity } from "../src/secure-transport.js";
 
 const execFileAsync = promisify(execFile);
@@ -74,6 +75,69 @@ function createMockCodex(handlers?: {
       return thread;
     },
   };
+}
+
+async function createAdoptedTestClaim(input: {
+  inputId: string;
+  ownerId: string;
+  store: Awaited<ReturnType<typeof createRelayStateStore>>;
+  threadId: string;
+  turnId: string;
+}) {
+  const capabilities = {
+    approve: true,
+    configure: true,
+    interrupt: true,
+    queue: true,
+    send: true,
+    steer: true,
+    view: true,
+  };
+  const owner = await input.store.acquireThreadOwner({
+    capabilities,
+    ownerId: input.ownerId,
+    ownerInstanceId: "process-before-restart",
+    ownerType: "shared_app_server",
+    threadId: input.threadId,
+  });
+  await input.store.createThreadInput({
+    clientId: "mobile-client",
+    inputId: input.inputId,
+    payload: { prompt: "active before restart" },
+    state: "accepted",
+    threadId: input.threadId,
+  });
+  const acquired = await input.store.acquireTurnClaim({
+    inputId: input.inputId,
+    ownerEpoch: owner.epoch,
+    ownerId: owner.ownerId,
+    threadId: input.threadId,
+  });
+  if (acquired.kind !== "acquired") {
+    throw new Error("Expected the pre-restart input to acquire a claim.");
+  }
+  const bound = await input.store.bindTurnClaimRuntimeTurn({
+    claimId: acquired.claim.claimId,
+    ownerEpoch: owner.epoch,
+    ownerId: owner.ownerId,
+    runtimeTurnId: input.turnId,
+  });
+  if (bound.kind !== "updated") {
+    throw new Error("Expected the pre-restart claim to bind its runtime turn.");
+  }
+  const adopted = await input.store.adoptActiveTurnClaim({
+    capabilities,
+    claimId: acquired.claim.claimId,
+    ownerId: input.ownerId,
+    ownerInstanceId: "process-after-restart",
+    ownerType: "shared_app_server",
+    runtimeTurnId: input.turnId,
+    threadId: input.threadId,
+  });
+  if (adopted.kind !== "adopted") {
+    throw new Error("Expected the pre-restart claim to be adopted.");
+  }
+  return adopted;
 }
 
 function appServerHistoryThread(input: {
@@ -248,6 +312,38 @@ describe("Codex Relay server routes", () => {
       workspacePath: "/tmp/codex-relay",
       threadCount: 0,
       preferences: { runtimeMode: "default" },
+    });
+  });
+
+  it("returns status for a selected workspace", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const selectedWorkspacePath = await mkdtemp(join(tmpdir(), "codex-relay-selected-"));
+    const app = createApp({ codex: createMockCodex(), workspacePath });
+
+    const update = await app.request("/v1/preferences", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        reasoningEffort: "high",
+        runtimeMode: "auto",
+        workspacePath: selectedWorkspacePath,
+      }),
+    });
+    const response = await app.request(
+      `/v1/status?workspacePath=${encodeURIComponent(selectedWorkspacePath)}`,
+    );
+    const body = await response.json();
+
+    expect(update.status).toBe(200);
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      workspacePath: selectedWorkspacePath,
+      preferences: {
+        model: "gpt-5.5",
+        reasoningEffort: "high",
+        runtimeMode: "auto",
+      },
     });
   });
 
@@ -1164,6 +1260,114 @@ describe("Codex Relay server routes", () => {
     expect(insecurePairing.status).toBe(400);
   });
 
+  it("serves local pairing controls on localhost", async () => {
+    const sessions = await createTursoPairingSessionStore(":memory:");
+    const expiresAt = Date.now() + 60_000;
+    await sessions.createPendingPairing({
+      approvalCode: "BE01-C955",
+      approved: false,
+      clientEphemeralPublicKey: "client-public-key",
+      clientNonce: "client-nonce",
+      expiresAt,
+      serverUrl: "http://127.0.0.1:8788",
+    });
+    const onPairApproved = vi.fn<(client: { approvalCode: string; clientName?: string }) => void>();
+    const app = createApp({
+      codex: createMockCodex(),
+      management: {
+        connectUrl: "http://127.0.0.1:8788",
+        connectUrlCandidates: [{ label: "Local", url: "http://127.0.0.1:8788" }],
+        listenUrl: "http://0.0.0.0:8788",
+        pairingPayload: "codex-relay://pair?serverUrl=http%3A%2F%2F127.0.0.1%3A8788",
+        port: 8788,
+      },
+      pairing: {
+        approvalSecret: "approve-secret",
+        createClientToken: () => "client-token",
+        hashClientToken: (token) => token,
+        onPairApproved,
+        sessions,
+      },
+    });
+
+    const page = await app.request("/", {
+      headers: { host: "127.0.0.1:8788" },
+    });
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain("Codex Relay Pairing");
+
+    const pairing = await app.request("/local/pairing", {
+      headers: { host: "localhost:8788" },
+    });
+    const pairingBody = await pairing.json();
+    expect(pairing.status).toBe(200);
+    expect(pairingBody).toMatchObject({
+      connectUrl: "http://127.0.0.1:8788",
+      pendingPairings: [
+        {
+          approvalCode: "BE01-C955",
+          approved: false,
+          expiresAt: new Date(expiresAt).toISOString(),
+        },
+      ],
+      pairingPayload: "codex-relay://pair?serverUrl=http%3A%2F%2F127.0.0.1%3A8788",
+      port: 8788,
+    });
+    expect(pairingBody.qrText).toContain("▄▄");
+
+    const approval = await app.request("/local/pairing/approve", {
+      method: "POST",
+      body: JSON.stringify({ approvalCode: "be01 c955" }),
+      headers: { "content-type": "application/json", host: "localhost:8788" },
+    });
+    expect(approval.status).toBe(200);
+    expect(await approval.json()).toEqual({ ok: true });
+    expect(onPairApproved).toHaveBeenCalledWith({ approvalCode: "BE01-C955" });
+    expect(await sessions.getPendingPairing("BE01-C955", Date.now())).toMatchObject({
+      approved: true,
+    });
+
+    const afterApproval = await app.request("/local/pairing", {
+      headers: { host: "localhost:8788" },
+    });
+    expect(await afterApproval.json()).toMatchObject({
+      pendingPairings: [
+        {
+          approvalCode: "BE01-C955",
+          approved: true,
+          expiresAt: new Date(expiresAt).toISOString(),
+        },
+      ],
+    });
+  });
+
+  it("rejects local pairing controls from non-localhost hosts", async () => {
+    const sessions = await createTursoPairingSessionStore(":memory:");
+    const app = createApp({
+      codex: createMockCodex(),
+      management: {
+        pairingPayload: "codex-relay://pair",
+      },
+      pairing: {
+        createClientToken: () => "client-token",
+        hashClientToken: (token) => token,
+        sessions,
+      },
+    });
+
+    const pairing = await app.request("/local/pairing", {
+      headers: { host: "192.168.31.114:8788" },
+    });
+    expect(pairing.status).toBe(403);
+
+    const approval = await app.request("/local/pairing/approve", {
+      method: "POST",
+      body: JSON.stringify({ approvalCode: "BE01-C955" }),
+      headers: { "content-type": "application/json", host: "192.168.31.114:8788" },
+    });
+    expect(approval.status).toBe(403);
+  });
+
   it("keeps client tokens valid after the legacy expiry timestamp", async () => {
     const sessions = await createTursoPairingSessionStore(":memory:");
     await sessions.createSession("expired-client-token", { expiresAt: Date.now() - 1 });
@@ -1716,6 +1920,50 @@ describe("Codex Relay server routes", () => {
     expect(listBody.threads[0]).toMatchObject({ collaborationMode: "plan" });
   });
 
+  it("filters app-server threads by selected workspace", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const selectedWorkspacePath = await mkdtemp(join(tmpdir(), "codex-relay-selected-"));
+    const otherWorkspacePath = await mkdtemp(join(tmpdir(), "codex-relay-other-"));
+    const selectedThread = appServerHistoryThread({
+      id: "selected-thread",
+      name: "Selected workspace",
+      turns: [],
+      workspacePath: selectedWorkspacePath,
+    });
+    const otherThread = appServerHistoryThread({
+      id: "other-thread",
+      name: "Other workspace",
+      turns: [],
+      workspacePath: otherWorkspacePath,
+    });
+    const listThreads = vi.fn<(limit?: number) => Promise<unknown[]>>(async () => [
+      selectedThread,
+      otherThread,
+    ]);
+    const appServer = {
+      listThreads,
+    } as unknown as NonNullable<Parameters<typeof createApp>[0]>["appServer"];
+    const app = createApp({ appServer, codex: createMockCodex(), workspacePath });
+
+    const filteredResponse = await app.request(
+      `/v1/threads?workspacePath=${encodeURIComponent(selectedWorkspacePath)}`,
+    );
+    const filteredBody = await filteredResponse.json();
+    const defaultResponse = await app.request("/v1/threads");
+    const defaultBody = await defaultResponse.json();
+
+    expect(filteredResponse.status).toBe(200);
+    expect(filteredBody.threads.map((thread: { id: string }) => thread.id)).toEqual([
+      "selected-thread",
+    ]);
+    expect(defaultBody.threads.map((thread: { id: string }) => thread.id).sort()).toEqual([
+      "other-thread",
+      "selected-thread",
+    ]);
+    expect(listThreads).toHaveBeenCalledWith(500);
+    expect(listThreads).toHaveBeenCalledTimes(2);
+  });
+
   it("starts a new thread in the selected workspace directory", async () => {
     const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
     const externalPath = await mkdtemp(join(tmpdir(), "codex-relay-external-"));
@@ -1800,13 +2048,68 @@ describe("Codex Relay server routes", () => {
       readThread: vi.fn<() => Promise<unknown>>(async () => remainingThread),
       startThread: vi.fn<() => Promise<unknown>>(async () => remainingThread),
     };
+    const threadCoordinator = await createRelayStateStore(":memory:");
+    await threadCoordinator.acquireThreadOwner({
+      capabilities: {
+        approve: true,
+        configure: true,
+        interrupt: true,
+        queue: true,
+        send: true,
+        steer: true,
+        view: true,
+      },
+      ownerId: "relay-archive",
+      ownerInstanceId: "process-archive",
+      ownerType: "relay_app_server",
+      threadId: "app-thread-archive",
+    });
+    let ownerReadCount = 0;
+    const racingThreadCoordinator = {
+      ...threadCoordinator,
+      async getThreadOwner(threadId: string) {
+        const owner = await threadCoordinator.getThreadOwner(threadId);
+        ownerReadCount += 1;
+        if (ownerReadCount === 2) {
+          await threadCoordinator.acquireThreadOwner({
+            capabilities: owner!.capabilities,
+            ownerId: "relay-archive-replacement",
+            ownerInstanceId: "process-archive-replacement",
+            ownerType: "relay_app_server",
+            threadId,
+          });
+        }
+        return owner;
+      },
+    };
     const app = createApp({
       appServer: appServer as never,
       codex: createMockCodex(),
+      threadCoordinator: racingThreadCoordinator,
       workspacePath,
     });
 
-    const response = await app.request("/v1/threads/app-thread-archive", { method: "DELETE" });
+    const staleResponse = await app.request("/v1/threads/app-thread-archive", {
+      method: "DELETE",
+      body: JSON.stringify({ expectedOwnerEpoch: 2 }),
+      headers: { "content-type": "application/json" },
+    });
+    expect(staleResponse.status).toBe(409);
+    expect(archiveThread).not.toHaveBeenCalled();
+
+    const racedResponse = await app.request("/v1/threads/app-thread-archive", {
+      method: "DELETE",
+      body: JSON.stringify({ expectedOwnerEpoch: 1 }),
+      headers: { "content-type": "application/json" },
+    });
+    expect(racedResponse.status).toBe(409);
+    expect(archiveThread).not.toHaveBeenCalled();
+
+    const response = await app.request("/v1/threads/app-thread-archive", {
+      method: "DELETE",
+      body: JSON.stringify({ expectedOwnerEpoch: 2 }),
+      headers: { "content-type": "application/json" },
+    });
     const body = await response.json();
 
     expect(response.status).toBe(200);
@@ -1874,6 +2177,71 @@ describe("Codex Relay server routes", () => {
     expect(body.thread).toMatchObject({ id: "app-thread-rename", title: "Renamed chat" });
   });
 
+  it("refreshes app-server thread details from full turn history even after a stale running cache", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const now = Date.now() / 1000;
+    const runningThread = appServerHistoryThread({
+      id: "app-thread-refresh-terminal-output",
+      name: "Refresh terminal output",
+      turns: [],
+      workspacePath,
+    });
+    const idleThread = {
+      ...runningThread,
+      status: { type: "idle" },
+      updatedAt: now + 5,
+    };
+    const completedThread = appServerHistoryThread({
+      id: "app-thread-refresh-terminal-output",
+      name: "Refresh terminal output",
+      turns: [appServerTurn("turn-final-refresh", "Final prompt", now)],
+      workspacePath,
+    });
+    let readThreadCalls = 0;
+    const readThread = vi.fn<
+      (threadId: string, options?: { includeTurns?: boolean }) => Promise<unknown>
+    >(async (_threadId, options) => {
+      readThreadCalls += 1;
+      if (options?.includeTurns) {
+        return completedThread;
+      }
+      return readThreadCalls === 1 ? runningThread : idleThread;
+    });
+    const appServer = {
+      onNotification() {
+        return () => undefined;
+      },
+      onRequest() {
+        return () => undefined;
+      },
+      readThread,
+    };
+    const app = createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      workspacePath,
+    });
+
+    const initialResponse = await app.request("/v1/threads/app-thread-refresh-terminal-output");
+    const refreshResponse = await app.request(
+      "/v1/threads/app-thread-refresh-terminal-output?refresh=true",
+    );
+    const refreshBody = await refreshResponse.json();
+
+    expect(initialResponse.status).toBe(200);
+    expect(refreshResponse.status).toBe(200);
+    expect(refreshBody.thread).toMatchObject({ id: "app-thread-refresh-terminal-output" });
+    expect(refreshBody.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "turn-final-refresh-assistant",
+          content: "Reply: Final prompt",
+          role: "assistant",
+        }),
+      ]),
+    );
+  });
+
   it("rewinds an app-server thread from a selected user turn", async () => {
     const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
     const now = Date.now() / 1000;
@@ -1911,15 +2279,43 @@ describe("Codex Relay server routes", () => {
       revertThread,
       rollbackThread,
     };
+    const threadCoordinator = await createRelayStateStore(":memory:");
+    await threadCoordinator.acquireThreadOwner({
+      capabilities: {
+        approve: true,
+        configure: true,
+        interrupt: true,
+        queue: true,
+        send: true,
+        steer: true,
+        view: true,
+      },
+      ownerId: "relay-rewind",
+      ownerInstanceId: "process-rewind",
+      ownerType: "relay_app_server",
+      threadId: "app-thread-rewind",
+    });
     const app = createApp({
       appServer: appServer as never,
       codex: createMockCodex(),
+      threadCoordinator,
       workspacePath,
     });
 
+    const staleResponse = await app.request("/v1/threads/app-thread-rewind/rollback", {
+      method: "POST",
+      body: JSON.stringify({ expectedOwnerEpoch: 2, turnId: "turn-2" }),
+      headers: { "content-type": "application/json" },
+    });
+    expect(staleResponse.status).toBe(409);
+    expect(await staleResponse.json()).toMatchObject({
+      error: { code: "stale_owner_epoch" },
+    });
+    expect(rollbackThread).not.toHaveBeenCalled();
+
     const response = await app.request("/v1/threads/app-thread-rewind/rollback", {
       method: "POST",
-      body: JSON.stringify({ turnId: "turn-2" }),
+      body: JSON.stringify({ expectedOwnerEpoch: 1, turnId: "turn-2" }),
       headers: { "content-type": "application/json" },
     });
     const body = await response.json();
@@ -2204,20 +2600,58 @@ describe("Codex Relay server routes", () => {
       readThread: vi.fn<() => Promise<unknown>>(async () => appThread),
       setThreadGoal,
     };
+    const threadCoordinator = await createRelayStateStore(":memory:");
+    await threadCoordinator.acquireThreadOwner({
+      capabilities: {
+        approve: true,
+        configure: true,
+        interrupt: true,
+        queue: true,
+        send: true,
+        steer: true,
+        view: true,
+      },
+      ownerId: "relay-goal",
+      ownerInstanceId: "process-goal",
+      ownerType: "relay_app_server",
+      threadId: "app-thread-goal-actions",
+    });
     const app = createApp({
       appServer: appServer as never,
       codex: createMockCodex(),
+      threadCoordinator,
       workspacePath,
     });
 
+    const staleUpdateResponse = await app.request("/v1/threads/app-thread-goal-actions/goal", {
+      method: "POST",
+      body: JSON.stringify({ expectedOwnerEpoch: 2, objective: "Stale objective" }),
+      headers: { "content-type": "application/json" },
+    });
+    expect(staleUpdateResponse.status).toBe(409);
+    expect(setThreadGoal).not.toHaveBeenCalled();
+
     const updateResponse = await app.request("/v1/threads/app-thread-goal-actions/goal", {
       method: "POST",
-      body: JSON.stringify({ objective: "Updated objective", status: "paused" }),
+      body: JSON.stringify({
+        expectedOwnerEpoch: 1,
+        objective: "Updated objective",
+        status: "paused",
+      }),
       headers: { "content-type": "application/json" },
     });
     const updateBody = await updateResponse.json();
+    const staleClearResponse = await app.request("/v1/threads/app-thread-goal-actions/goal", {
+      method: "DELETE",
+      body: JSON.stringify({ expectedOwnerEpoch: 2 }),
+      headers: { "content-type": "application/json" },
+    });
+    expect(staleClearResponse.status).toBe(409);
+    expect(clearThreadGoal).not.toHaveBeenCalled();
     const clearResponse = await app.request("/v1/threads/app-thread-goal-actions/goal", {
       method: "DELETE",
+      body: JSON.stringify({ expectedOwnerEpoch: 1 }),
+      headers: { "content-type": "application/json" },
     });
     const clearBody = await clearResponse.json();
 
@@ -4434,9 +4868,13 @@ describe("Codex Relay server routes", () => {
       startThread: vi.fn<() => Promise<unknown>>(async () => appThread),
       startTurn,
     };
+    const threadCoordinator = await createRelayStateStore(":memory:");
     const app = createApp({
       appServer: appServer as never,
       codex: createMockCodex(),
+      connectionPlan: { relayId: "relay-interrupt", serverEpoch: "process-interrupt" },
+      threadCoordinator,
+      threadInputs: threadCoordinator,
       workspacePath,
     });
 
@@ -4455,8 +4893,29 @@ describe("Codex Relay server routes", () => {
     });
     await waitUntil(() => expect(startTurn).toHaveBeenCalledTimes(1));
 
+    const detailResponse = await app.request("/v1/threads/app-thread-interrupt");
+    expect(await detailResponse.json()).toMatchObject({
+      thread: { id: "app-thread-interrupt", ownerEpoch: 1 },
+    });
+
+    const staleInterruptResponse = await app.request(
+      "/v1/threads/app-thread-interrupt/runs/interrupt",
+      {
+        method: "POST",
+        body: JSON.stringify({ expectedOwnerEpoch: 2 }),
+        headers: { "content-type": "application/json" },
+      },
+    );
+    expect(staleInterruptResponse.status).toBe(409);
+    expect(await staleInterruptResponse.json()).toMatchObject({
+      error: { code: "stale_owner_epoch" },
+    });
+    expect(interruptTurn).not.toHaveBeenCalled();
+
     const interruptResponse = await app.request("/v1/threads/app-thread-interrupt/runs/interrupt", {
       method: "POST",
+      body: JSON.stringify({ expectedOwnerEpoch: 1 }),
+      headers: { "content-type": "application/json" },
     });
     const interruptBody = await interruptResponse.json();
 
@@ -4533,6 +4992,89 @@ describe("Codex Relay server routes", () => {
     expect(body).toContain("thread.message.created");
     expect(body).toContain("thread.message.completed");
     expect(body).toContain("direct reply");
+    expect(body).toContain('"state":"completed"');
+  });
+
+  it("streams assistant items included only in app-server terminal turn notifications", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const notificationHandlers = new Set<(notification: unknown) => void>();
+    const now = Date.now() / 1000;
+    const appServer = {
+      onNotification(handler: (notification: unknown) => void) {
+        notificationHandlers.add(handler);
+        return () => notificationHandlers.delete(handler);
+      },
+      onRequest() {
+        return () => undefined;
+      },
+      startThread: vi.fn<() => Promise<unknown>>(async () => ({
+        id: "app-thread-terminal-items",
+        createdAt: now,
+        cwd: workspacePath,
+        modelProvider: "gpt-5.5",
+        name: "Terminal items",
+        preview: "Terminal items",
+        source: "app",
+        status: "idle",
+        turns: [],
+        updatedAt: now,
+      })),
+      startTurn: vi.fn<() => Promise<unknown>>(async () => {
+        queueMicrotask(() => {
+          for (const handler of notificationHandlers) {
+            handler({
+              method: "turn/completed",
+              params: {
+                threadId: "app-thread-terminal-items",
+                turn: {
+                  id: "turn-terminal-items",
+                  items: [
+                    {
+                      id: "assistant-terminal-items",
+                      text: "final desktop reply",
+                      type: "agentMessage",
+                    },
+                  ],
+                  status: "completed",
+                  error: null,
+                  startedAt: now,
+                  completedAt: now,
+                },
+              },
+            });
+          }
+        });
+        return {
+          id: "turn-terminal-items",
+          items: [],
+          status: "running",
+          startedAt: now,
+          completedAt: null,
+        };
+      }),
+    };
+    const app = createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      workspacePath,
+    });
+
+    await app.request("/v1/threads", {
+      method: "POST",
+      body: JSON.stringify({ title: "Terminal items" }),
+      headers: { "content-type": "application/json" },
+    });
+    const response = await app.request("/v1/threads/app-thread-terminal-items/runs/stream", {
+      method: "POST",
+      body: JSON.stringify({ prompt: "Reply in terminal turn" }),
+      headers: { "content-type": "application/json" },
+    });
+    const body = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(body).toContain("thread.message.completed");
+    expect(body).toContain("final desktop reply");
+    expect(body).not.toContain("codex_empty_response");
     expect(body).toContain('"state":"completed"');
   });
 
@@ -5301,6 +5843,101 @@ describe("Codex Relay server routes", () => {
     expect(body).toContain("codex_run_failed");
     expect(body).toContain(failureMessage);
     expect(body).not.toContain("codex_empty_response");
+  });
+
+  it("reports external active writer conflicts with a dedicated stream error code", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const now = Date.now() / 1000;
+    const appServer = {
+      onNotification() {
+        return () => undefined;
+      },
+      onRequest() {
+        return () => undefined;
+      },
+      startThread: vi.fn<() => Promise<unknown>>(async () => ({
+        id: "app-thread-active-writer",
+        createdAt: now,
+        cwd: workspacePath,
+        modelProvider: "gpt-5.5",
+        name: "Active writer",
+        preview: "Active writer",
+        source: "app",
+        status: "idle",
+        turns: [],
+        updatedAt: now,
+      })),
+      startTurn: vi.fn<() => Promise<unknown>>(async () => {
+        throw new Error("thread app-thread-active-writer already has an active writer");
+      }),
+    };
+    const app = createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      workspacePath,
+    });
+
+    await app.request("/v1/threads", {
+      method: "POST",
+      body: JSON.stringify({ title: "Active writer" }),
+      headers: { "content-type": "application/json" },
+    });
+    const response = await app.request("/v1/threads/app-thread-active-writer/runs/stream", {
+      method: "POST",
+      body: JSON.stringify({ prompt: "Continue from mobile" }),
+      headers: { "content-type": "application/json" },
+    });
+    const body = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(body).toContain("thread.error");
+    expect(body).toContain("thread_active_writer");
+    expect(body).not.toContain("codex_run_failed");
+  });
+
+  it("rejects running-thread input when the active writer is external", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const now = Date.now() / 1000;
+    const appServer = {
+      onNotification() {
+        return () => undefined;
+      },
+      onRequest() {
+        return () => undefined;
+      },
+      startThread: vi.fn<() => Promise<unknown>>(async () => ({
+        id: "app-thread-external-input",
+        createdAt: now,
+        cwd: workspacePath,
+        modelProvider: "gpt-5.5",
+        name: "External input",
+        preview: "External input",
+        source: "app",
+        status: "running",
+        turns: [],
+        updatedAt: now,
+      })),
+    };
+    const app = createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      workspacePath,
+    });
+
+    await app.request("/v1/threads", {
+      method: "POST",
+      body: JSON.stringify({ title: "External input" }),
+      headers: { "content-type": "application/json" },
+    });
+    const response = await app.request("/v1/threads/app-thread-external-input/input", {
+      method: "POST",
+      body: JSON.stringify({ prompt: "Should not queue" }),
+      headers: { "content-type": "application/json" },
+    });
+    const body = await response.text();
+
+    expect(response.status).toBe(409);
+    expect(body).toContain("thread_active_writer");
   });
 
   it("hands off queued input after a directly returned terminal turn", async () => {
@@ -6439,10 +7076,732 @@ describe("Codex Relay server routes", () => {
     );
   });
 
+  it("restores durable approvals after a Relay restart and resolves the original request", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const approvalStore = await createRelayStateStore(":memory:");
+    const timestamp = new Date().toISOString();
+    await approvalStore.createPendingApproval({
+      approvalId: "approval-41",
+      kind: "structuredUserInput",
+      method: "item/tool/requestUserInput",
+      questions: [{ id: "scope", question: "What should happen next?" }],
+      requestId: 41,
+      threadId: "app-thread-recovered-approval",
+      turnId: "turn-recovered-approval",
+    });
+    await approvalStore.createPendingApproval({
+      approvalId: "approval-42",
+      kind: "commandExecution",
+      message: {
+        id: "approval-message-42",
+        threadId: "app-thread-recovered-approval",
+        role: "status",
+        kind: "approvalRequest",
+        content: "pnpm test",
+        details: { approvalId: "approval-42", approvalKind: "commandExecution" },
+        createdAt: timestamp,
+        state: "completed",
+      },
+      messageId: "approval-message-42",
+      method: "item/commandExecution/requestApproval",
+      requestId: 42,
+      threadId: "app-thread-recovered-approval",
+      turnId: "turn-recovered-approval",
+    });
+    const now = Date.now() / 1_000;
+    const thread = {
+      id: "app-thread-recovered-approval",
+      createdAt: now,
+      cwd: workspacePath,
+      modelProvider: "gpt-5.5",
+      name: "Recovered approval",
+      preview: "Recovered approval",
+      source: "app",
+      status: "active",
+      turns: [],
+      updatedAt: now,
+    };
+    const respondToRequest = vi.fn<() => Promise<void>>();
+    const app = createApp({
+      appServer: {
+        readThread: vi.fn<() => Promise<unknown>>(async () => thread),
+        respondToRequest,
+      } as never,
+      approvalStore,
+      codex: createMockCodex(),
+      workspacePath,
+    });
+
+    const detailResponse = await app.request("/v1/threads/app-thread-recovered-approval");
+    const detail = await detailResponse.json();
+    const resolution = await app.request("/v1/approvals/approval-41", {
+      method: "POST",
+      body: JSON.stringify({ decision: "approve", answers: ["Run tests"] }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(detailResponse.status).toBe(200);
+    expect(detail.pendingInputRequests).toContainEqual(
+      expect.objectContaining({
+        id: "approval-41",
+        questions: [expect.objectContaining({ id: "scope" })],
+      }),
+    );
+    expect(detail.messages).toContainEqual(
+      expect.objectContaining({ id: "approval-message-42", kind: "approvalRequest" }),
+    );
+    expect(resolution.status).toBe(200);
+    expect(respondToRequest).toHaveBeenCalledWith(41, {
+      answers: { scope: { answers: ["Run tests"] } },
+    });
+    await expect(approvalStore.listPendingApprovals()).resolves.toMatchObject([
+      { approvalId: "approval-42" },
+    ]);
+  });
+
+  it("reconciles an active app-server turn after shared socket reconnect", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const connectionStateHandlers = new Set<
+      (event: { state: "disconnected" | "reconnected" }) => void
+    >();
+    const notificationHandlers = new Set<(notification: unknown) => void>();
+    const now = Date.now() / 1000;
+    let reconciledState: "running" | "completed" = "running";
+    let reconnectTurnStarted = false;
+    const activeTurn = () => ({
+      id: "turn-reconnect",
+      items:
+        reconciledState === "completed"
+          ? [{ id: "assistant-reconnect", text: "Recovered after reconnect", type: "agentMessage" }]
+          : [],
+      status: reconciledState,
+      startedAt: now,
+      completedAt: reconciledState === "completed" ? now + 1 : null,
+    });
+    const readThread = vi.fn<
+      (threadId: string, options?: { includeTurns?: boolean }) => Promise<unknown>
+    >(async () => ({
+      id: "app-thread-reconnect",
+      createdAt: now,
+      cwd: workspacePath,
+      modelProvider: "gpt-5.5",
+      name: "Reconnect thread",
+      preview: "Reconnect thread",
+      source: "app",
+      status: reconnectTurnStarted && reconciledState === "running" ? "active" : "idle",
+      turns: [activeTurn()],
+      updatedAt: now,
+    }));
+    const startTurn = vi.fn<() => Promise<unknown>>(async () => {
+      reconnectTurnStarted = true;
+      return activeTurn();
+    });
+    const appServer = {
+      onConnectionState(handler: (event: { state: "disconnected" | "reconnected" }) => void) {
+        connectionStateHandlers.add(handler);
+        return () => connectionStateHandlers.delete(handler);
+      },
+      onNotification(handler: (notification: unknown) => void) {
+        notificationHandlers.add(handler);
+        return () => notificationHandlers.delete(handler);
+      },
+      onRequest() {
+        return () => undefined;
+      },
+      readThread,
+      startThread: vi.fn<() => Promise<unknown>>(async () => ({
+        id: "app-thread-reconnect",
+        createdAt: now,
+        cwd: workspacePath,
+        modelProvider: "gpt-5.5",
+        name: "Reconnect thread",
+        preview: "Reconnect thread",
+        source: "app",
+        status: "idle",
+        turns: [],
+        updatedAt: now,
+      })),
+      startTurn,
+    };
+    const threadCoordinator = await createRelayStateStore(":memory:");
+    const app = createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      threadCoordinator,
+      threadInputs: threadCoordinator,
+      workspacePath,
+    });
+
+    await app.request("/v1/threads", {
+      method: "POST",
+      body: JSON.stringify({ title: "Reconnect thread" }),
+      headers: { "content-type": "application/json" },
+    });
+    const streamResponse = await app.request("/v1/threads/app-thread-reconnect/runs/stream", {
+      method: "POST",
+      body: JSON.stringify({
+        clientEventId: "04f70ba3-d3f0-4db6-a17b-cfe7339e27cc",
+        prompt: "Keep this turn alive",
+      }),
+      headers: { "content-type": "application/json" },
+    });
+    await vi.waitFor(() => expect(startTurn).toHaveBeenCalledTimes(1));
+    await vi.waitFor(async () =>
+      expect(await threadCoordinator.getActiveTurnClaim("app-thread-reconnect")).toMatchObject({
+        runtimeTurnId: "turn-reconnect",
+        state: "active",
+      }),
+    );
+
+    for (const handler of connectionStateHandlers) {
+      handler({ state: "reconnected" });
+    }
+    await vi.waitFor(() =>
+      expect(readThread).toHaveBeenCalledWith("app-thread-reconnect", { includeTurns: true }),
+    );
+    const reconciliationReadCount = readThread.mock.calls.filter(
+      (call) => (call[1] as { includeTurns?: boolean } | undefined)?.includeTurns,
+    ).length;
+    expect(reconciliationReadCount).toBe(1);
+    expect(startTurn).toHaveBeenCalledTimes(1);
+    expect(await threadCoordinator.getActiveTurnClaim("app-thread-reconnect")).toMatchObject({
+      runtimeTurnId: "turn-reconnect",
+      state: "active",
+    });
+
+    reconciledState = "completed";
+    for (const handler of connectionStateHandlers) {
+      handler({ state: "reconnected" });
+    }
+    const body = await streamResponse.text();
+
+    expect(
+      readThread.mock.calls.filter(
+        (call) => (call[1] as { includeTurns?: boolean } | undefined)?.includeTurns,
+      ),
+    ).toHaveLength(2);
+    expect(startTurn).toHaveBeenCalledTimes(1);
+    expect(body).toContain("Recovered after reconnect");
+    expect(await threadCoordinator.getActiveTurnClaim("app-thread-reconnect")).toBeUndefined();
+    expect(
+      await threadCoordinator.getThreadInputByClientEvent(
+        "unpaired-client",
+        "04f70ba3-d3f0-4db6-a17b-cfe7339e27cc",
+      ),
+    ).toMatchObject({ state: "completed" });
+    expect(connectionStateHandlers).toHaveLength(0);
+  });
+
+  it("finalizes a startup-recovered claim only for its exact runtime turn", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const notificationHandlers = new Set<(notification: unknown) => void>();
+    const now = Date.now() / 1000;
+    const threadCoordinator = await createRelayStateStore(":memory:");
+    const previousOwner = await threadCoordinator.acquireThreadOwner({
+      capabilities: {
+        approve: true,
+        configure: true,
+        interrupt: true,
+        queue: true,
+        send: true,
+        steer: true,
+        view: true,
+      },
+      ownerId: "relay-recovered",
+      ownerInstanceId: "process-before-restart",
+      ownerType: "shared_app_server",
+      threadId: "app-thread-startup-recovered",
+    });
+    await threadCoordinator.createThreadInput({
+      clientId: "mobile-client",
+      inputId: "input-startup-recovered",
+      payload: { prompt: "survive relay restart" },
+      state: "accepted",
+      threadId: "app-thread-startup-recovered",
+    });
+    const acquired = await threadCoordinator.acquireTurnClaim({
+      inputId: "input-startup-recovered",
+      ownerEpoch: previousOwner.epoch,
+      ownerId: previousOwner.ownerId,
+      threadId: "app-thread-startup-recovered",
+    });
+    if (acquired.kind !== "acquired") {
+      throw new Error("Expected the startup input to acquire a claim.");
+    }
+    const bound = await threadCoordinator.bindTurnClaimRuntimeTurn({
+      claimId: acquired.claim.claimId,
+      ownerEpoch: previousOwner.epoch,
+      ownerId: previousOwner.ownerId,
+      runtimeTurnId: "turn-startup-recovered",
+    });
+    if (bound.kind !== "updated") {
+      throw new Error("Expected the startup claim to bind its runtime turn.");
+    }
+    const adopted = await threadCoordinator.adoptActiveTurnClaim({
+      capabilities: previousOwner.capabilities,
+      claimId: acquired.claim.claimId,
+      ownerId: "relay-recovered",
+      ownerInstanceId: "process-after-restart",
+      ownerType: "shared_app_server",
+      runtimeTurnId: "turn-startup-recovered",
+      threadId: "app-thread-startup-recovered",
+    });
+    if (adopted.kind !== "adopted") {
+      throw new Error("Expected the startup claim to be adopted.");
+    }
+    let recoveredTurnStatus = "running";
+    let recoveredTurnCompletedAt: number | null = null;
+    const startTurn = vi.fn<() => Promise<unknown>>();
+    const readThread = vi.fn<(_threadId: string, _options: unknown) => Promise<unknown>>(
+      async () => ({
+        id: "app-thread-startup-recovered",
+        createdAt: now,
+        cwd: workspacePath,
+        modelProvider: "gpt-5.5",
+        name: "Recovered thread",
+        preview: "Recovered thread",
+        source: "app",
+        status: "active",
+        turns: [
+          {
+            completedAt: recoveredTurnCompletedAt,
+            id: "turn-startup-recovered",
+            items: [
+              {
+                id: "assistant-startup-recovered",
+                text: "Recovered assistant output",
+                type: "agentMessage",
+              },
+            ],
+            startedAt: now,
+            status: recoveredTurnStatus,
+          },
+        ],
+        updatedAt: now,
+      }),
+    );
+    const appServer = {
+      appServerMode: "socket",
+      onConnectionState() {
+        return () => undefined;
+      },
+      onNotification(handler: (notification: unknown) => void) {
+        notificationHandlers.add(handler);
+        return () => notificationHandlers.delete(handler);
+      },
+      readThread,
+      startTurn,
+    };
+
+    createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      connectionPlan: {
+        relayId: "relay-recovered",
+        serverEpoch: "process-after-restart",
+      },
+      recoveredTurnClaims: [{ claim: adopted.claim, input: adopted.input, owner: adopted.owner }],
+      threadCoordinator,
+      threadEvents: threadCoordinator,
+      threadInputs: threadCoordinator,
+      workspacePath,
+    });
+    await vi.waitFor(() => expect(readThread).toHaveBeenCalledTimes(1));
+
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "turn/completed",
+        params: {
+          status: "completed",
+          threadId: "app-thread-startup-recovered",
+          turnId: "turn-other",
+        },
+      });
+    }
+    expect(
+      await threadCoordinator.getActiveTurnClaim("app-thread-startup-recovered"),
+    ).toMatchObject({ claimId: acquired.claim.claimId });
+
+    recoveredTurnStatus = "cancelled";
+    recoveredTurnCompletedAt = now;
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "turn/cancelled",
+        params: {
+          status: "cancelled",
+          threadId: "app-thread-startup-recovered",
+          turnId: "turn-startup-recovered",
+        },
+      });
+    }
+    await vi.waitFor(async () =>
+      expect(
+        await threadCoordinator.getActiveTurnClaim("app-thread-startup-recovered"),
+      ).toBeUndefined(),
+    );
+
+    expect(startTurn).not.toHaveBeenCalled();
+    expect(
+      await threadCoordinator.listThreadInputs({ threadId: "app-thread-startup-recovered" }),
+    ).toMatchObject([{ state: "cancelled" }]);
+    const recoveredEvents = await threadCoordinator.listThreadEvents({
+      threadId: "app-thread-startup-recovered",
+    });
+    expect(recoveredEvents.events.map((event) => event.event)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          message: expect.objectContaining({
+            content: "Recovered assistant output",
+            id: "assistant-startup-recovered",
+          }),
+          type: "thread.message.completed",
+        }),
+        expect.objectContaining({
+          thread: expect.objectContaining({ state: "failed" }),
+          type: "thread.state.changed",
+        }),
+      ]),
+    );
+  });
+
+  it("dispatches one durable queued input after a recovered turn completes", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const notificationHandlers = new Set<(notification: unknown) => void>();
+    const now = Date.now() / 1000;
+    const threadId = "app-thread-recovery-queue";
+    const threadCoordinator = await createRelayStateStore(":memory:");
+    const previousOwner = await threadCoordinator.acquireThreadOwner({
+      capabilities: {
+        approve: true,
+        configure: true,
+        interrupt: true,
+        queue: true,
+        send: true,
+        steer: true,
+        view: true,
+      },
+      ownerId: "relay-recovery-queue",
+      ownerInstanceId: "process-before-restart",
+      ownerType: "shared_app_server",
+      threadId,
+    });
+    await threadCoordinator.createThreadInput({
+      clientId: "mobile-client",
+      inputId: "input-recovery-active",
+      payload: { prompt: "active before restart" },
+      state: "accepted",
+      threadId,
+    });
+    const acquired = await threadCoordinator.acquireTurnClaim({
+      inputId: "input-recovery-active",
+      ownerEpoch: previousOwner.epoch,
+      ownerId: previousOwner.ownerId,
+      threadId,
+    });
+    if (acquired.kind !== "acquired") {
+      throw new Error("Expected the pre-restart input to acquire a claim.");
+    }
+    const bound = await threadCoordinator.bindTurnClaimRuntimeTurn({
+      claimId: acquired.claim.claimId,
+      ownerEpoch: previousOwner.epoch,
+      ownerId: previousOwner.ownerId,
+      runtimeTurnId: "turn-recovery-active",
+    });
+    if (bound.kind !== "updated") {
+      throw new Error("Expected the pre-restart claim to bind its runtime turn.");
+    }
+    const adopted = await threadCoordinator.adoptActiveTurnClaim({
+      capabilities: previousOwner.capabilities,
+      claimId: acquired.claim.claimId,
+      ownerId: "relay-recovery-queue",
+      ownerInstanceId: "process-after-restart",
+      ownerType: "shared_app_server",
+      runtimeTurnId: "turn-recovery-active",
+      threadId,
+    });
+    if (adopted.kind !== "adopted") {
+      throw new Error("Expected the pre-restart claim to be adopted.");
+    }
+    await threadCoordinator.createThreadInput({
+      clientId: "mobile-client",
+      inputId: "input-recovery-queued",
+      payload: {
+        attachments: [],
+        prompt: "queued after restart",
+        runOptions: {},
+        skills: [],
+        workspacePath,
+      },
+      state: "queued",
+      threadId,
+    });
+
+    const recoveredTurn = {
+      completedAt: null as number | null,
+      id: "turn-recovery-active",
+      items: [
+        {
+          id: "assistant-recovery-active",
+          text: "Recovered first output",
+          type: "agentMessage",
+        },
+      ],
+      startedAt: now,
+      status: "running",
+    };
+    const turns: unknown[] = [recoveredTurn];
+    const queuedTurn = {
+      completedAt: now,
+      id: "turn-recovery-queued",
+      items: [
+        {
+          id: "assistant-recovery-queued",
+          text: "Recovered queued output",
+          type: "agentMessage",
+        },
+      ],
+      startedAt: now,
+      status: "completed",
+    };
+    const startTurn = vi.fn<() => Promise<unknown>>(async () => {
+      turns.push(queuedTurn);
+      return queuedTurn;
+    });
+    const readThread = vi.fn<(_threadId: string, _options: unknown) => Promise<unknown>>(
+      async () => ({
+        id: threadId,
+        createdAt: now,
+        cwd: workspacePath,
+        modelProvider: "gpt-5.5",
+        name: "Recovery queue",
+        preview: "Recovery queue",
+        source: "app",
+        status: turns.every((turn) => (turn as { status?: string }).status === "completed")
+          ? "idle"
+          : "active",
+        turns,
+        updatedAt: now,
+      }),
+    );
+    const appServer = {
+      appServerMode: "socket",
+      onConnectionState() {
+        return () => undefined;
+      },
+      onNotification(handler: (notification: unknown) => void) {
+        notificationHandlers.add(handler);
+        return () => notificationHandlers.delete(handler);
+      },
+      readThread,
+      startTurn,
+    };
+
+    createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      connectionPlan: {
+        relayId: "relay-recovery-queue",
+        serverEpoch: "process-after-restart",
+      },
+      recoveredTurnClaims: [{ claim: adopted.claim, input: adopted.input, owner: adopted.owner }],
+      threadCoordinator,
+      threadEvents: threadCoordinator,
+      threadInputs: threadCoordinator,
+      workspacePath,
+    });
+    await vi.waitFor(() => expect(readThread).toHaveBeenCalledTimes(1));
+
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "item/completed",
+        params: {
+          item: recoveredTurn.items[0],
+          threadId,
+          turnId: recoveredTurn.id,
+        },
+      });
+    }
+    await vi.waitFor(async () => {
+      const events = await threadCoordinator.listThreadEvents({ threadId, limit: 100 });
+      expect(events.events.map((event) => event.event)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            message: expect.objectContaining({ content: "Recovered first output" }),
+            type: "thread.message.completed",
+          }),
+        ]),
+      );
+    });
+    expect(await threadCoordinator.getActiveTurnClaim(threadId)).toMatchObject({
+      claimId: acquired.claim.claimId,
+    });
+    expect(startTurn).not.toHaveBeenCalled();
+
+    recoveredTurn.completedAt = now;
+    recoveredTurn.status = "completed";
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "turn/completed",
+        params: { status: "completed", threadId, turnId: recoveredTurn.id },
+      });
+    }
+
+    await vi.waitFor(async () => {
+      expect(startTurn).toHaveBeenCalledTimes(1);
+      expect(await threadCoordinator.getActiveTurnClaim(threadId)).toBeUndefined();
+    });
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "turn/completed",
+        params: { status: "completed", threadId, turnId: recoveredTurn.id },
+      });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(startTurn).toHaveBeenCalledTimes(1);
+    expect(await threadCoordinator.listThreadInputs({ threadId })).toMatchObject([
+      { inputId: "input-recovery-active", state: "completed" },
+      { inputId: "input-recovery-queued", state: "completed" },
+    ]);
+    const recoveredEvents = await threadCoordinator.listThreadEvents({ threadId, limit: 100 });
+    const assistantContents = recoveredEvents.events.flatMap((event) =>
+      "message" in event.event && event.event.message?.role === "assistant"
+        ? [event.event.message.content]
+        : [],
+    );
+    expect(assistantContents).toEqual(
+      expect.arrayContaining(["Recovered first output", "Recovered queued output"]),
+    );
+    expect(
+      assistantContents.filter((content) => content === "Recovered first output"),
+    ).toHaveLength(1);
+  });
+
+  it("keeps a recovery-dispatched claim active when runtime binding persistence fails", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const notificationHandlers = new Set<(notification: unknown) => void>();
+    const now = Date.now() / 1000;
+    const threadId = "app-thread-recovery-bind-failure";
+    const store = await createRelayStateStore(":memory:");
+    const adopted = await createAdoptedTestClaim({
+      inputId: "input-recovery-bind-active",
+      ownerId: "relay-recovery-bind",
+      store,
+      threadId,
+      turnId: "turn-recovery-bind-active",
+    });
+    await store.createThreadInput({
+      clientId: "mobile-client",
+      inputId: "input-recovery-bind-queued",
+      payload: {
+        attachments: [],
+        prompt: "queued bind failure",
+        runOptions: {},
+        skills: [],
+        workspacePath,
+      },
+      state: "queued",
+      threadId,
+    });
+
+    const recoveredTurn = {
+      completedAt: null as number | null,
+      id: "turn-recovery-bind-active",
+      items: [],
+      startedAt: now,
+      status: "running",
+    };
+    const acceptedTurn = {
+      completedAt: null,
+      id: "turn-recovery-bind-accepted",
+      items: [],
+      startedAt: now,
+      status: "running",
+    };
+    const startTurn = vi.fn<() => Promise<unknown>>(async () => acceptedTurn);
+    const bindTurnClaimRuntimeTurn = vi.fn<typeof store.bindTurnClaimRuntimeTurn>(async () => {
+      throw new Error("database temporarily unavailable");
+    });
+    const recoveryCoordinator = { ...store, bindTurnClaimRuntimeTurn };
+    const readThread = vi.fn<(_threadId: string, _options: unknown) => Promise<unknown>>(
+      async () => ({
+        id: threadId,
+        createdAt: now,
+        cwd: workspacePath,
+        modelProvider: "gpt-5.5",
+        name: "Recovery bind failure",
+        preview: "Recovery bind failure",
+        source: "app",
+        status: recoveredTurn.status === "completed" ? "idle" : "active",
+        turns: [recoveredTurn, acceptedTurn],
+        updatedAt: now,
+      }),
+    );
+    const appServer = {
+      appServerMode: "socket",
+      onConnectionState() {
+        return () => undefined;
+      },
+      onNotification(handler: (notification: unknown) => void) {
+        notificationHandlers.add(handler);
+        return () => notificationHandlers.delete(handler);
+      },
+      readThread,
+      startTurn,
+    };
+
+    createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      connectionPlan: {
+        relayId: "relay-recovery-bind",
+        serverEpoch: "process-after-restart",
+      },
+      recoveredTurnClaims: [{ claim: adopted.claim, input: adopted.input, owner: adopted.owner }],
+      threadCoordinator: recoveryCoordinator,
+      threadEvents: store,
+      threadInputs: store,
+      workspacePath,
+    });
+    await vi.waitFor(() => expect(readThread).toHaveBeenCalledTimes(1));
+
+    recoveredTurn.completedAt = now;
+    recoveredTurn.status = "completed";
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "turn/completed",
+        params: { status: "completed", threadId, turnId: recoveredTurn.id },
+      });
+    }
+    await vi.waitFor(() => {
+      expect(startTurn).toHaveBeenCalledTimes(1);
+      expect(bindTurnClaimRuntimeTurn).toHaveBeenCalledTimes(1);
+    });
+
+    expect(await store.getActiveTurnClaim(threadId)).toMatchObject({
+      inputId: "input-recovery-bind-queued",
+      runtimeTurnId: undefined,
+      state: "active",
+    });
+    expect(await store.listThreadInputs({ threadId })).toMatchObject([
+      { inputId: "input-recovery-bind-active", state: "completed" },
+      { inputId: "input-recovery-bind-queued", state: "running" },
+    ]);
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "turn/completed",
+        params: { status: "completed", threadId, turnId: recoveredTurn.id },
+      });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(startTurn).toHaveBeenCalledTimes(1);
+  });
+
   it("recovers a missing app-server thread even after prior messages exist", async () => {
     const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
     const notificationHandlers = new Set<(notification: unknown) => void>();
     const now = Date.now() / 1000;
+    let threadStartCount = 0;
     let turnCount = 0;
     const appServer = {
       onNotification(handler: (notification: unknown) => void) {
@@ -6452,19 +7811,22 @@ describe("Codex Relay server routes", () => {
       onRequest() {
         return () => undefined;
       },
-      startThread: vi.fn<() => Promise<unknown>>(async () => ({
-        id: "app-thread-stale",
-        createdAt: now,
-        cwd: workspacePath,
-        modelProvider: "gpt-5.5",
-        name: "Stale thread",
-        preview: "Stale thread",
-        source: "app",
-        status: "idle",
-        turns: [],
-        updatedAt: now,
-      })),
-      startTurn: vi.fn<() => Promise<unknown>>(async () => {
+      startThread: vi.fn<() => Promise<unknown>>(async () => {
+        threadStartCount += 1;
+        return {
+          id: threadStartCount === 1 ? "app-thread-stale" : "app-thread-recovered",
+          createdAt: now,
+          cwd: workspacePath,
+          modelProvider: "gpt-5.5",
+          name: "Stale thread",
+          preview: "Stale thread",
+          source: "app",
+          status: "idle",
+          turns: [],
+          updatedAt: now,
+        };
+      }),
+      startTurn: vi.fn<(params: { threadId: string }) => Promise<unknown>>(async (params) => {
         turnCount += 1;
         if (turnCount === 2) {
           throw new Error("Thread not found");
@@ -6479,13 +7841,13 @@ describe("Codex Relay server routes", () => {
               params: {
                 delta: reply,
                 itemId,
-                threadId: "app-thread-stale",
+                threadId: params.threadId,
                 turnId,
               },
             });
             handler({
               method: "turn/completed",
-              params: { status: "completed", threadId: "app-thread-stale", turnId },
+              params: { status: "completed", threadId: params.threadId, turnId },
             });
           }
         });
@@ -6498,9 +7860,13 @@ describe("Codex Relay server routes", () => {
         };
       }),
     };
+    const threadCoordinator = await createRelayStateStore(":memory:");
     const app = createApp({
       appServer: appServer as never,
       codex: createMockCodex(),
+      connectionPlan: { relayId: "relay-recovery", serverEpoch: "process-recovery" },
+      threadCoordinator,
+      threadInputs: threadCoordinator,
       workspacePath,
     });
 
@@ -6511,14 +7877,20 @@ describe("Codex Relay server routes", () => {
     });
     const firstResponse = await app.request("/v1/threads/app-thread-stale/runs/stream", {
       method: "POST",
-      body: JSON.stringify({ prompt: "First run" }),
+      body: JSON.stringify({
+        clientEventId: "27cc6547-d51d-40d4-b60f-006e10c27cb8",
+        prompt: "First run",
+      }),
       headers: { "content-type": "application/json" },
     });
     await firstResponse.text();
 
     const secondResponse = await app.request("/v1/threads/app-thread-stale/runs/stream", {
       method: "POST",
-      body: JSON.stringify({ prompt: "Continue existing thread" }),
+      body: JSON.stringify({
+        clientEventId: "b2a8e8fd-5681-4a94-974f-f1e72dbb73ce",
+        prompt: "Continue existing thread",
+      }),
       headers: { "content-type": "application/json" },
     });
     const body = await secondResponse.text();
@@ -6527,7 +7899,15 @@ describe("Codex Relay server routes", () => {
     expect(appServer.startThread).toHaveBeenCalledTimes(2);
     expect(body).not.toContain("thread.error");
     expect(body).toContain("recovered reply");
-    expect(body).toContain('"id":"app-thread-stale"');
+    expect(body).toContain('"id":"app-thread-recovered"');
+    expect(
+      await threadCoordinator.getThreadInputByClientEvent(
+        "unpaired-client",
+        "b2a8e8fd-5681-4a94-974f-f1e72dbb73ce",
+      ),
+    ).toMatchObject({ state: "completed", threadId: "app-thread-recovered" });
+    expect(await threadCoordinator.getActiveTurnClaim("app-thread-stale")).toBeUndefined();
+    expect(await threadCoordinator.getActiveTurnClaim("app-thread-recovered")).toBeUndefined();
   });
 
   it("hands off queued input when the active turn completes during input submission", async () => {
@@ -6668,6 +8048,18 @@ describe("Codex Relay server routes", () => {
       onRequest() {
         return () => undefined;
       },
+      readThread: vi.fn<() => Promise<unknown>>(async () => ({
+        id: "app-thread-queue",
+        createdAt: now,
+        cwd: workspacePath,
+        modelProvider: "gpt-5.5",
+        name: "Queue thread",
+        preview: "Queue thread",
+        source: "app",
+        status: turnCount > 0 ? "active" : "idle",
+        turns: [],
+        updatedAt: now,
+      })),
       startThread: vi.fn<() => Promise<unknown>>(async () => ({
         id: "app-thread-queue",
         createdAt: now,
@@ -6682,9 +8074,12 @@ describe("Codex Relay server routes", () => {
       })),
       startTurn,
     };
+    const threadInputs = await createRelayStateStore(":memory:");
     const app = createApp({
       appServer: appServer as never,
       codex: createMockCodex(),
+      threadCoordinator: threadInputs,
+      threadInputs,
       workspacePath,
     });
     const skillPath = join(workspacePath, ".agents", "skills", "dogfood", "SKILL.md");
@@ -6705,8 +8100,25 @@ describe("Codex Relay server routes", () => {
     });
     const streamResponse = await app.request("/v1/threads/app-thread-queue/runs/stream", {
       method: "POST",
-      body: JSON.stringify({ prompt: "Initial run" }),
-      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        clientEventId: "fa924609-21bc-42ab-9f9e-e4ae6e75fd76",
+        prompt: "Initial run",
+      }),
+      headers: {
+        "content-type": "application/json",
+        "x-codex-relay-client-session-id": "mobile-client-a",
+      },
+    });
+    const duplicateStreamResponse = await app.request("/v1/threads/app-thread-queue/runs/stream", {
+      method: "POST",
+      body: JSON.stringify({
+        clientEventId: "fa924609-21bc-42ab-9f9e-e4ae6e75fd76",
+        prompt: "Initial run",
+      }),
+      headers: {
+        "content-type": "application/json",
+        "x-codex-relay-client-session-id": "mobile-client-a",
+      },
     });
 
     const firstQueuedResponse = await app.request("/v1/threads/app-thread-queue/input", {
@@ -6714,6 +8126,7 @@ describe("Codex Relay server routes", () => {
       body: JSON.stringify({
         approvalPolicy: "never",
         attachments: [attachment],
+        clientEventId: "bea3b9d1-c9ce-43ce-a859-40a7d303d1ab",
         model: "gpt-5.5",
         prompt: "Run after first",
         reasoningEffort: "high",
@@ -6721,7 +8134,22 @@ describe("Codex Relay server routes", () => {
         sandboxMode: "danger-full-access",
         skills: [{ name: "dogfood", path: skillPath }],
       }),
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "x-codex-relay-client-session-id": "mobile-client-a",
+      },
+    });
+    const firstQueuedBody = await firstQueuedResponse.json();
+    const duplicateQueuedResponse = await app.request("/v1/threads/app-thread-queue/input", {
+      method: "POST",
+      body: JSON.stringify({
+        clientEventId: "bea3b9d1-c9ce-43ce-a859-40a7d303d1ab",
+        prompt: "A retry body is ignored after the first acceptance",
+      }),
+      headers: {
+        "content-type": "application/json",
+        "x-codex-relay-client-session-id": "mobile-client-a",
+      },
     });
     const secondQueuedResponse = await app.request("/v1/threads/app-thread-queue/input", {
       method: "POST",
@@ -6730,8 +8158,11 @@ describe("Codex Relay server routes", () => {
     });
 
     expect(firstQueuedResponse.status).toBe(202);
-    await expect(firstQueuedResponse.json()).resolves.toMatchObject({
+    expect(firstQueuedBody).toMatchObject({
       acceptedAs: "queued",
+      clientEventId: "bea3b9d1-c9ce-43ce-a859-40a7d303d1ab",
+      deliveryState: "queued",
+      inputId: expect.any(String),
       queueLength: 1,
       thread: {
         approvalPolicy: "never",
@@ -6742,15 +8173,31 @@ describe("Codex Relay server routes", () => {
       },
       input: {
         attachments: [attachment],
+        clientEventId: "bea3b9d1-c9ce-43ce-a859-40a7d303d1ab",
         skills: [{ name: "dogfood", path: skillPath }],
       },
     });
+    expect(duplicateQueuedResponse.status).toBe(202);
+    await expect(duplicateQueuedResponse.json()).resolves.toEqual(firstQueuedBody);
     expect(secondQueuedResponse.status).toBe(202);
     await expect(secondQueuedResponse.json()).resolves.toMatchObject({
       acceptedAs: "queued",
       queueLength: 2,
     });
     expect(startTurn).toHaveBeenCalledTimes(1);
+    const initialInput = await threadInputs.getThreadInputByClientEvent(
+      "mobile-client-a",
+      "fa924609-21bc-42ab-9f9e-e4ae6e75fd76",
+    );
+    expect(initialInput).toMatchObject({
+      payload: expect.objectContaining({ prompt: "Initial run" }),
+      state: "running",
+    });
+    expect(await threadInputs.getActiveTurnClaim("app-thread-queue")).toMatchObject({
+      inputId: initialInput?.inputId,
+      runtimeTurnId: "turn-1",
+      state: "active",
+    });
 
     for (const handler of notificationHandlers) {
       handler({
@@ -6758,8 +8205,35 @@ describe("Codex Relay server routes", () => {
         params: { status: "completed", threadId: "app-thread-queue", turnId: "turn-1" },
       });
     }
+    expect(await duplicateStreamResponse.text()).not.toContain("codex_empty_response");
     await vi.waitFor(() => {
       expect(startTurn).toHaveBeenCalledTimes(2);
+    });
+    const observedReadCount = appServer.readThread.mock.calls.length;
+    const terminalRetryResponse = await app.request("/v1/threads/app-thread-queue/runs/stream", {
+      method: "POST",
+      body: JSON.stringify({
+        clientEventId: "fa924609-21bc-42ab-9f9e-e4ae6e75fd76",
+        prompt: "Initial run",
+      }),
+      headers: {
+        "content-type": "application/json",
+        "x-codex-relay-client-session-id": "mobile-client-a",
+      },
+    });
+    expect(await terminalRetryResponse.text()).toBe("");
+    expect(appServer.readThread).toHaveBeenCalledTimes(observedReadCount);
+    expect(startTurn).toHaveBeenCalledTimes(2);
+    expect(
+      await threadInputs.getThreadInputByClientEvent(
+        "mobile-client-a",
+        "bea3b9d1-c9ce-43ce-a859-40a7d303d1ab",
+      ),
+    ).toMatchObject({ state: "running" });
+    expect(await threadInputs.getActiveTurnClaim("app-thread-queue")).toMatchObject({
+      inputId: firstQueuedBody.inputId,
+      runtimeTurnId: "turn-2",
+      state: "active",
     });
     expect(startTurn).toHaveBeenNthCalledWith(
       2,
@@ -6786,6 +8260,16 @@ describe("Codex Relay server routes", () => {
     await vi.waitFor(() => {
       expect(startTurn).toHaveBeenCalledTimes(3);
     });
+    expect(
+      await threadInputs.getThreadInputByClientEvent(
+        "mobile-client-a",
+        "bea3b9d1-c9ce-43ce-a859-40a7d303d1ab",
+      ),
+    ).toMatchObject({ state: "completed" });
+    expect(await threadInputs.getActiveTurnClaim("app-thread-queue")).toMatchObject({
+      inputId: expect.not.stringMatching(firstQueuedBody.inputId),
+      state: "active",
+    });
 
     for (const handler of notificationHandlers) {
       handler({
@@ -6794,6 +8278,292 @@ describe("Codex Relay server routes", () => {
       });
     }
     expect(await streamResponse.text()).toContain("thread.state.changed");
+    expect(await threadInputs.getActiveTurnClaim("app-thread-queue")).toBeUndefined();
+  });
+
+  it("reacquires a thread owner after a stale terminal callback", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const notificationHandlers = new Set<(notification: unknown) => void>();
+    const dispatchOrder: string[] = [];
+    let turnCount = 0;
+    const startTurn = vi.fn<() => Promise<unknown>>(async () => {
+      dispatchOrder.push("start");
+      turnCount += 1;
+      return {
+        id: `turn-owner-${turnCount}`,
+        items: [],
+        status: "running",
+        startedAt: null,
+        completedAt: null,
+      };
+    });
+    const now = Date.now() / 1000;
+    const appServer = {
+      onNotification(handler: (notification: unknown) => void) {
+        notificationHandlers.add(handler);
+        return () => notificationHandlers.delete(handler);
+      },
+      onRequest() {
+        return () => undefined;
+      },
+      startThread: vi.fn<() => Promise<unknown>>(async () => ({
+        id: "app-thread-owner-epoch",
+        createdAt: now,
+        cwd: workspacePath,
+        modelProvider: "gpt-5.5",
+        name: "Owner epoch",
+        preview: "Owner epoch",
+        source: "app",
+        status: "idle",
+        turns: [],
+        updatedAt: now,
+      })),
+      startTurn,
+    };
+    const threadCoordinator = await createRelayStateStore(":memory:");
+    let replaceOwnerOnNextRead = false;
+    const racingThreadCoordinator = {
+      ...threadCoordinator,
+      async getThreadOwner(threadId: string) {
+        const owner = await threadCoordinator.getThreadOwner(threadId);
+        if (replaceOwnerOnNextRead) {
+          replaceOwnerOnNextRead = false;
+          await threadCoordinator.acquireThreadOwner({
+            capabilities: owner!.capabilities,
+            ownerId: "relay-replacement",
+            ownerInstanceId: "process-replacement",
+            ownerType: "relay_app_server",
+            threadId,
+          });
+        }
+        return owner;
+      },
+      async markTurnClaimDispatch(
+        input: Parameters<typeof threadCoordinator.markTurnClaimDispatch>[0],
+      ) {
+        dispatchOrder.push("mark");
+        return threadCoordinator.markTurnClaimDispatch(input);
+      },
+    };
+    const app = createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      connectionPlan: { relayId: "relay-primary", serverEpoch: "process-primary" },
+      threadCoordinator: racingThreadCoordinator,
+      threadInputs: threadCoordinator,
+      workspacePath,
+    });
+
+    await app.request("/v1/threads", {
+      method: "POST",
+      body: JSON.stringify({ title: "Owner epoch" }),
+      headers: { "content-type": "application/json" },
+    });
+    const firstStream = await app.request("/v1/threads/app-thread-owner-epoch/runs/stream", {
+      method: "POST",
+      body: JSON.stringify({
+        clientEventId: "1d5e155c-081b-48bd-a576-383f2d52d129",
+        prompt: "First owner run",
+      }),
+      headers: { "content-type": "application/json" },
+    });
+    await vi.waitFor(() => expect(startTurn).toHaveBeenCalledTimes(1));
+    expect(dispatchOrder).toEqual(["mark", "start"]);
+    expect(await threadCoordinator.getThreadOwner("app-thread-owner-epoch")).toMatchObject({
+      epoch: 1,
+      ownerId: "relay-primary",
+      ownerInstanceId: "process-primary",
+    });
+
+    replaceOwnerOnNextRead = true;
+    const staleStream = await app.request("/v1/threads/app-thread-owner-epoch/runs/stream", {
+      method: "POST",
+      body: JSON.stringify({
+        clientEventId: "73970ab9-47bf-49e0-aa29-a8736984c142",
+        expectedOwnerEpoch: 1,
+        prompt: "Must not run under the replacement owner",
+      }),
+      headers: { "content-type": "application/json" },
+    });
+    expect(staleStream.status).toBe(409);
+    expect(await staleStream.json()).toMatchObject({
+      error: { code: "stale_owner_epoch" },
+    });
+    expect(startTurn).toHaveBeenCalledTimes(1);
+    expect(
+      await threadCoordinator.getThreadInputByClientEvent(
+        "unpaired-client",
+        "73970ab9-47bf-49e0-aa29-a8736984c142",
+      ),
+    ).toBeUndefined();
+    const replacementDetail = await app.request("/v1/threads/app-thread-owner-epoch");
+    expect(await replacementDetail.json()).toMatchObject({
+      thread: { id: "app-thread-owner-epoch", ownerEpoch: 2 },
+    });
+    const staleClaimStream = await app.request("/v1/threads/app-thread-owner-epoch/runs/stream", {
+      method: "POST",
+      body: JSON.stringify({
+        clientEventId: "18cc7882-5105-457e-a1d8-37e37510e42d",
+        expectedOwnerEpoch: 2,
+        prompt: "Do not leave an accepted input after a stale claim",
+      }),
+      headers: { "content-type": "application/json" },
+    });
+    expect(staleClaimStream.status).toBe(409);
+    expect(
+      await threadCoordinator.getThreadInputByClientEvent(
+        "unpaired-client",
+        "18cc7882-5105-457e-a1d8-37e37510e42d",
+      ),
+    ).toMatchObject({ state: "failed" });
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "turn/completed",
+        params: {
+          status: "completed",
+          threadId: "app-thread-owner-epoch",
+          turnId: "turn-owner-1",
+        },
+      });
+    }
+    await firstStream.text();
+
+    const secondStream = await app.request("/v1/threads/app-thread-owner-epoch/runs/stream", {
+      method: "POST",
+      body: JSON.stringify({
+        clientEventId: "35b6d0a0-fe5e-4d1f-85d0-a0d18de61dcc",
+        prompt: "Second owner run",
+      }),
+      headers: { "content-type": "application/json" },
+    });
+    await vi.waitFor(() => expect(startTurn).toHaveBeenCalledTimes(2));
+    expect(await threadCoordinator.getThreadOwner("app-thread-owner-epoch")).toMatchObject({
+      epoch: 3,
+      ownerId: "relay-primary",
+      ownerInstanceId: "process-primary",
+    });
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "turn/completed",
+        params: {
+          status: "completed",
+          threadId: "app-thread-owner-epoch",
+          turnId: "turn-owner-2",
+        },
+      });
+    }
+    await secondStream.text();
+    expect(await threadCoordinator.getActiveTurnClaim("app-thread-owner-epoch")).toBeUndefined();
+    expect(
+      await threadCoordinator.getThreadInputByClientEvent(
+        "unpaired-client",
+        "35b6d0a0-fe5e-4d1f-85d0-a0d18de61dcc",
+      ),
+    ).toMatchObject({ state: "failed" });
+  });
+
+  it("queues a new stream prompt without observing the active turn", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const notificationHandlers = new Set<(notification: unknown) => void>();
+    let turnCount = 0;
+    const startTurn = vi.fn<() => Promise<unknown>>(async () => {
+      turnCount += 1;
+      return {
+        id: `turn-stream-queue-${turnCount}`,
+        items: [],
+        status: "running",
+        startedAt: null,
+        completedAt: null,
+      };
+    });
+    const now = Date.now() / 1000;
+    const appServer = {
+      onNotification(handler: (notification: unknown) => void) {
+        notificationHandlers.add(handler);
+        return () => notificationHandlers.delete(handler);
+      },
+      onRequest() {
+        return () => undefined;
+      },
+      startThread: vi.fn<() => Promise<unknown>>(async () => ({
+        id: "app-thread-stream-queue",
+        createdAt: now,
+        cwd: workspacePath,
+        modelProvider: "gpt-5.5",
+        name: "Stream queue",
+        preview: "Stream queue",
+        source: "app",
+        status: "idle",
+        turns: [],
+        updatedAt: now,
+      })),
+      startTurn,
+    };
+    const threadCoordinator = await createRelayStateStore(":memory:");
+    const app = createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      threadCoordinator,
+      threadInputs: threadCoordinator,
+      workspacePath,
+    });
+
+    await app.request("/v1/threads", {
+      method: "POST",
+      body: JSON.stringify({ title: "Stream queue" }),
+      headers: { "content-type": "application/json" },
+    });
+    const activeStream = await app.request("/v1/threads/app-thread-stream-queue/runs/stream", {
+      method: "POST",
+      body: JSON.stringify({
+        clientEventId: "cb4ece86-fcdb-436a-863d-5e05422c826e",
+        prompt: "Active prompt",
+      }),
+      headers: { "content-type": "application/json" },
+    });
+    await vi.waitFor(() => expect(startTurn).toHaveBeenCalledTimes(1));
+    const queuedStream = await app.request("/v1/threads/app-thread-stream-queue/runs/stream", {
+      method: "POST",
+      body: JSON.stringify({
+        clientEventId: "c3a6be8a-527f-4466-9a54-d1cbd98ab31e",
+        prompt: "Queued prompt",
+      }),
+      headers: { "content-type": "application/json" },
+    });
+    const queuedBody = await queuedStream.text();
+
+    expect(startTurn).toHaveBeenCalledTimes(1);
+    expect(queuedBody).toContain("thread.state.changed");
+    expect(queuedBody).not.toContain("thread.message.");
+    expect(
+      await threadCoordinator.getThreadInputByClientEvent(
+        "unpaired-client",
+        "c3a6be8a-527f-4466-9a54-d1cbd98ab31e",
+      ),
+    ).toMatchObject({ state: "queued" });
+
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "turn/completed",
+        params: {
+          status: "completed",
+          threadId: "app-thread-stream-queue",
+          turnId: "turn-stream-queue-1",
+        },
+      });
+    }
+    await vi.waitFor(() => expect(startTurn).toHaveBeenCalledTimes(2));
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "turn/completed",
+        params: {
+          status: "completed",
+          threadId: "app-thread-stream-queue",
+          turnId: "turn-stream-queue-2",
+        },
+      });
+    }
+    await activeStream.text();
   });
 
   it("validates empty responses independently for each queued app-server turn", async () => {
@@ -6992,7 +8762,7 @@ describe("Codex Relay server routes", () => {
     ]);
   });
 
-  it("returns the full thread detail history without pagination fields", async () => {
+  it("returns thread detail history with an explicit older-message state", async () => {
     const app = createApp({ codex: createMockCodex() });
 
     await app.request("/v1/threads", {
@@ -7015,9 +8785,8 @@ describe("Codex Relay server routes", () => {
     const body = await response.json();
 
     expect(response.status).toBe(200);
-    expect(body).not.toHaveProperty("hasMoreMessages");
+    expect(body.hasOlderMessages).toBe(false);
     expect(body).not.toHaveProperty("olderMessagesCursor");
-    expect(body).not.toHaveProperty("oldestMessageId");
     expect(body.messages.map((message: { content: string }) => message.content)).toEqual([
       "First",
       "result: First",
@@ -7086,7 +8855,7 @@ describe("Codex Relay server routes", () => {
     expect(body.messages).toHaveLength(121);
     expect(body.messages.at(0)?.content).toBe("Message 0");
     expect(body.messages.at(-1)?.content).toBe("Message 120");
-    expect(body).not.toHaveProperty("hasMoreMessages");
+    expect(body.hasOlderMessages).toBe(false);
     expect(body).not.toHaveProperty("olderMessagesCursor");
   });
 
@@ -7155,6 +8924,93 @@ describe("Codex Relay server routes", () => {
       "turn-summary-history-assistant",
     ]);
     expect(refreshedBody.thread.messageCount).toBe(2);
+  });
+
+  it("limits very large thread detail responses to the latest messages", async () => {
+    const previousLimit = process.env.CODEX_RELAY_THREAD_DETAIL_MESSAGE_LIMIT;
+    process.env.CODEX_RELAY_THREAD_DETAIL_MESSAGE_LIMIT = "3";
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const now = Date.now() / 1000;
+    const longThread = {
+      id: "app-thread-capped",
+      createdAt: now,
+      cwd: workspacePath,
+      modelProvider: "gpt-5.5",
+      name: "Capped thread",
+      preview: "Capped thread",
+      source: "app",
+      status: { type: "idle" },
+      turns: Array.from({ length: 5 }, (_value, index) => ({
+        id: `turn-capped-${index}`,
+        completedAt: now,
+        items: [
+          {
+            id: `user-capped-${index}`,
+            type: "userMessage",
+            content: [{ type: "text", text: `Message ${index}`, text_elements: [] }],
+          },
+        ],
+        startedAt: now,
+        status: { type: "completed" },
+      })),
+      updatedAt: now,
+    };
+    const appServer = {
+      listThreads: vi.fn<() => Promise<unknown[]>>(async () => [longThread]),
+      onNotification() {
+        return () => undefined;
+      },
+      onRequest() {
+        return () => undefined;
+      },
+      readThread: vi.fn<
+        (_threadId: string, options?: { includeTurns?: boolean }) => Promise<unknown>
+      >(async (_threadId, options) => ({
+        ...longThread,
+        turns: options?.includeTurns === false ? undefined : longThread.turns,
+      })),
+    };
+    const app = createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      workspacePath,
+    });
+
+    try {
+      await app.request("/v1/threads");
+      const response = await app.request("/v1/threads/app-thread-capped");
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body.thread.messageCount).toBe(5);
+      expect(body.messages.map((message: { content: string }) => message.content)).toEqual([
+        "Message 2",
+        "Message 3",
+        "Message 4",
+      ]);
+      expect(body).toMatchObject({
+        hasOlderMessages: true,
+        olderMessagesCursor: "user-capped-2",
+      });
+
+      const olderResponse = await app.request(
+        "/v1/threads/app-thread-capped?beforeMessageId=user-capped-2",
+      );
+      const olderBody = await olderResponse.json();
+      expect(olderResponse.status).toBe(200);
+      expect(olderBody.messages.map((message: { content: string }) => message.content)).toEqual([
+        "Message 0",
+        "Message 1",
+      ]);
+      expect(olderBody).toMatchObject({ hasOlderMessages: false });
+      expect(olderBody).not.toHaveProperty("olderMessagesCursor");
+    } finally {
+      if (previousLimit === undefined) {
+        delete process.env.CODEX_RELAY_THREAD_DETAIL_MESSAGE_LIMIT;
+      } else {
+        process.env.CODEX_RELAY_THREAD_DETAIL_MESSAGE_LIMIT = previousLimit;
+      }
+    }
   });
 
   it("loads app-server history from the rollout file when full thread reads hang", async () => {

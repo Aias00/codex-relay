@@ -6,17 +6,23 @@ import {
   CreateThreadRequestSchema,
   EncryptedPayloadSchema,
   ImageAttachmentUploadResponseSchema,
+  ConnectionPlanResponseSchema,
+  HealthResponseSchema,
   InterruptThreadRunResponseSchema,
   ListModelsResponseSchema,
   ListQueuedThreadInputsResponseSchema,
   ListSkillsResponseSchema,
+  ListThreadEventsQuerySchema,
+  ListThreadEventsResponseSchema,
   ListThreadsResponseSchema,
+  ListWorkspacesResponseSchema,
   ListWorkspaceFilesResponseSchema,
   ListWorkspaceDirectoriesResponseSchema,
   PairRequestSchema,
   PairResponseSchema,
   PushNotificationSettingsResponseSchema,
   QueuedThreadInputActionResponseSchema,
+  QueuedThreadInputSchema,
   RateLimitsResponseSchema,
   RenameThreadRequestSchema,
   RenameThreadResponseSchema,
@@ -33,12 +39,14 @@ import {
   StreamThreadRunRequestSchema,
   SubmitThreadInputResponseSchema,
   ThreadContextWindowResponseSchema,
+  ThreadDetailQuerySchema,
   ThreadDetailResponseSchema,
   ThreadGoalResponseSchema,
   ThreadGoalSchema,
   ThreadGoalStatusSchema,
   ThreadMessageDetailFieldSchema,
   ThreadMessageDetailResponseSchema,
+  ThreadOwnerMutationRequestSchema,
   ThreadSummarySchema,
   UpdateThreadGoalRequestSchema,
   UpdateWorkspaceFileContentRequestSchema,
@@ -63,10 +71,14 @@ import {
   type ApprovalMode,
   type ArchiveThreadResponse,
   type ChatMessage,
+  type ConnectionPlanResponse,
   type CreateThreadResponse,
   type ErrorResponse,
   type ImageAttachmentUploadResponse,
+  type HealthResponse,
   type ListThreadsResponse,
+  type ListThreadEventsResponse,
+  type ListWorkspacesResponse,
   type ListWorkspaceFilesResponse,
   type ListWorkspaceDirectoriesResponse,
   type PairResponse,
@@ -125,9 +137,11 @@ import { mkdir, open, readFile, readdir, stat, writeFile } from "node:fs/promise
 import { createRequire } from "node:module";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { setInterval as setNodeInterval } from "node:timers";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import * as pty from "@lydell/node-pty";
+import qrcode from "qrcode-terminal";
 import { z } from "zod";
 
 import {
@@ -144,6 +158,10 @@ import {
   type AppServerUserInput,
 } from "./app-server.js";
 import {
+  appServerRecoveredTurnState,
+  type RecoveredActiveTurnClaim,
+} from "./app-server-turn-recovery.js";
+import {
   classifyStreamEvent,
   createCodexClient,
   extractStreamText,
@@ -151,9 +169,25 @@ import {
   stringifyRunResult,
   type CodexClient,
 } from "./codex.js";
+import { createConnectionPlan, createHealthResponse } from "./connection-plan.js";
 import { readLatestContextWindowUsage } from "./context-window.js";
 import { codexRelayDataPath } from "./paths.js";
 import { relayDebugLog } from "./debug-log.js";
+import type {
+  PendingApprovalStore,
+  ThreadEventStore,
+  ThreadCoordinatorStore,
+  ThreadInput,
+  ThreadInputState,
+  ThreadInputStore,
+  ThreadOwner,
+  TurnClaim,
+  WorkspaceRegistry,
+} from "./relay-state-store.js";
+import {
+  createDurableThreadEventPublisher,
+  type DurableThreadEventPublisher,
+} from "./thread-event-publisher.js";
 import { permanentClientSessionExpiresAt, type PairingSessionStore } from "./pairing-store.js";
 import {
   createExpoPushNotificationSender,
@@ -196,17 +230,53 @@ const collaborationModeTemplates = Object.fromEntries(
   collaborationModeTemplateNames.map((name) => [name, readCollaborationModeTemplate(name)]),
 ) as Record<(typeof collaborationModeTemplateNames)[number], string>;
 const defaultWebPreviewPorts = [3000, 3001, 5173, 4173, 8080, 19006];
+const threadEventStreamPageLimit = 500;
+const threadEventStreamPollIntervalMs = 250;
+const threadEventStreamHeartbeatIntervalMs = 15_000;
+
+export const relayThreadOwnerCapabilities = {
+  approve: true,
+  configure: true,
+  interrupt: true,
+  queue: true,
+  send: true,
+  steer: true,
+  view: true,
+} as const;
 
 type AppOptions = {
+  approvalStore?: PendingApprovalStore;
   appServer?: CodexAppServerClient | null;
   codex?: CodexClient;
+  connectionPlan?: ConnectionPlanOptions;
+  management?: ManagementOptions;
+  maxThreadEventRetention?: number;
   pairing?: PairingOptions;
   preferences?: RuntimePreferencesStore;
   pushNotificationSender?: PushNotificationSender;
+  recoveredTurnClaims?: RecoveredActiveTurnClaim[];
   tailscaleServeForPreviewUrl?: (input: {
     readonly url: string;
   }) => Promise<WorkspaceTailscaleServeResponse>;
+  threadEvents?: ThreadEventStore;
+  threadCoordinator?: ThreadCoordinatorStore;
+  threadInputs?: ThreadInputStore;
+  threadOwnerLeaseMs?: number;
+  workspaceRegistry?: WorkspaceRegistry;
   workspacePath?: string;
+};
+
+type ConnectionPlanOptions = {
+  relayId: string;
+  serverEpoch: string;
+};
+
+type ManagementOptions = {
+  connectUrl?: string;
+  connectUrlCandidates?: Array<{ label: string; url: string }>;
+  listenUrl?: string;
+  pairingPayload?: string;
+  port?: number;
 };
 
 type PairingOptions = {
@@ -259,6 +329,7 @@ type PendingApproval = {
     | "permissions"
     | "structuredUserInput"
     | "mcpElicitation";
+  message?: ChatMessage;
   messageId?: string;
   method: string;
   isBlocking?: boolean;
@@ -272,6 +343,38 @@ type ResolvedApproval = {
   promise: Promise<void>;
 };
 
+function recordPendingApproval(input: {
+  approvalId: string;
+  approvalStore?: PendingApprovalStore;
+  onReady(): void;
+  pending: PendingApproval;
+  pendingApprovals: Map<string, PendingApproval>;
+}) {
+  void (async () => {
+    try {
+      await input.approvalStore?.createPendingApproval({
+        approvalId: input.approvalId,
+        kind: input.pending.kind,
+        message: input.pending.message,
+        messageId: input.pending.messageId,
+        method: input.pending.method,
+        questions: input.pending.questions,
+        requestId: input.pending.requestId,
+        threadId: input.pending.threadId,
+        turnId: input.pending.turnId,
+      });
+    } catch (error) {
+      relayDebugLog("thread.approval.persistence_failed", {
+        approvalId: input.approvalId,
+        error: errorMessage(error),
+        threadId: input.pending.threadId,
+      });
+    }
+    input.pendingApprovals.set(input.approvalId, input.pending);
+    input.onReady();
+  })();
+}
+
 const maxResolvedApprovals = 100;
 
 type SecureSessionHandle = {
@@ -280,8 +383,21 @@ type SecureSessionHandle = {
   tokenHash: string;
 };
 
+type DurableSseContext = {
+  fallbackThreadId: string;
+  publisher: DurableThreadEventPublisher;
+  threadIds: Set<string>;
+  workspaceId?: string;
+};
+
+const durableSseContexts = new WeakMap<
+  ReadableStreamDefaultController<Uint8Array>,
+  DurableSseContext
+>();
+
 type QueuedThreadInput = {
   attachments: PromptAttachment[];
+  clientEventId?: string;
   id: string;
   prompt: string;
   runOptions: {
@@ -333,20 +449,39 @@ export function createApp(options: AppOptions = {}) {
   const workspacePath = resolve(
     options.workspacePath ?? process.env.CODEX_RELAY_WORKSPACE_PATH ?? defaultWorkspacePath,
   );
+  const threadOwnerLeaseMs = options.threadOwnerLeaseMs ?? 0;
+  if (!Number.isInteger(threadOwnerLeaseMs) || threadOwnerLeaseMs < 0) {
+    throw new TypeError("threadOwnerLeaseMs must be a nonnegative integer.");
+  }
+  const relayId = options.connectionPlan?.relayId ?? `relay_${randomUUID()}`;
+  const serverEpoch = options.connectionPlan?.serverEpoch ?? randomUUID();
   const threads = new Map<string, ThreadMetadata>();
   const messagesByThreadId = new Map<string, ChatMessage[]>();
   const liveThreads = new Map<string, ReturnType<CodexClient["startThread"]>>();
   const pendingApprovals = new Map<string, PendingApproval>();
   const resolvedApprovals = new Map<string, ResolvedApproval>();
   const queuedInputsByThreadId = new Map<string, QueuedThreadInput[]>();
+  const recoveredTurnClaims = options.recoveredTurnClaims ?? [];
+  const activeThreadInputIdsByThreadId = new Map(
+    recoveredTurnClaims.map((recovered) => [recovered.claim.threadId, recovered.claim.inputId]),
+  );
   const threadOperationTails = new Map<string, Promise<void>>();
   const appServerMutationTails = new Map<string, Promise<void>>();
   const workspaceTerminalSessions = new Map<string, WorkspaceTerminalSession>();
-  const activeAppServerTurnIdsByThreadId = new Map<string, string>();
+  const activeAppServerTurnIdsByThreadId = new Map(
+    recoveredTurnClaims.flatMap((recovered) =>
+      recovered.claim.runtimeTurnId
+        ? [[recovered.claim.threadId, recovered.claim.runtimeTurnId] as const]
+        : [],
+    ),
+  );
+  const activeTurnClaimsByThreadId = new Map(
+    recoveredTurnClaims.map((recovered) => [recovered.claim.threadId, recovered.claim]),
+  );
   const appServerHistoryGenerationsByThreadId = new Map<string, number>();
   const appServerHistoryLoadsByThreadId = new Map<string, Promise<void>>();
   const appServerRolloutPathsByThreadId = new Map<string, string>();
-  const steeringThreads = new Set<string>();
+  const steeringThreads = new Set(recoveredTurnClaims.map((recovered) => recovered.claim.threadId));
   const secureSessionsByTokenHash = new Map<string, SecureSession>();
   const activeStreamControllers = new Map<
     ReadableStreamDefaultController<Uint8Array>,
@@ -406,6 +541,222 @@ export function createApp(options: AppOptions = {}) {
       }
     });
   }
+  const durableThreadEventPublisher = options.threadEvents
+    ? createDurableThreadEventPublisher({
+        maxRetainedEvents: options.maxThreadEventRetention,
+        store: options.threadEvents,
+        onPersistenceError(error, context) {
+          relayDebugLog("thread.event.persistence_failed", {
+            ...context,
+            error: errorMessage(error),
+          });
+        },
+      })
+    : undefined;
+  let pendingApprovalsHydrationError: unknown;
+  const pendingApprovalsHydration =
+    appServer && options.approvalStore
+      ? options.approvalStore
+          .listPendingApprovals()
+          .then((approvals) => {
+            for (const approval of approvals) {
+              if (!pendingApprovals.has(approval.approvalId)) {
+                pendingApprovals.set(approval.approvalId, {
+                  appServer,
+                  kind: approval.kind,
+                  message: approval.message ? ChatMessageSchema.parse(approval.message) : undefined,
+                  messageId: approval.messageId,
+                  method: approval.method,
+                  questions: approval.questions,
+                  requestId: approval.requestId,
+                  threadId: approval.threadId,
+                  turnId: approval.turnId,
+                });
+              }
+            }
+          })
+          .catch((error) => {
+            pendingApprovalsHydrationError = error;
+            relayDebugLog("thread.approval.hydration_failed", { error: errorMessage(error) });
+          })
+      : Promise.resolve();
+  async function ensurePendingApprovalsHydrated() {
+    await pendingApprovalsHydration;
+    if (pendingApprovalsHydrationError) {
+      throw pendingApprovalsHydrationError;
+    }
+  }
+  let queuedInputsHydrationError: unknown;
+  const queuedInputsHydration = options.threadInputs
+    ? hydrateQueuedThreadInputs(options.threadInputs, queuedInputsByThreadId).catch((error) => {
+        queuedInputsHydrationError = error;
+        relayDebugLog("thread.input.hydration_failed", { error: errorMessage(error) });
+      })
+    : Promise.resolve();
+  async function ensureQueuedInputsHydrated() {
+    await queuedInputsHydration;
+    if (queuedInputsHydrationError) {
+      throw queuedInputsHydrationError;
+    }
+  }
+  const threadOwnersByThreadId = new Map(
+    recoveredTurnClaims.map((recovered) => [recovered.claim.threadId, recovered.owner]),
+  );
+  function withKnownThreadOwnerEpoch(thread: ThreadMetadata) {
+    const owner = threadOwnersByThreadId.get(thread.id);
+    if (!owner || thread.ownerEpoch === owner.epoch) {
+      return thread;
+    }
+    const next = ThreadSummarySchema.parse({
+      ...thread,
+      ownerEpoch: owner.epoch,
+    });
+    threads.set(thread.id, next);
+    return next;
+  }
+  async function withCurrentThreadOwnerEpoch(thread: ThreadMetadata) {
+    const owner = await options.threadCoordinator?.getThreadOwner(thread.id);
+    const ownerEpoch = owner?.epoch ?? threadOwnersByThreadId.get(thread.id)?.epoch;
+    if (thread.ownerEpoch === ownerEpoch) {
+      return thread;
+    }
+    const next = ThreadSummarySchema.parse({
+      ...thread,
+      ownerEpoch,
+    });
+    threads.set(thread.id, next);
+    return next;
+  }
+  function rememberRelayThreadOwner(owner: ThreadOwner) {
+    threadOwnersByThreadId.set(owner.threadId, owner);
+    const thread = threads.get(owner.threadId);
+    if (thread) {
+      withKnownThreadOwnerEpoch(thread);
+    }
+    return owner;
+  }
+  async function expectedThreadOwnerEpochError(
+    threadId: string,
+    expectedOwnerEpoch: number | undefined,
+  ) {
+    if (expectedOwnerEpoch === undefined) {
+      return undefined;
+    }
+    const owner = await options.threadCoordinator?.getThreadOwner(threadId);
+    if (owner?.epoch === expectedOwnerEpoch) {
+      return undefined;
+    }
+    return apiError(
+      "stale_owner_epoch",
+      owner
+        ? `Thread ${threadId} owner epoch changed from ${expectedOwnerEpoch} to ${owner.epoch}. Refresh before retrying.`
+        : `Thread ${threadId} no longer has owner epoch ${expectedOwnerEpoch}. Refresh before retrying.`,
+    );
+  }
+  async function ensureRelayThreadOwner(threadId: string, workspaceId?: string) {
+    if (!options.threadCoordinator) {
+      return undefined;
+    }
+    const existing = threadOwnersByThreadId.get(threadId);
+    if (existing && threadOwnerLeaseMs === 0) {
+      return rememberRelayThreadOwner(existing);
+    }
+    const owner = await options.threadCoordinator.acquireThreadOwner({
+      capabilities: relayThreadOwnerCapabilities,
+      leaseExpiresAt:
+        threadOwnerLeaseMs > 0
+          ? new Date(Date.now() + threadOwnerLeaseMs).toISOString()
+          : undefined,
+      ownerId: relayId,
+      ownerInstanceId: serverEpoch,
+      ownerType: appServer?.appServerMode === "socket" ? "shared_app_server" : "relay_app_server",
+      threadId,
+      workspaceId: workspaceId ?? existing?.workspaceId,
+    });
+    if (owner.ownerId !== relayId || owner.ownerInstanceId !== serverEpoch) {
+      throw new Error(`Thread ${threadId} is held by an active Relay owner lease.`);
+    }
+    return rememberRelayThreadOwner(owner);
+  }
+  if (threadOwnerLeaseMs > 0) {
+    const heartbeatIntervalMs = Math.max(1_000, Math.floor(threadOwnerLeaseMs / 3));
+    setNodeInterval(() => {
+      for (const [threadId, owner] of threadOwnersByThreadId) {
+        void ensureRelayThreadOwner(threadId, owner.workspaceId).catch(() => {
+          forgetRelayThreadOwner(threadId);
+        });
+      }
+    }, heartbeatIntervalMs);
+  }
+  function forgetRelayThreadOwner(threadId: string) {
+    threadOwnersByThreadId.delete(threadId);
+  }
+  const registeredThreadWorkspacePaths = new Set<string>();
+  let threadWorkspaceRegistrationTail = Promise.resolve();
+  async function registerThreadWorkspacePaths(threadSummaries: ThreadSummary[]) {
+    if (!options.workspaceRegistry) {
+      return;
+    }
+    const paths = new Set(
+      threadSummaries
+        .map((thread) => thread.cwd)
+        .filter((path): path is string => Boolean(path && isAbsolute(path))),
+    );
+    for (const path of paths) {
+      if (registeredThreadWorkspacePaths.has(path)) {
+        continue;
+      }
+      try {
+        const workspace = await options.workspaceRegistry.registerWorkspace({
+          path,
+          source: "thread_cwd",
+        });
+        registeredThreadWorkspacePaths.add(path);
+        for (const thread of threadSummaries) {
+          if (thread.cwd === path) {
+            rememberThreadWorkspaceId(threads, thread, workspace.workspaceId);
+          }
+        }
+      } catch (error) {
+        relayDebugLog("workspace_registry.thread_registration_failed", {
+          error: errorMessage(error),
+          workspacePath: path,
+        });
+      }
+    }
+  }
+  function scheduleThreadWorkspaceRegistration(threadSummaries: ThreadSummary[]) {
+    threadWorkspaceRegistrationTail = threadWorkspaceRegistrationTail.then(() =>
+      registerThreadWorkspacePaths(threadSummaries),
+    );
+  }
+  async function identifyKnownThreadWorkspaces(
+    threadSummaries: ThreadSummary[],
+    selectedWorkspaceId?: string,
+  ) {
+    if (selectedWorkspaceId) {
+      return threadSummaries.map((thread) =>
+        rememberThreadWorkspaceId(threads, thread, selectedWorkspaceId),
+      );
+    }
+    if (!options.workspaceRegistry) {
+      return threadSummaries;
+    }
+    const workspaceIdByCanonicalPath = new Map(
+      (await options.workspaceRegistry.listWorkspaces()).map((workspace) => [
+        workspace.canonicalPath,
+        workspace.workspaceId,
+      ]),
+    );
+    return threadSummaries.map((thread) => {
+      const knownWorkspaceId =
+        thread.workspaceId ??
+        (thread.cwd ? workspaceIdByCanonicalPath.get(resolve(thread.cwd)) : undefined);
+      return knownWorkspaceId
+        ? rememberThreadWorkspaceId(threads, thread, knownWorkspaceId)
+        : thread;
+    });
+  }
   function runThreadOperation<T>(threadId: string, operation: () => Promise<T>) {
     const previous = threadOperationTails.get(threadId) ?? Promise.resolve();
     const result = previous.then(operation, operation);
@@ -435,6 +786,290 @@ export function createApp(options: AppOptions = {}) {
       }
     });
     return result;
+  }
+  const recoveryCoordinator = options.threadCoordinator;
+  if (appServer && recoveryCoordinator && recoveredTurnClaims.length > 0) {
+    const recoveryManagedClaimIdsByThreadId = new Map(
+      recoveredTurnClaims.map((recovered) => [recovered.claim.threadId, recovered.claim.claimId]),
+    );
+    let reconcileRecoveredClaim: (
+      threadId: string,
+      completedItemId?: string,
+      publishRunningState?: boolean,
+    ) => void;
+    const finalizeRecoveredClaim = async (
+      threadId: string,
+      claimId: string,
+      state: "cancelled" | "completed" | "failed",
+    ) => {
+      let reconcileStartedTurn = false;
+      await runThreadOperation(threadId, async () => {
+        const claim = activeTurnClaimsByThreadId.get(threadId);
+        if (!claim || claim.claimId !== claimId) {
+          if (recoveryManagedClaimIdsByThreadId.get(threadId) === claimId) {
+            recoveryManagedClaimIdsByThreadId.delete(threadId);
+          }
+          return;
+        }
+        const finalized = await recoveryCoordinator.finalizeTurnClaim({
+          claimId: claim.claimId,
+          ownerEpoch: claim.ownerEpoch,
+          ownerId: claim.ownerId,
+          state,
+        });
+        if (finalized.kind === "stale_owner") {
+          forgetRelayThreadOwner(threadId);
+        }
+        const finalizedCurrentClaim =
+          finalized.kind === "updated" || finalized.kind === "already_terminal";
+        activeTurnClaimsByThreadId.delete(threadId);
+        activeThreadInputIdsByThreadId.delete(threadId);
+        activeAppServerTurnIdsByThreadId.delete(threadId);
+        steeringThreads.delete(threadId);
+        recoveryManagedClaimIdsByThreadId.delete(threadId);
+        relayDebugLog("thread.claim.recovery_terminal", {
+          claimId,
+          result: finalized.kind,
+          state,
+          threadId,
+          turnId: claim.runtimeTurnId,
+        });
+
+        if (!finalizedCurrentClaim || state !== "completed") {
+          return;
+        }
+        const owner = threadOwnersByThreadId.get(threadId);
+        if (!owner) {
+          return;
+        }
+        const nextClaimResult = await recoveryCoordinator.claimNextThreadInput({
+          ownerEpoch: owner.epoch,
+          ownerId: owner.ownerId,
+          threadId,
+        });
+        if (nextClaimResult.kind !== "acquired") {
+          if (nextClaimResult.kind === "stale_owner") {
+            forgetRelayThreadOwner(threadId);
+          }
+          return;
+        }
+
+        let nextInput: QueuedThreadInput;
+        try {
+          nextInput = queuedThreadInputFromRecord(nextClaimResult.input);
+        } catch (error) {
+          await recoveryCoordinator.finalizeTurnClaim({
+            claimId: nextClaimResult.claim.claimId,
+            ownerEpoch: nextClaimResult.claim.ownerEpoch,
+            ownerId: nextClaimResult.claim.ownerId,
+            state: "failed",
+          });
+          relayDebugLog("thread.claim.recovery_dispatch_failed", {
+            claimId: nextClaimResult.claim.claimId,
+            error: errorMessage(error),
+            stage: "restore_input",
+            threadId,
+          });
+          return;
+        }
+
+        removeQueuedInput(queuedInputsByThreadId, threadId, nextInput.id);
+        activeTurnClaimsByThreadId.set(threadId, nextClaimResult.claim);
+        activeThreadInputIdsByThreadId.set(threadId, nextInput.id);
+        steeringThreads.add(threadId);
+        let acceptedTurnId: string | undefined;
+        try {
+          const nextTurn = await runAppServerMutation(threadId, async () => {
+            const turn = await startAppServerTurn(
+              appServer,
+              threadId,
+              nextInput,
+              activeTurnClaimDispatchContext({
+                activeTurnClaimsByThreadId,
+                coordinator: recoveryCoordinator,
+                threadId,
+              }),
+            );
+            acceptedTurnId = turn.id;
+            await bindActiveTurnClaimRuntimeTurn({
+              activeThreadInputIdsByThreadId,
+              activeTurnClaimsByThreadId,
+              coordinator: recoveryCoordinator,
+              forgetThreadOwner: forgetRelayThreadOwner,
+              threadId,
+              turnId: turn.id,
+            });
+            return turn;
+          });
+          const boundClaim = activeTurnClaimsByThreadId.get(threadId);
+          if (
+            !boundClaim ||
+            boundClaim.claimId !== nextClaimResult.claim.claimId ||
+            boundClaim.runtimeTurnId !== nextTurn.id
+          ) {
+            throw new Error(`Turn ${nextTurn.id} was accepted without a durable claim binding.`);
+          }
+          activeAppServerTurnIdsByThreadId.set(threadId, nextTurn.id);
+          recoveryManagedClaimIdsByThreadId.set(threadId, boundClaim.claimId);
+          reconcileStartedTurn = true;
+          relayDebugLog("thread.claim.recovery_dispatched", {
+            claimId: boundClaim.claimId,
+            inputId: nextInput.id,
+            threadId,
+            turnId: nextTurn.id,
+          });
+        } catch (error) {
+          if (acceptedTurnId) {
+            activeAppServerTurnIdsByThreadId.set(threadId, acceptedTurnId);
+            if (recoveryManagedClaimIdsByThreadId.get(threadId) === nextClaimResult.claim.claimId) {
+              recoveryManagedClaimIdsByThreadId.delete(threadId);
+            }
+            relayDebugLog("thread.claim.recovery_dispatch_failed", {
+              claimId: nextClaimResult.claim.claimId,
+              error: errorMessage(error),
+              stage: "bind_runtime_turn",
+              threadId,
+              turnId: acceptedTurnId,
+            });
+            return;
+          }
+          const failed = await recoveryCoordinator.finalizeTurnClaim({
+            claimId: nextClaimResult.claim.claimId,
+            ownerEpoch: nextClaimResult.claim.ownerEpoch,
+            ownerId: nextClaimResult.claim.ownerId,
+            state: "failed",
+          });
+          if (failed.kind === "stale_owner") {
+            forgetRelayThreadOwner(threadId);
+          }
+          activeTurnClaimsByThreadId.delete(threadId);
+          activeThreadInputIdsByThreadId.delete(threadId);
+          activeAppServerTurnIdsByThreadId.delete(threadId);
+          steeringThreads.delete(threadId);
+          if (recoveryManagedClaimIdsByThreadId.get(threadId) === nextClaimResult.claim.claimId) {
+            recoveryManagedClaimIdsByThreadId.delete(threadId);
+          }
+          relayDebugLog("thread.claim.recovery_dispatch_failed", {
+            claimId: nextClaimResult.claim.claimId,
+            error: errorMessage(error),
+            stage: "start_turn",
+            threadId,
+          });
+        }
+      });
+      if (reconcileStartedTurn) {
+        reconcileRecoveredClaim(threadId, undefined, true);
+      }
+    };
+    reconcileRecoveredClaim = (
+      threadId: string,
+      completedItemId?: string,
+      publishRunningState = false,
+    ) => {
+      const claim = activeTurnClaimsByThreadId.get(threadId);
+      const recoveryManagedClaimId = recoveryManagedClaimIdsByThreadId.get(threadId);
+      if (!claim?.runtimeTurnId || recoveryManagedClaimId !== claim.claimId) {
+        if (recoveryManagedClaimId && claim?.claimId !== recoveryManagedClaimId) {
+          recoveryManagedClaimIdsByThreadId.delete(threadId);
+        }
+        return;
+      }
+      void appServer
+        .readThread(threadId, { includeTurns: true })
+        .then(async (thread) => {
+          const currentClaim = activeTurnClaimsByThreadId.get(threadId);
+          if (
+            !currentClaim ||
+            currentClaim.claimId !== claim.claimId ||
+            recoveryManagedClaimIdsByThreadId.get(threadId) !== claim.claimId
+          ) {
+            return;
+          }
+          const turn = thread.turns?.find((candidate) => candidate.id === claim.runtimeTurnId);
+          if (!turn) {
+            return;
+          }
+          const state = appServerRecoveredTurnState(turn);
+          const shouldPublish =
+            publishRunningState ||
+            Boolean(completedItemId) ||
+            (state !== "running" && state !== "unknown");
+          if (shouldPublish && durableThreadEventPublisher) {
+            publishRecoveredAppServerTurnSnapshot({
+              claimId: claim.claimId,
+              completedItemId: state === "running" ? completedItemId : undefined,
+              messagesByThreadId,
+              publisher: durableThreadEventPublisher,
+              state: state === "unknown" ? "running" : state,
+              thread,
+              threads,
+              turn,
+              publishTurnMessages:
+                Boolean(completedItemId) || (state !== "running" && state !== "unknown"),
+              workspaceId: threadOwnersByThreadId.get(threadId)?.workspaceId,
+            });
+            await durableThreadEventPublisher.flush(threadId);
+          }
+          if (state !== "running" && state !== "unknown") {
+            await finalizeRecoveredClaim(threadId, claim.claimId, state);
+          }
+        })
+        .catch(() => {
+          relayDebugLog("thread.claim.recovery_reconcile_failed", {
+            claimId: claim.claimId,
+            threadId,
+            turnId: claim.runtimeTurnId,
+          });
+        });
+    };
+
+    appServer.onNotification((notification) => {
+      const isCompletedItem = notification.method === "item/completed";
+      const isTerminalTurn =
+        notification.method === "turn/aborted" ||
+        notification.method === "turn/cancelled" ||
+        notification.method === "turn/completed" ||
+        notification.method === "turn/failed";
+      if (!isCompletedItem && !isTerminalTurn) {
+        return;
+      }
+      const params = recordParams(notification);
+      const threadId = firstString(params, ["threadId"]);
+      if (!threadId) {
+        return;
+      }
+      const claim = activeTurnClaimsByThreadId.get(threadId);
+      const turnId = firstString(params, ["turnId"]) ?? turnIdFromParams(params);
+      if (
+        !claim?.runtimeTurnId ||
+        recoveryManagedClaimIdsByThreadId.get(threadId) !== claim.claimId ||
+        turnId !== claim.runtimeTurnId
+      ) {
+        return;
+      }
+      const item = params?.item;
+      const completedItemId = isCompletedItem
+        ? ((item && typeof item === "object"
+            ? firstString(item as Record<string, unknown>, ["id"])
+            : undefined) ?? firstString(params, ["itemId"]))
+        : undefined;
+      reconcileRecoveredClaim(threadId, completedItemId);
+    });
+    if (typeof appServer.onConnectionState === "function") {
+      appServer.onConnectionState((event) => {
+        if (event.state !== "reconnected") {
+          return;
+        }
+        for (const threadId of recoveryManagedClaimIdsByThreadId.keys()) {
+          reconcileRecoveredClaim(threadId, undefined, true);
+        }
+      });
+    }
+    queueMicrotask(() => {
+      for (const threadId of recoveryManagedClaimIdsByThreadId.keys()) {
+        reconcileRecoveredClaim(threadId, undefined, true);
+      }
+    });
   }
   const pushNotificationDispatcher = options.pairing
     ? createPushNotificationDispatcher({
@@ -494,6 +1129,53 @@ export function createApp(options: AppOptions = {}) {
   };
 
   app.use("*", cors());
+
+  app.get("/", async (c, next) => {
+    if (!isLocalManagementRequest(c.req.header("host"))) {
+      await next();
+      return;
+    }
+
+    return c.html(createManagementPage());
+  });
+
+  app.get("/local/pairing", async (c) => {
+    if (!isLocalManagementRequest(c.req.header("host"))) {
+      return c.json(
+        apiError("forbidden", "Local pairing management is only available on localhost."),
+        403,
+      );
+    }
+
+    return c.json(await createManagementPairingResponse(options.management, options.pairing));
+  });
+
+  app.post("/local/pairing/approve", async (c) => {
+    if (!isLocalManagementRequest(c.req.header("host"))) {
+      return c.json(
+        apiError("forbidden", "Local pairing management is only available on localhost."),
+        403,
+      );
+    }
+    if (!options.pairing) {
+      return c.json(apiError("pairing_disabled", "Pairing is not enabled on this server."), 404);
+    }
+
+    const parsed = await parsePlainJson(c.req.raw, PairApproveRequestSchema);
+    if (!parsed.success) {
+      return c.json(validationError(parsed.error), 400);
+    }
+
+    const approvalCode = normalizeApprovalCode(parsed.data.approvalCode);
+    const pending = await options.pairing.sessions.approvePendingPairing(approvalCode, Date.now());
+    if (!pending) {
+      return c.json(apiError("not_found", "No pending pairing request matches that code."), 404);
+    }
+
+    options.pairing.onPairApproved?.({ approvalCode, clientName: pending.clientName });
+    return c.json({ ok: true });
+  });
+
   app.use("*", async (c, next) => {
     if (
       !options.pairing ||
@@ -735,18 +1417,68 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.get(apiPaths.status, async (c) => {
+    const selectedWorkspacePath = await resolveWorkspaceSelection(
+      workspacePath,
+      options.workspaceRegistry,
+      {
+        workspaceId: c.req.query("workspaceId"),
+        workspacePath: c.req.query("workspacePath"),
+      },
+      { allowUnvalidatedDefault: true },
+    );
+    if (!selectedWorkspacePath.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(selectedWorkspacePath.code, selectedWorkspacePath.error),
+        400,
+      );
+    }
+
+    const selectedPath = selectedWorkspacePath.path;
     const response: StatusResponse = StatusResponseSchema.parse({
       ok: true,
       service: "codex-relay-server",
       sdkAvailable: Boolean(codex),
       machineName: hostname(),
-      workspacePath,
+      workspaceId: selectedWorkspacePath.workspaceId,
+      workspacePath: selectedPath,
       threadCount: threads.size,
       appServerAvailable: Boolean(appServer),
-      preferences: await preferences.read(workspacePath),
+      preferences: await preferences.read(selectedPath),
       runtimePreferencesByWorkspacePath: await preferences.readByWorkspacePath(),
     });
 
+    return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+  });
+
+  app.get(apiPaths.workspaces, async (c) => {
+    await threadWorkspaceRegistrationTail;
+    const response: ListWorkspacesResponse = ListWorkspacesResponseSchema.parse({
+      workspaces: (await options.workspaceRegistry?.listWorkspaces()) ?? [],
+    });
+    return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+  });
+
+  app.get(apiPaths.health, (c) => {
+    const response: HealthResponse = HealthResponseSchema.parse(
+      createHealthResponse({ relayId, serverEpoch }),
+    );
+    c.header("cache-control", "no-store");
+    return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+  });
+
+  app.get(apiPaths.connectionPlan, (c) => {
+    const candidates =
+      options.management?.connectUrlCandidates ??
+      (options.management?.connectUrl
+        ? [{ label: "Server", url: options.management.connectUrl }]
+        : []);
+    const response: ConnectionPlanResponse = ConnectionPlanResponseSchema.parse(
+      createConnectionPlan({ candidates, relayId, serverEpoch }),
+    );
+    c.header("cache-control", "no-store");
     return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
   });
 
@@ -785,20 +1517,35 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
-    if (parsed.data.threadId || parsed.data.workspacePath) {
-      const targetWorkspacePath = parsed.data.workspacePath ?? targetThread?.cwd ?? workspacePath;
-      const response = RuntimePreferencesResponseSchema.parse({
-        preferences: await preferences.update(parsed.data, targetWorkspacePath),
-        runtimePreferencesByWorkspacePath: await preferences.readByWorkspacePath(),
-        workspacePath: targetWorkspacePath,
-      });
-      return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+    const legacyTargetWorkspacePath =
+      parsed.data.workspacePath ?? targetThread?.cwd ?? workspacePath;
+    const selectedWorkspace = parsed.data.workspaceId
+      ? await resolveWorkspaceSelection(workspacePath, options.workspaceRegistry, {
+          workspaceId: parsed.data.workspaceId,
+          workspacePath: parsed.data.workspacePath ?? targetThread?.cwd,
+        })
+      : {
+          success: true as const,
+          path: legacyTargetWorkspacePath,
+          workspaceId: (
+            await options.workspaceRegistry?.resolveWorkspace(legacyTargetWorkspacePath)
+          )?.workspaceId,
+        };
+    if (!selectedWorkspace.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(selectedWorkspace.code, selectedWorkspace.error),
+        400,
+      );
     }
 
     const response = RuntimePreferencesResponseSchema.parse({
-      preferences: await preferences.update(parsed.data, workspacePath),
+      preferences: await preferences.update(parsed.data, selectedWorkspace.path),
       runtimePreferencesByWorkspacePath: await preferences.readByWorkspacePath(),
-      workspacePath,
+      workspaceId: selectedWorkspace.workspaceId,
+      workspacePath: selectedWorkspace.path,
     });
     return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
   });
@@ -964,22 +1711,24 @@ export function createApp(options: AppOptions = {}) {
 
   app.get(apiPaths.workspaceChanges, async (c) => {
     try {
-      const selectedWorkspacePath = await validateThreadWorkspacePath(
+      const selectedWorkspacePath = await resolveWorkspaceSelection(
         workspacePath,
-        c.req.query("workspacePath"),
+        options.workspaceRegistry,
+        workspaceSelectionFromQuery(c),
       );
       if (!selectedWorkspacePath.success) {
         return secureJson(
           c,
           options.pairing,
           secureSessionsByTokenHash,
-          apiError("invalid_workspace_path", selectedWorkspacePath.error),
+          apiError(selectedWorkspacePath.code, selectedWorkspacePath.error),
           400,
         );
       }
 
       const changes = await readWorkspaceChanges(selectedWorkspacePath.path);
       const response = WorkspaceChangesResponseSchema.parse({
+        workspaceId: selectedWorkspacePath.workspaceId,
         workspacePath: selectedWorkspacePath.path,
         ...changes,
       });
@@ -1013,16 +1762,17 @@ export function createApp(options: AppOptions = {}) {
     }
 
     try {
-      const selectedWorkspacePath = await validateThreadWorkspacePath(
+      const selectedWorkspacePath = await resolveWorkspaceSelection(
         workspacePath,
-        parsed.data.workspacePath,
+        options.workspaceRegistry,
+        parsed.data,
       );
       if (!selectedWorkspacePath.success) {
         return secureJson(
           c,
           options.pairing,
           secureSessionsByTokenHash,
-          apiError("invalid_workspace_path", selectedWorkspacePath.error),
+          apiError(selectedWorkspacePath.code, selectedWorkspacePath.error),
           400,
         );
       }
@@ -1040,6 +1790,8 @@ export function createApp(options: AppOptions = {}) {
           ? `Checked out ${parsed.data.branch}.`
           : `Created and checked out ${parsed.data.branch}.`,
         output,
+        workspaceId: selectedWorkspacePath.workspaceId,
+        workspacePath: selectedWorkspacePath.path,
       });
       return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
     } catch (error) {
@@ -1071,16 +1823,17 @@ export function createApp(options: AppOptions = {}) {
     }
 
     try {
-      const selectedWorkspacePath = await validateThreadWorkspacePath(
+      const selectedWorkspacePath = await resolveWorkspaceSelection(
         workspacePath,
-        parsed.data.workspacePath,
+        options.workspaceRegistry,
+        parsed.data,
       );
       if (!selectedWorkspacePath.success) {
         return secureJson(
           c,
           options.pairing,
           secureSessionsByTokenHash,
-          apiError("invalid_workspace_path", selectedWorkspacePath.error),
+          apiError(selectedWorkspacePath.code, selectedWorkspacePath.error),
           400,
         );
       }
@@ -1106,6 +1859,8 @@ export function createApp(options: AppOptions = {}) {
         branch,
         message: "Committed and pushed workspace changes.",
         output: [commitOutput, pushOutput].filter(Boolean).join("\n"),
+        workspaceId: selectedWorkspacePath.workspaceId,
+        workspacePath: selectedWorkspacePath.path,
       });
       return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
     } catch (error) {
@@ -1136,16 +1891,17 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
-    const selectedWorkspacePath = await validateThreadWorkspacePath(
+    const selectedWorkspacePath = await resolveWorkspaceSelection(
       workspacePath,
-      parsed.data.workspacePath,
+      options.workspaceRegistry,
+      parsed.data,
     );
     if (!selectedWorkspacePath.success) {
       return secureJson(
         c,
         options.pairing,
         secureSessionsByTokenHash,
-        apiError("invalid_workspace_path", selectedWorkspacePath.error),
+        apiError(selectedWorkspacePath.code, selectedWorkspacePath.error),
         400,
       );
     }
@@ -1163,6 +1919,7 @@ export function createApp(options: AppOptions = {}) {
           rows: session.rows,
           sessionId: session.sessionId,
           startedAt: session.startedAt,
+          workspaceId: selectedWorkspacePath.workspaceId,
           workspacePath: session.workspacePath,
         });
       return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
@@ -1425,16 +2182,17 @@ export function createApp(options: AppOptions = {}) {
 
   app.get(apiPaths.skills, async (c) => {
     try {
-      const selectedWorkspacePath = await validateThreadWorkspacePath(
+      const selectedWorkspacePath = await resolveWorkspaceSelection(
         workspacePath,
-        c.req.query("workspacePath"),
+        options.workspaceRegistry,
+        workspaceSelectionFromQuery(c),
       );
       if (!selectedWorkspacePath.success) {
         return secureJson(
           c,
           options.pairing,
           secureSessionsByTokenHash,
-          apiError("invalid_workspace_path", selectedWorkspacePath.error),
+          apiError(selectedWorkspacePath.code, selectedWorkspacePath.error),
           400,
         );
       }
@@ -1459,16 +2217,17 @@ export function createApp(options: AppOptions = {}) {
 
   app.get(apiPaths.workspaceFiles, async (c) => {
     try {
-      const selectedWorkspacePath = await validateThreadWorkspacePath(
+      const selectedWorkspacePath = await resolveWorkspaceSelection(
         workspacePath,
-        c.req.query("workspacePath"),
+        options.workspaceRegistry,
+        workspaceSelectionFromQuery(c),
       );
       if (!selectedWorkspacePath.success) {
         return secureJson(
           c,
           options.pairing,
           secureSessionsByTokenHash,
-          apiError("invalid_workspace_path", selectedWorkspacePath.error),
+          apiError(selectedWorkspacePath.code, selectedWorkspacePath.error),
           400,
         );
       }
@@ -1489,6 +2248,7 @@ export function createApp(options: AppOptions = {}) {
         files: await listWorkspaceFiles(selectedWorkspacePath.path, query, directoryPath.path),
         parentDirectory: parentWorkspaceDirectory(directoryPath.path),
         query,
+        workspaceId: selectedWorkspacePath.workspaceId,
         workspacePath: selectedWorkspacePath.path,
       });
       return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
@@ -1505,16 +2265,17 @@ export function createApp(options: AppOptions = {}) {
 
   app.get(apiPaths.workspaceFileContent, async (c) => {
     try {
-      const selectedWorkspacePath = await validateThreadWorkspacePath(
+      const selectedWorkspacePath = await resolveWorkspaceSelection(
         workspacePath,
-        c.req.query("workspacePath"),
+        options.workspaceRegistry,
+        workspaceSelectionFromQuery(c),
       );
       if (!selectedWorkspacePath.success) {
         return secureJson(
           c,
           options.pairing,
           secureSessionsByTokenHash,
-          apiError("invalid_workspace_path", selectedWorkspacePath.error),
+          apiError(selectedWorkspacePath.code, selectedWorkspacePath.error),
           400,
         );
       }
@@ -1542,6 +2303,7 @@ export function createApp(options: AppOptions = {}) {
       }
 
       const response: WorkspaceFileContentResponse = WorkspaceFileContentResponseSchema.parse({
+        workspaceId: selectedWorkspacePath.workspaceId,
         workspacePath: selectedWorkspacePath.path,
         ...file.content,
       });
@@ -1575,16 +2337,17 @@ export function createApp(options: AppOptions = {}) {
     }
 
     try {
-      const selectedWorkspacePath = await validateThreadWorkspacePath(
+      const selectedWorkspacePath = await resolveWorkspaceSelection(
         workspacePath,
-        parsed.data.workspacePath,
+        options.workspaceRegistry,
+        parsed.data,
       );
       if (!selectedWorkspacePath.success) {
         return secureJson(
           c,
           options.pairing,
           secureSessionsByTokenHash,
-          apiError("invalid_workspace_path", selectedWorkspacePath.error),
+          apiError(selectedWorkspacePath.code, selectedWorkspacePath.error),
           400,
         );
       }
@@ -1601,6 +2364,7 @@ export function createApp(options: AppOptions = {}) {
       }
 
       const response: WorkspaceFileContentResponse = WorkspaceFileContentResponseSchema.parse({
+        workspaceId: selectedWorkspacePath.workspaceId,
         workspacePath: selectedWorkspacePath.path,
         ...file.content,
       });
@@ -1741,14 +2505,47 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.get(apiPaths.threads, async (c) => {
+    const selectedWorkspacePath = await resolveWorkspaceSelection(
+      workspacePath,
+      options.workspaceRegistry,
+      {
+        workspaceId: c.req.query("workspaceId"),
+        workspacePath: c.req.query("workspacePath"),
+      },
+      { allowUnscoped: true },
+    );
+    if (!selectedWorkspacePath.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(selectedWorkspacePath.code, selectedWorkspacePath.error),
+        400,
+      );
+    }
+    const requestedWorkspacePath = selectedWorkspacePath.path;
+
     if (appServer) {
       try {
-        const appServerThreads = await appServer.listThreads();
+        const appServerThreads = await appServer.listThreads(500);
+        const knownAppServerThreads = appServerThreads
+          .filter((thread) => !isSubagentThread(thread))
+          .map((thread) => rememberAppServerThread(threads, thread));
+        scheduleThreadWorkspaceRegistration(knownAppServerThreads);
+        const visibleThreads = await identifyKnownThreadWorkspaces(
+          knownAppServerThreads.filter((thread) =>
+            threadMatchesWorkspace(thread, requestedWorkspacePath),
+          ),
+          selectedWorkspacePath.workspaceId,
+        );
         const response: ListThreadsResponse = ListThreadsResponseSchema.parse({
-          threads: appServerThreads
-            .filter((thread) => !isSubagentThread(thread))
-            .map((thread) => rememberAppServerThread(threads, thread)),
+          threads: await Promise.all(visibleThreads.map(withCurrentThreadOwnerEpoch)),
           source: "app-server",
+        });
+        relayDebugLog("threads.listed", {
+          requestedWorkspacePath,
+          source: "app-server",
+          threadCount: visibleThreads.length,
         });
         return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
       } catch {
@@ -1756,9 +2553,20 @@ export function createApp(options: AppOptions = {}) {
       }
     }
 
+    const visibleThreads = await identifyKnownThreadWorkspaces(
+      sortedThreads(threads).filter((thread) =>
+        threadMatchesWorkspace(thread, requestedWorkspacePath),
+      ),
+      selectedWorkspacePath.workspaceId,
+    );
     const response: ListThreadsResponse = ListThreadsResponseSchema.parse({
-      threads: sortedThreads(threads),
+      threads: await Promise.all(visibleThreads.map(withCurrentThreadOwnerEpoch)),
       source: "memory",
+    });
+    relayDebugLog("threads.listed", {
+      requestedWorkspacePath,
+      source: "memory",
+      threadCount: visibleThreads.length,
     });
 
     return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
@@ -1766,9 +2574,59 @@ export function createApp(options: AppOptions = {}) {
 
   app.delete("/v1/threads/:threadId", async (c) => {
     const threadId = c.req.param("threadId");
+    const parsed = await parseOptionalRequestJson(
+      c,
+      options.pairing,
+      secureSessionsByTokenHash,
+      ThreadOwnerMutationRequestSchema,
+    );
+    if (!parsed.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsed.error),
+        400,
+      );
+    }
+    const ownerEpochError = await expectedThreadOwnerEpochError(
+      threadId,
+      parsed.data.expectedOwnerEpoch,
+    );
+    if (ownerEpochError) {
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
+    }
+    await ensureQueuedInputsHydrated();
     if (appServer) {
       try {
+        const dispatchOwnerEpochError = await expectedThreadOwnerEpochError(
+          threadId,
+          parsed.data.expectedOwnerEpoch,
+        );
+        if (dispatchOwnerEpochError) {
+          return secureJson(
+            c,
+            options.pairing,
+            secureSessionsByTokenHash,
+            dispatchOwnerEpochError,
+            409,
+          );
+        }
         await appServer.archiveThread({ threadId });
+        await updateQueuedThreadInputStates(
+          options.threadInputs,
+          queuedInputsByThreadId.get(threadId) ?? [],
+          "cancelled",
+        );
+        await finalizeActiveThreadInputState(
+          options.threadInputs,
+          options.threadCoordinator,
+          activeTurnClaimsByThreadId,
+          activeThreadInputIdsByThreadId,
+          threadId,
+          "cancelled",
+          forgetRelayThreadOwner,
+        );
         threads.delete(threadId);
         messagesByThreadId.delete(threadId);
         activeAppServerTurnIdsByThreadId.delete(threadId);
@@ -1807,6 +2665,20 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
+    await updateQueuedThreadInputStates(
+      options.threadInputs,
+      queuedInputsByThreadId.get(threadId) ?? [],
+      "cancelled",
+    );
+    await finalizeActiveThreadInputState(
+      options.threadInputs,
+      options.threadCoordinator,
+      activeTurnClaimsByThreadId,
+      activeThreadInputIdsByThreadId,
+      threadId,
+      "cancelled",
+      forgetRelayThreadOwner,
+    );
     threads.delete(threadId);
     liveThreads.delete(threadId);
     messagesByThreadId.delete(threadId);
@@ -1919,6 +2791,14 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
+    const ownerEpochError = await expectedThreadOwnerEpochError(
+      threadId,
+      parsed.data.expectedOwnerEpoch,
+    );
+    if (ownerEpochError) {
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
+    }
+
     return runThreadOperation(threadId, () =>
       runAppServerMutation(threadId, async () => {
         try {
@@ -1958,6 +2838,20 @@ export function createApp(options: AppOptions = {}) {
             );
           }
 
+          const dispatchOwnerEpochError = await expectedThreadOwnerEpochError(
+            threadId,
+            parsed.data.expectedOwnerEpoch,
+          );
+          if (dispatchOwnerEpochError) {
+            return secureJson(
+              c,
+              options.pairing,
+              secureSessionsByTokenHash,
+              dispatchOwnerEpochError,
+              409,
+            );
+          }
+
           let rolledBackThread: AppServerThread;
           if (
             threadBeforeRewind.historyMode === "paginated" &&
@@ -1992,6 +2886,21 @@ export function createApp(options: AppOptions = {}) {
           });
           const messages = mapAppServerMessages(threadWithTurns);
           invalidateAppServerHistory(threadId);
+          await ensureQueuedInputsHydrated();
+          await updateQueuedThreadInputStates(
+            options.threadInputs,
+            queuedInputsByThreadId.get(threadId) ?? [],
+            "cancelled",
+          );
+          await finalizeActiveThreadInputState(
+            options.threadInputs,
+            options.threadCoordinator,
+            activeTurnClaimsByThreadId,
+            activeThreadInputIdsByThreadId,
+            threadId,
+            "cancelled",
+            forgetRelayThreadOwner,
+          );
           messagesByThreadId.set(threadId, messages);
           liveThreads.delete(threadId);
           activeAppServerTurnIdsByThreadId.delete(threadId);
@@ -2003,7 +2912,7 @@ export function createApp(options: AppOptions = {}) {
             options.pairing,
             secureSessionsByTokenHash,
             threadDetailResponse({
-              thread,
+              thread: await withCurrentThreadOwnerEpoch(thread),
               messages,
               pendingInputRequests: [],
             }),
@@ -2023,9 +2932,209 @@ export function createApp(options: AppOptions = {}) {
     );
   });
 
+  app.get("/v1/threads/:threadId/events", async (c) => {
+    const threadId = c.req.param("threadId");
+    const parsedQuery = ListThreadEventsQuerySchema.safeParse(c.req.query());
+    if (!parsedQuery.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsedQuery.error),
+        400,
+      );
+    }
+    if (!options.threadEvents) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(
+          "event_replay_unavailable",
+          "Durable thread event replay is not available on this Relay.",
+        ),
+        503,
+      );
+    }
+
+    const knownThread = await ensureKnownThread({
+      appServer,
+      threadId,
+      messagesByThreadId,
+      threads,
+    });
+    if (!knownThread || isSubagentThread(knownThread)) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError("not_found", `Thread ${threadId} is not known to this server.`),
+        404,
+      );
+    }
+
+    const page = await options.threadEvents.listThreadEvents({
+      afterSequence: parsedQuery.data.afterSequence,
+      limit: parsedQuery.data.limit,
+      threadId,
+    });
+    const response: ListThreadEventsResponse = ListThreadEventsResponseSchema.parse({
+      ...page,
+      resetRequired: page.resetRequired ?? false,
+    });
+    return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+  });
+
+  app.get("/v1/threads/:threadId/events/stream", async (c) => {
+    const threadId = c.req.param("threadId");
+    const parsedQuery = ListThreadEventsQuerySchema.safeParse({
+      afterSequence: c.req.query("afterSequence"),
+    });
+    if (!parsedQuery.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsedQuery.error),
+        400,
+      );
+    }
+    if (!options.threadEvents) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(
+          "event_replay_unavailable",
+          "Durable thread event streaming is not available on this Relay.",
+        ),
+        503,
+      );
+    }
+
+    const knownThread = await ensureKnownThread({
+      appServer,
+      threadId,
+      messagesByThreadId,
+      threads,
+    });
+    if (!knownThread || isSubagentThread(knownThread)) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError("not_found", `Thread ${threadId} is not known to this server.`),
+        404,
+      );
+    }
+
+    const encoder = new TextEncoder();
+    const secureSession = getSecureSessionForRequest(c, options.pairing, secureSessionsByTokenHash);
+    let closeStream = () => {};
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        let afterSequence = parsedQuery.data.afterSequence;
+        let closed = false;
+        let lastWriteAt = Date.now();
+        closeStream = () => {
+          if (closed) {
+            return;
+          }
+          closed = true;
+          activeStreamControllers.delete(controller);
+          closeSseController(controller);
+        };
+        activeStreamControllers.set(controller, closeStream);
+        relayDebugLog("thread.event_stream.started", { afterSequence, threadId });
+
+        void (async () => {
+          try {
+            while (!closed) {
+              const page = await options.threadEvents!.listThreadEvents({
+                afterSequence,
+                limit: threadEventStreamPageLimit,
+                threadId,
+              });
+              for (const stored of page.events) {
+                if (closed) {
+                  return;
+                }
+                const event = StreamThreadRunEventSchema.parse({
+                  ...stored.event,
+                  eventId: stored.eventId,
+                  sequence: stored.sequence,
+                });
+                afterSequence = stored.sequence;
+                if (!sendSse(controller, encoder, secureSession, event)) {
+                  closeStream();
+                  return;
+                }
+                lastWriteAt = Date.now();
+                if (isTerminalThreadStreamEvent(event)) {
+                  relayDebugLog("thread.event_stream.terminal", {
+                    eventType: event.type,
+                    sequence: stored.sequence,
+                    threadId,
+                  });
+                  closeStream();
+                  return;
+                }
+              }
+              if (page.hasMore) {
+                continue;
+              }
+              if (Date.now() - lastWriteAt >= threadEventStreamHeartbeatIntervalMs) {
+                if (!enqueueSseChunk(controller, encoder.encode(": keep-alive\n\n"))) {
+                  closeStream();
+                  return;
+                }
+                lastWriteAt = Date.now();
+              }
+              await delay(threadEventStreamPollIntervalMs);
+            }
+          } catch (error) {
+            relayDebugLog("thread.event_stream.failed", {
+              afterSequence,
+              error: errorMessage(error),
+              threadId,
+            });
+            closeStream();
+          }
+        })();
+      },
+      cancel(reason) {
+        closeStream();
+        relayDebugLog("thread.event_stream.cancelled_by_client", {
+          reason: debugReason(reason),
+          threadId,
+        });
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+        "content-type": "text/event-stream; charset=utf-8",
+      },
+    });
+  });
+
   app.get("/v1/threads/:threadId", async (c) => {
     const threadId = c.req.param("threadId");
-    const forceRefresh = c.req.query("refresh") === "true";
+    await ensurePendingApprovalsHydrated();
+    const parsedQuery = ThreadDetailQuerySchema.safeParse(c.req.query());
+    if (!parsedQuery.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsedQuery.error),
+        400,
+      );
+    }
+    const forceRefresh = parsedQuery.data.refresh === "true";
+    const beforeMessageId = parsedQuery.data.beforeMessageId;
     const detailStartedAt = Date.now();
     relayDebugLog("thread.detail.requested", {
       threadId,
@@ -2070,7 +3179,7 @@ export function createApp(options: AppOptions = {}) {
         let messages = cachedMessages;
         let responseThread = preserveKnownRunningThreadState(mappedThread, wasKnownRunning);
 
-        if (forceRefresh && responseThread.state !== "running") {
+        if (forceRefresh) {
           const threadWithTurns = await appServer.readThread(threadId, {
             includeTurns: true,
           });
@@ -2132,14 +3241,18 @@ export function createApp(options: AppOptions = {}) {
         }
 
         const response = threadDetailResponse({
-          thread: responseThread,
-          messages,
+          thread: await withCurrentThreadOwnerEpoch(responseThread),
+          messages: messagesWithPendingApprovals(messages, pendingApprovals, threadId),
           pendingInputRequests: pendingInputRequestsForThread(pendingApprovals, threadId),
+          beforeMessageId,
         });
         relayDebugLog("thread.detail.responded", {
           durationMs: Date.now() - detailStartedAt,
+          forceRefresh,
+          hasOlderMessages: response.hasOlderMessages,
           loadedMessages,
           messageCount: messages.length,
+          responseMessageCount: response.messages.length,
           state: responseThread.state,
           threadId,
         });
@@ -2177,15 +3290,19 @@ export function createApp(options: AppOptions = {}) {
       );
       messagesByThreadId.set(threadId, messages);
       const response = threadDetailResponse({
-        thread: responseThread,
-        messages,
+        thread: await withCurrentThreadOwnerEpoch(responseThread),
+        messages: messagesWithPendingApprovals(messages, pendingApprovals, threadId),
         pendingInputRequests: pendingInputRequestsForThread(pendingApprovals, threadId),
+        beforeMessageId,
       });
       relayDebugLog("thread.detail.responded", {
         durationMs: Date.now() - detailStartedAt,
         fastPath: "rollout",
+        forceRefresh,
+        hasOlderMessages: response.hasOlderMessages,
         loadedMessages: true,
         messageCount: messages.length,
+        responseMessageCount: response.messages.length,
         state: responseThread.state,
         threadId,
       });
@@ -2208,9 +3325,14 @@ export function createApp(options: AppOptions = {}) {
       options.pairing,
       secureSessionsByTokenHash,
       threadDetailResponse({
-        thread,
-        messages: messagesByThreadId.get(threadId) ?? [],
+        thread: await withCurrentThreadOwnerEpoch(thread),
+        messages: messagesWithPendingApprovals(
+          messagesByThreadId.get(threadId) ?? [],
+          pendingApprovals,
+          threadId,
+        ),
         pendingInputRequests: pendingInputRequestsForThread(pendingApprovals, threadId),
+        beforeMessageId,
       }),
     );
   });
@@ -2285,6 +3407,7 @@ export function createApp(options: AppOptions = {}) {
 
   app.get("/v1/threads/:threadId/input", async (c) => {
     const threadId = c.req.param("threadId");
+    await ensureQueuedInputsHydrated();
     const thread = threads.get(threadId);
     if (!thread) {
       return secureJson(
@@ -2398,12 +3521,33 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
+    const ownerEpochError = await expectedThreadOwnerEpochError(
+      threadId,
+      parsed.data.expectedOwnerEpoch,
+    );
+    if (ownerEpochError) {
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
+    }
+
     try {
       const body: UpdateThreadGoalRequest = parsed.data;
       const thread = rememberAppServerThread(
         threads,
         await appServer.readThread(threadId, { includeTurns: false }),
       );
+      const dispatchOwnerEpochError = await expectedThreadOwnerEpochError(
+        threadId,
+        parsed.data.expectedOwnerEpoch,
+      );
+      if (dispatchOwnerEpochError) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          dispatchOwnerEpochError,
+          409,
+        );
+      }
       const goal = mapAppServerThreadGoal(
         await appServer.setThreadGoal({
           threadId,
@@ -2444,11 +3588,47 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
+    const parsed = await parseOptionalRequestJson(
+      c,
+      options.pairing,
+      secureSessionsByTokenHash,
+      ThreadOwnerMutationRequestSchema,
+    );
+    if (!parsed.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsed.error),
+        400,
+      );
+    }
+    const ownerEpochError = await expectedThreadOwnerEpochError(
+      threadId,
+      parsed.data.expectedOwnerEpoch,
+    );
+    if (ownerEpochError) {
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
+    }
+
     try {
       const thread = rememberAppServerThread(
         threads,
         await appServer.readThread(threadId, { includeTurns: false }),
       );
+      const dispatchOwnerEpochError = await expectedThreadOwnerEpochError(
+        threadId,
+        parsed.data.expectedOwnerEpoch,
+      );
+      if (dispatchOwnerEpochError) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          dispatchOwnerEpochError,
+          409,
+        );
+      }
       await appServer.clearThreadGoal({ threadId });
       const threadWithoutGoal = rememberThreadGoal(threads, thread, null);
       return secureJson(
@@ -2476,6 +3656,7 @@ export function createApp(options: AppOptions = {}) {
 
   app.post("/v1/approvals/:approvalId", async (c) => {
     const approvalId = c.req.param("approvalId");
+    await ensurePendingApprovalsHydrated();
     const parsed = await parseRequestJson(
       c,
       options.pairing,
@@ -2513,12 +3694,31 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
+    const ownerEpochError = await expectedThreadOwnerEpochError(
+      pending.threadId,
+      parsed.data.expectedOwnerEpoch,
+    );
+    if (ownerEpochError) {
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
+    }
+
     pendingApprovals.delete(approvalId);
     const resolution = resolveAppServerRequest(
       pending,
       parsed.data.decision,
       parsed.data.answers ?? [],
     )
+      .then(async () => {
+        try {
+          await options.approvalStore?.resolvePendingApproval(approvalId);
+        } catch (error) {
+          relayDebugLog("thread.approval.resolve_persistence_failed", {
+            approvalId,
+            error: errorMessage(error),
+            threadId: pending.threadId,
+          });
+        }
+      })
       .then(() => {
         if (pending.messageId) {
           markApprovalMessageResolved(
@@ -2562,24 +3762,26 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
-    const selectedWorkspacePath = await validateThreadWorkspacePath(
+    const selectedWorkspacePath = await resolveWorkspaceSelection(
       workspacePath,
-      parsed.data.workspacePath,
+      options.workspaceRegistry,
+      parsed.data,
     );
     if (!selectedWorkspacePath.success) {
       return secureJson(
         c,
         options.pairing,
         secureSessionsByTokenHash,
-        apiError("invalid_workspace_path", selectedWorkspacePath.error),
+        apiError(selectedWorkspacePath.code, selectedWorkspacePath.error),
         400,
       );
     }
+    const selectedPath = selectedWorkspacePath.path ?? workspacePath;
 
     const hasRequestRuntimeOptions = hasExplicitRunOptions(parsed.data);
     const runOptions =
       parsed.data.prompt || hasRequestRuntimeOptions
-        ? withRuntimePreferences(await preferences.read(selectedWorkspacePath.path), parsed.data)
+        ? withRuntimePreferences(await preferences.read(selectedPath), parsed.data)
         : parsed.data;
     const { threadId } = appServer
       ? await createAppServerThreadRecord({
@@ -2589,7 +3791,8 @@ export function createApp(options: AppOptions = {}) {
           persistRuntimeOptions: Boolean(runOptions.prompt) || hasRequestRuntimeOptions,
           threads,
           title: runOptions.title,
-          workspacePath: selectedWorkspacePath.path,
+          workspaceId: selectedWorkspacePath.workspaceId,
+          workspacePath: selectedPath,
         })
       : createThreadRecord({
           codex,
@@ -2599,8 +3802,9 @@ export function createApp(options: AppOptions = {}) {
           title: runOptions.title,
           prompt: runOptions.prompt,
           runOptions,
+          workspaceId: selectedWorkspacePath.workspaceId,
           threadOptions: buildThreadOptions(
-            { ...threadOptions, workingDirectory: selectedWorkspacePath.path },
+            { ...threadOptions, workingDirectory: selectedPath },
             runOptions,
           ),
         });
@@ -2623,7 +3827,7 @@ export function createApp(options: AppOptions = {}) {
       prompt,
       attachments: runOptions.attachments ?? [],
       threadId,
-      threadOptions: { ...threadOptions, workingDirectory: selectedWorkspacePath.path },
+      threadOptions: { ...threadOptions, workingDirectory: selectedPath },
       runOptions,
       skills,
       threads,
@@ -2672,12 +3876,33 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
+    const ownerEpochError = await expectedThreadOwnerEpochError(
+      threadId,
+      parsed.data.expectedOwnerEpoch,
+    );
+    if (ownerEpochError) {
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
+    }
+
     const runOptions = withRuntimePreferences(
       await preferences.read(knownThread.cwd ?? workspacePath),
       parsed.data,
     );
     const skills = runOptions.skills ?? [];
     const prompt = runOptions.prompt;
+    const dispatchOwnerEpochError = await expectedThreadOwnerEpochError(
+      threadId,
+      parsed.data.expectedOwnerEpoch,
+    );
+    if (dispatchOwnerEpochError) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        dispatchOwnerEpochError,
+        409,
+      );
+    }
     const response = await runPromptBuffered({
       codex,
       liveThreads,
@@ -2703,6 +3928,7 @@ export function createApp(options: AppOptions = {}) {
   app.post("/v1/threads/:threadId/input", async (c) => {
     const threadId = c.req.param("threadId");
     return runThreadOperation(threadId, async () => {
+      await ensureQueuedInputsHydrated();
       const knownThread = await ensureKnownThread({
         appServer,
         threadId,
@@ -2716,24 +3942,6 @@ export function createApp(options: AppOptions = {}) {
           secureSessionsByTokenHash,
           apiError("not_found", `Thread ${threadId} is not known to this server.`),
           404,
-        );
-      }
-      if (!appServer) {
-        return secureJson(
-          c,
-          options.pairing,
-          secureSessionsByTokenHash,
-          apiError("unsupported", "Running-thread input requires the Codex app-server."),
-          409,
-        );
-      }
-      if (knownThread.state !== "running") {
-        return secureJson(
-          c,
-          options.pairing,
-          secureSessionsByTokenHash,
-          apiError("thread_not_running", `Thread ${threadId} is not currently running.`),
-          409,
         );
       }
 
@@ -2753,89 +3961,59 @@ export function createApp(options: AppOptions = {}) {
         );
       }
 
-      const runOptions = withRuntimePreferences(
-        await preferences.read(knownThread.cwd ?? workspacePath),
-        parsed.data,
-      );
-      const skills = runOptions.skills ?? [];
-      const prompt = runOptions.prompt;
-      const queuedInputs = queuedInputsByThreadId.get(threadId) ?? [];
-      const queuedInput: QueuedThreadInput = {
-        attachments: runOptions.attachments ?? [],
-        id: randomUUID(),
-        prompt,
-        runOptions,
-        skills,
-        workspacePath: knownThread.cwd ?? workspacePath,
-      };
-      queuedInputs.push(queuedInput);
-      queuedInputsByThreadId.set(threadId, queuedInputs);
-
-      const thread = updateThread(threads, messagesByThreadId, threadId, {
-        state: "running",
-        lastPrompt: promptWithAttachmentReferences(prompt, runOptions.attachments ?? []),
-        lastError: undefined,
-        ...runtimeMetadataFromOptions(runOptions),
-      });
-      const response: SubmitThreadInputResponse = SubmitThreadInputResponseSchema.parse({
-        acceptedAs: "queued",
-        input: queuedThreadInputSummary(queuedInput),
-        queueLength: queuedInputsByThreadId.get(threadId)?.length ?? 0,
-        thread,
-      });
-      return secureJson(c, options.pairing, secureSessionsByTokenHash, response, 202);
-    });
-  });
-
-  app.delete("/v1/threads/:threadId/input/:inputId", async (c) => {
-    const threadId = c.req.param("threadId");
-    const inputId = c.req.param("inputId");
-    const queuedInput = removeQueuedInput(queuedInputsByThreadId, threadId, inputId);
-    if (!queuedInput) {
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("not_found", `Queued input ${inputId} is not known to this thread.`),
-        404,
-      );
-    }
-    const thread = threads.get(threadId);
-    if (!thread) {
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("not_found", `Thread ${threadId} is not known to this server.`),
-        404,
-      );
-    }
-    const response = QueuedThreadInputActionResponseSchema.parse({
-      input: queuedThreadInputSummary(queuedInput),
-      queueLength: queuedInputsByThreadId.get(threadId)?.length ?? 0,
-      thread,
-    });
-    return secureJson(c, options.pairing, secureSessionsByTokenHash, response, 200);
-  });
-
-  app.post("/v1/threads/:threadId/input/:inputId/steer", async (c) => {
-    const threadId = c.req.param("threadId");
-    const inputId = c.req.param("inputId");
-    return runThreadOperation(threadId, async () => {
-      const knownThread = await ensureKnownThread({
-        appServer,
-        threadId,
-        messagesByThreadId,
-        threads,
-      });
-      if (!knownThread) {
-        return secureJson(
-          c,
+      const clientId =
+        normalizeClientSessionId(c.req.header("x-codex-relay-client-session-id")) ??
+        (await pairedClientSessionIdForAuthorization(
+          c.req.header("authorization"),
           options.pairing,
-          secureSessionsByTokenHash,
-          apiError("not_found", `Thread ${threadId} is not known to this server.`),
-          404,
+        )) ??
+        "unpaired-client";
+      if (options.threadInputs && parsed.data.clientEventId) {
+        const existing = await options.threadInputs.getThreadInputByClientEvent(
+          clientId,
+          parsed.data.clientEventId,
         );
+        if (existing) {
+          if (existing.threadId !== threadId) {
+            return secureJson(
+              c,
+              options.pairing,
+              secureSessionsByTokenHash,
+              apiError(
+                "client_event_conflict",
+                `Client event ${parsed.data.clientEventId} already belongs to another thread.`,
+              ),
+              409,
+            );
+          }
+          const existingResponse = SubmitThreadInputResponseSchema.safeParse(existing.result);
+          if (!existingResponse.success) {
+            return secureJson(
+              c,
+              options.pairing,
+              secureSessionsByTokenHash,
+              apiError(
+                "input_result_unavailable",
+                `Input ${existing.inputId} was persisted without a reusable response.`,
+              ),
+              409,
+            );
+          }
+          return secureJson(
+            c,
+            options.pairing,
+            secureSessionsByTokenHash,
+            existingResponse.data,
+            202,
+          );
+        }
+      }
+      const ownerEpochError = await expectedThreadOwnerEpochError(
+        threadId,
+        parsed.data.expectedOwnerEpoch,
+      );
+      if (ownerEpochError) {
+        return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
       }
       if (!appServer) {
         return secureJson(
@@ -2855,7 +4033,234 @@ export function createApp(options: AppOptions = {}) {
           409,
         );
       }
-      const queuedInput = removeQueuedInput(queuedInputsByThreadId, threadId, inputId);
+      if (!activeAppServerTurnIdsByThreadId.has(threadId) && !steeringThreads.has(threadId)) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          activeThreadWriterError(),
+          409,
+        );
+      }
+      await ensureRelayThreadOwner(threadId, knownThread.workspaceId);
+
+      const runOptions = withRuntimePreferences(
+        await preferences.read(knownThread.cwd ?? workspacePath),
+        parsed.data,
+      );
+      const skills = runOptions.skills ?? [];
+      const prompt = runOptions.prompt;
+      const queuedInputs = queuedInputsByThreadId.get(threadId) ?? [];
+      const queuedInput: QueuedThreadInput = {
+        attachments: runOptions.attachments ?? [],
+        clientEventId: parsed.data.clientEventId,
+        id: randomUUID(),
+        prompt,
+        runOptions,
+        skills,
+        workspacePath: knownThread.cwd ?? workspacePath,
+      };
+      const thread = updatedThreadSummary(threads, messagesByThreadId, threadId, {
+        state: "running",
+        lastPrompt: promptWithAttachmentReferences(prompt, runOptions.attachments ?? []),
+        lastError: undefined,
+        ...runtimeMetadataFromOptions(runOptions),
+      });
+      const response: SubmitThreadInputResponse = SubmitThreadInputResponseSchema.parse({
+        acceptedAs: "queued",
+        clientEventId: parsed.data.clientEventId,
+        deliveryState: parsed.data.clientEventId ? "queued" : undefined,
+        input: queuedThreadInputSummary(queuedInput),
+        inputId: parsed.data.clientEventId ? queuedInput.id : undefined,
+        queueLength: queuedInputs.length + 1,
+        thread,
+      });
+
+      const dispatchOwnerEpochError = await expectedThreadOwnerEpochError(
+        threadId,
+        parsed.data.expectedOwnerEpoch,
+      );
+      if (dispatchOwnerEpochError) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          dispatchOwnerEpochError,
+          409,
+        );
+      }
+
+      if (options.threadInputs) {
+        const persisted = await options.threadInputs.createThreadInput({
+          clientEventId: parsed.data.clientEventId,
+          clientId,
+          inputId: queuedInput.id,
+          payload: queuedInput,
+          result: response,
+          state: "queued",
+          threadId,
+          workspaceId: knownThread.workspaceId,
+        });
+        if (!persisted.created) {
+          const existingResponse = SubmitThreadInputResponseSchema.safeParse(
+            persisted.input.result,
+          );
+          if (persisted.input.threadId !== threadId || !existingResponse.success) {
+            return secureJson(
+              c,
+              options.pairing,
+              secureSessionsByTokenHash,
+              apiError(
+                "client_event_conflict",
+                `Client event ${parsed.data.clientEventId} could not be reused for this input.`,
+              ),
+              409,
+            );
+          }
+          return secureJson(
+            c,
+            options.pairing,
+            secureSessionsByTokenHash,
+            existingResponse.data,
+            202,
+          );
+        }
+      }
+
+      queuedInputs.push(queuedInput);
+      queuedInputsByThreadId.set(threadId, queuedInputs);
+      threads.set(threadId, thread);
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, response, 202);
+    });
+  });
+
+  app.delete("/v1/threads/:threadId/input/:inputId", async (c) => {
+    const threadId = c.req.param("threadId");
+    const inputId = c.req.param("inputId");
+    const parsed = await parseOptionalRequestJson(
+      c,
+      options.pairing,
+      secureSessionsByTokenHash,
+      ThreadOwnerMutationRequestSchema,
+    );
+    if (!parsed.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsed.error),
+        400,
+      );
+    }
+    await ensureQueuedInputsHydrated();
+    const thread = threads.get(threadId);
+    if (!thread) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError("not_found", `Thread ${threadId} is not known to this server.`),
+        404,
+      );
+    }
+    const ownerEpochError = await expectedThreadOwnerEpochError(
+      threadId,
+      parsed.data.expectedOwnerEpoch,
+    );
+    if (ownerEpochError) {
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
+    }
+    const queuedInput = removeQueuedInput(queuedInputsByThreadId, threadId, inputId);
+    if (!queuedInput) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError("not_found", `Queued input ${inputId} is not known to this thread.`),
+        404,
+      );
+    }
+    await options.threadInputs?.updateThreadInputState(inputId, "cancelled");
+    const response = QueuedThreadInputActionResponseSchema.parse({
+      input: queuedThreadInputSummary(queuedInput),
+      queueLength: queuedInputsByThreadId.get(threadId)?.length ?? 0,
+      thread,
+    });
+    return secureJson(c, options.pairing, secureSessionsByTokenHash, response, 200);
+  });
+
+  app.post("/v1/threads/:threadId/input/:inputId/steer", async (c) => {
+    const threadId = c.req.param("threadId");
+    const inputId = c.req.param("inputId");
+    return runThreadOperation(threadId, async () => {
+      const parsed = await parseOptionalRequestJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        ThreadOwnerMutationRequestSchema,
+      );
+      if (!parsed.success) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          validationError(parsed.error),
+          400,
+        );
+      }
+      await ensureQueuedInputsHydrated();
+      const knownThread = await ensureKnownThread({
+        appServer,
+        threadId,
+        messagesByThreadId,
+        threads,
+      });
+      if (!knownThread) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("not_found", `Thread ${threadId} is not known to this server.`),
+          404,
+        );
+      }
+      const ownerEpochError = await expectedThreadOwnerEpochError(
+        threadId,
+        parsed.data.expectedOwnerEpoch,
+      );
+      if (ownerEpochError) {
+        return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
+      }
+      if (!appServer) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("unsupported", "Running-thread input requires the Codex app-server."),
+          409,
+        );
+      }
+      if (knownThread.state !== "running") {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("thread_not_running", `Thread ${threadId} is not currently running.`),
+          409,
+        );
+      }
+      if (!activeAppServerTurnIdsByThreadId.has(threadId) && !steeringThreads.has(threadId)) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          activeThreadWriterError(),
+          409,
+        );
+      }
+      const queuedInput = (queuedInputsByThreadId.get(threadId) ?? []).find(
+        (input) => input.id === inputId,
+      );
       if (!queuedInput) {
         return secureJson(
           c,
@@ -2866,10 +4271,93 @@ export function createApp(options: AppOptions = {}) {
         );
       }
 
+      let turnClaim: TurnClaim | undefined;
+      if (options.threadCoordinator) {
+        const owner = await ensureRelayThreadOwner(threadId, knownThread.workspaceId);
+        if (!owner) {
+          throw new Error(`Failed to acquire an owner for thread ${threadId}.`);
+        }
+        const claimResult = await options.threadCoordinator.acquireTurnClaim({
+          inputId,
+          ownerEpoch: owner.epoch,
+          ownerId: owner.ownerId,
+          threadId,
+        });
+        if (claimResult.kind !== "acquired") {
+          if (claimResult.kind === "stale_owner") {
+            forgetRelayThreadOwner(threadId);
+          }
+          return secureJson(
+            c,
+            options.pairing,
+            secureSessionsByTokenHash,
+            apiError(
+              claimResult.kind === "stale_owner" ? "stale_owner_epoch" : "turn_claim_conflict",
+              claimResult.kind === "stale_owner"
+                ? "The thread owner changed. Refresh before steering this input."
+                : "This input is already claimed or the thread is dispatching another input.",
+            ),
+            409,
+          );
+        }
+        turnClaim = claimResult.claim;
+      }
+      removeQueuedInput(queuedInputsByThreadId, threadId, inputId);
+
       steeringThreads.add(threadId);
-      await runAppServerMutation(threadId, () =>
-        startAppServerTurn(appServer, threadId, queuedInput),
-      );
+      if (turnClaim) {
+        activeTurnClaimsByThreadId.set(threadId, turnClaim);
+      } else {
+        await options.threadInputs?.updateThreadInputState(inputId, "steered");
+      }
+      try {
+        const turn = await runAppServerMutation(threadId, () =>
+          startAppServerTurn(
+            appServer,
+            threadId,
+            queuedInput,
+            activeTurnClaimDispatchContext({
+              activeTurnClaimsByThreadId,
+              coordinator: options.threadCoordinator,
+              threadId,
+            }),
+          ),
+        );
+        await bindActiveTurnClaimRuntimeTurn({
+          activeThreadInputIdsByThreadId,
+          activeTurnClaimsByThreadId,
+          coordinator: options.threadCoordinator,
+          forgetThreadOwner: forgetRelayThreadOwner,
+          threadId,
+          turnId: turn.id,
+        });
+        activeAppServerTurnIdsByThreadId.set(threadId, turn.id);
+        if (!turnClaim) {
+          await options.threadInputs?.updateThreadInputState(inputId, "running");
+        }
+        activeThreadInputIdsByThreadId.set(threadId, inputId);
+      } catch (error) {
+        if (
+          turnClaim &&
+          options.threadCoordinator &&
+          activeTurnClaimsByThreadId.get(threadId)?.claimId === turnClaim.claimId
+        ) {
+          await options.threadCoordinator.finalizeTurnClaim({
+            claimId: turnClaim.claimId,
+            ownerEpoch: turnClaim.ownerEpoch,
+            ownerId: turnClaim.ownerId,
+            state: "failed",
+          });
+          activeTurnClaimsByThreadId.delete(threadId);
+        } else if (!turnClaim) {
+          const queuedInputs = queuedInputsByThreadId.get(threadId) ?? [];
+          queuedInputs.unshift(queuedInput);
+          queuedInputsByThreadId.set(threadId, queuedInputs);
+          await options.threadInputs?.updateThreadInputState(inputId, "queued");
+        }
+        steeringThreads.delete(threadId);
+        throw error;
+      }
       const thread = updateThread(threads, messagesByThreadId, threadId, {
         state: "running",
         lastPrompt: promptWithAttachmentReferences(queuedInput.prompt, queuedInput.attachments),
@@ -2886,6 +4374,22 @@ export function createApp(options: AppOptions = {}) {
 
   app.post("/v1/threads/:threadId/runs/interrupt", async (c) => {
     const threadId = c.req.param("threadId");
+    const parsed = await parseOptionalRequestJson(
+      c,
+      options.pairing,
+      secureSessionsByTokenHash,
+      ThreadOwnerMutationRequestSchema,
+    );
+    if (!parsed.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsed.error),
+        400,
+      );
+    }
+    await ensureQueuedInputsHydrated();
     const knownThread = await ensureKnownThread({
       appServer,
       threadId,
@@ -2909,6 +4413,17 @@ export function createApp(options: AppOptions = {}) {
         apiError("not_found", `Thread ${threadId} is not known to this server.`),
         404,
       );
+    }
+    const ownerEpochError = await expectedThreadOwnerEpochError(
+      threadId,
+      parsed.data.expectedOwnerEpoch,
+    );
+    if (ownerEpochError) {
+      relayDebugLog("thread.interrupt.rejected", {
+        reason: "stale_owner_epoch",
+        threadId,
+      });
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
     }
     if (!appServer) {
       relayDebugLog("thread.interrupt.rejected", {
@@ -2944,6 +4459,24 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
+    const dispatchOwnerEpochError = await expectedThreadOwnerEpochError(
+      threadId,
+      parsed.data.expectedOwnerEpoch,
+    );
+    if (dispatchOwnerEpochError) {
+      relayDebugLog("thread.interrupt.rejected", {
+        reason: "stale_owner_epoch_before_dispatch",
+        threadId,
+      });
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        dispatchOwnerEpochError,
+        409,
+      );
+    }
+
     try {
       await appServer.interruptTurn({ threadId, turnId });
     } catch (error) {
@@ -2956,6 +4489,20 @@ export function createApp(options: AppOptions = {}) {
     }
     relayDebugLog("thread.interrupt.completed", { threadId, turnId });
     activeAppServerTurnIdsByThreadId.delete(threadId);
+    await finalizeActiveThreadInputState(
+      options.threadInputs,
+      options.threadCoordinator,
+      activeTurnClaimsByThreadId,
+      activeThreadInputIdsByThreadId,
+      threadId,
+      "cancelled",
+      forgetRelayThreadOwner,
+    );
+    await updateQueuedThreadInputStates(
+      options.threadInputs,
+      queuedInputsByThreadId.get(threadId) ?? [],
+      "cancelled",
+    );
     queuedInputsByThreadId.delete(threadId);
     steeringThreads.delete(threadId);
     const thread = updateThread(threads, messagesByThreadId, threadId, {
@@ -2973,6 +4520,7 @@ export function createApp(options: AppOptions = {}) {
 
   app.post("/v1/threads/:threadId/runs/stream", async (c) => {
     const threadId = c.req.param("threadId");
+    await ensureQueuedInputsHydrated();
     const knownThread = await ensureKnownThread({
       appServer,
       threadId,
@@ -2996,6 +4544,13 @@ export function createApp(options: AppOptions = {}) {
         apiError("not_found", `Thread ${threadId} is not known to this server.`),
         404,
       );
+    }
+    const registeredThreadWorkspace = knownThread.workspaceId
+      ? undefined
+      : await options.workspaceRegistry?.resolveWorkspace(knownThread.cwd ?? workspacePath);
+    const threadWorkspaceId = knownThread.workspaceId ?? registeredThreadWorkspace?.workspaceId;
+    if (threadWorkspaceId && !knownThread.workspaceId) {
+      rememberThreadWorkspaceId(threads, knownThread, threadWorkspaceId);
     }
 
     const parsed = await parseRequestJson(
@@ -3031,12 +4586,150 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
+    const clientEventId = "clientEventId" in parsed.data ? parsed.data.clientEventId : undefined;
+    const clientId =
+      normalizeClientSessionId(c.req.header("x-codex-relay-client-session-id")) ??
+      (await pairedClientSessionIdForAuthorization(
+        c.req.header("authorization"),
+        options.pairing,
+      )) ??
+      "unpaired-client";
+    const existingDurableInput =
+      options.threadInputs && clientEventId
+        ? await options.threadInputs.getThreadInputByClientEvent(clientId, clientEventId)
+        : undefined;
+    const ownerEpochError = existingDurableInput
+      ? undefined
+      : await expectedThreadOwnerEpochError(threadId, parsed.data.expectedOwnerEpoch);
+    if (ownerEpochError) {
+      relayDebugLog("thread.stream.rejected", {
+        reason: "stale_owner_epoch",
+        threadId,
+      });
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
+    }
+
     const runOptions = withRuntimePreferences(
       await preferences.read(knownThread.cwd ?? workspacePath),
       parsed.data,
     );
+    const threadOwner =
+      appServer && runOptions.prompt
+        ? await ensureRelayThreadOwner(threadId, threadWorkspaceId)
+        : threadOwnersByThreadId.get(threadId);
+    let initialQueuedInput: QueuedThreadInput | undefined;
+    let initialTurnClaim: TurnClaim | undefined;
+    let observeExistingPrompt = false;
+    let queuedPrompt = false;
+    let terminalPromptRetry = false;
+    if (
+      appServer &&
+      runOptions.prompt &&
+      threadOwner &&
+      options.threadCoordinator &&
+      options.threadInputs
+    ) {
+      const durableInput: QueuedThreadInput = {
+        attachments: runOptions.attachments ?? [],
+        clientEventId,
+        id: randomUUID(),
+        prompt: runOptions.prompt,
+        runOptions,
+        skills: runOptions.skills ?? [],
+        workspacePath: knownThread.cwd ?? workspacePath,
+      };
+      const durableInputAtWrite =
+        existingDurableInput ??
+        (clientEventId
+          ? await options.threadInputs.getThreadInputByClientEvent(clientId, clientEventId)
+          : undefined);
+      const writeOwnerEpochError = durableInputAtWrite
+        ? undefined
+        : await expectedThreadOwnerEpochError(threadId, parsed.data.expectedOwnerEpoch);
+      if (writeOwnerEpochError) {
+        relayDebugLog("thread.stream.rejected", {
+          reason: "stale_owner_epoch_before_persist",
+          threadId,
+        });
+        return secureJson(c, options.pairing, secureSessionsByTokenHash, writeOwnerEpochError, 409);
+      }
+      const persisted = await options.threadInputs.createThreadInput({
+        clientEventId,
+        clientId,
+        inputId: durableInput.id,
+        payload: durableInput,
+        state: "accepted",
+        threadId,
+        workspaceId: threadWorkspaceId,
+      });
+      if (persisted.input.threadId !== threadId) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError(
+            "client_event_conflict",
+            `Client event ${clientEventId} already belongs to another thread.`,
+          ),
+          409,
+        );
+      }
+      const persistedQueuedInput = queuedThreadInputFromRecord(persisted.input);
+      const claimResult = await options.threadCoordinator.acquireTurnClaim({
+        inputId: persisted.input.inputId,
+        ownerEpoch: threadOwner.epoch,
+        ownerId: threadOwner.ownerId,
+        threadId,
+      });
+      if (claimResult.kind === "acquired") {
+        initialQueuedInput = persistedQueuedInput;
+        initialTurnClaim = claimResult.claim;
+      } else if (claimResult.kind === "busy") {
+        const queuedInputs = queuedInputsByThreadId.get(threadId) ?? [];
+        if (!queuedInputs.some((queuedInput) => queuedInput.id === persistedQueuedInput.id)) {
+          queuedInputs.push(persistedQueuedInput);
+          queuedInputsByThreadId.set(threadId, queuedInputs);
+        }
+        await options.threadInputs.updateThreadInputState(persisted.input.inputId, "queued");
+        queuedPrompt = true;
+      } else if (claimResult.kind === "existing") {
+        if (claimResult.claim.state === "active") {
+          observeExistingPrompt = true;
+        } else {
+          terminalPromptRetry = true;
+        }
+      } else {
+        if (claimResult.kind === "stale_owner") {
+          forgetRelayThreadOwner(threadId);
+        }
+        if (persisted.created) {
+          await options.threadInputs.updateThreadInputState(persisted.input.inputId, "failed");
+        }
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError(
+            claimResult.kind === "stale_owner" ? "stale_owner_epoch" : "turn_claim_conflict",
+            claimResult.kind === "stale_owner"
+              ? "The thread owner changed. Refresh before starting this input."
+              : `Input ${persisted.input.inputId} is no longer available to start.`,
+          ),
+          409,
+        );
+      }
+    }
     relayDebugLog("thread.stream.accepted", {
       hasPrompt: Boolean(runOptions.prompt),
+      mode: queuedPrompt
+        ? "queued"
+        : terminalPromptRetry
+          ? "terminal_retry"
+          : observeExistingPrompt
+            ? "observe"
+            : runOptions.prompt
+              ? "run"
+              : "attach",
       source: knownThread.source,
       threadId,
       workspacePath: knownThread.cwd ?? workspacePath,
@@ -3048,6 +4741,19 @@ export function createApp(options: AppOptions = {}) {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         const attachmentAbortController = new AbortController();
+        const durableSseContext =
+          runOptions.prompt &&
+          !observeExistingPrompt &&
+          !queuedPrompt &&
+          !terminalPromptRetry &&
+          durableThreadEventPublisher
+            ? {
+                fallbackThreadId: threadId,
+                publisher: durableThreadEventPublisher,
+                threadIds: new Set([threadId]),
+                workspaceId: threadWorkspaceId,
+              }
+            : undefined;
         let closed = false;
         let stopPreviewMonitor = () => {};
         closeStream = () => {
@@ -3061,6 +4767,9 @@ export function createApp(options: AppOptions = {}) {
           closeSseController(controller);
         };
         activeStreamControllers.set(controller, closeStream);
+        if (durableSseContext) {
+          durableSseContexts.set(controller, durableSseContext);
+        }
         relayDebugLog("thread.stream.started", {
           mode: !runOptions.prompt && appServer ? "attach" : "run",
           threadId,
@@ -3075,8 +4784,25 @@ export function createApp(options: AppOptions = {}) {
             });
           },
         });
-        if (!runOptions.prompt && appServer) {
+        if (terminalPromptRetry) {
+          streamSettled = true;
+          relayDebugLog("thread.stream.finished", { mode: "terminal_retry", threadId });
+          closeStream();
+          return;
+        }
+        if (queuedPrompt) {
+          sendSse(controller, encoder, secureSession, {
+            type: "thread.state.changed",
+            thread: threads.get(threadId) ?? knownThread,
+          });
+          streamSettled = true;
+          relayDebugLog("thread.stream.finished", { mode: "queued", threadId });
+          closeStream();
+          return;
+        }
+        if ((!runOptions.prompt || observeExistingPrompt) && appServer) {
           void streamRunningAppServerThread({
+            approvalStore: options.approvalStore,
             appServer,
             controller,
             encoder,
@@ -3084,11 +4810,15 @@ export function createApp(options: AppOptions = {}) {
             pendingApprovals,
             secureSession,
             signal: attachmentAbortController.signal,
+            suppressEmptyTurnError: observeExistingPrompt,
             threadId,
             threads,
           }).finally(() => {
             streamSettled = true;
-            relayDebugLog("thread.stream.finished", { mode: "attach", threadId });
+            relayDebugLog("thread.stream.finished", {
+              mode: observeExistingPrompt ? "observe" : "attach",
+              threadId,
+            });
             closeStream();
           });
           return;
@@ -3111,8 +4841,11 @@ export function createApp(options: AppOptions = {}) {
         const skills = runOptions.skills ?? [];
         const prompt = rawPrompt;
         void runPromptStreamed({
+          approvalStore: options.approvalStore,
           appServer,
           activeAppServerTurnIdsByThreadId,
+          activeThreadInputIdsByThreadId,
+          activeTurnClaimsByThreadId,
           controller,
           codex,
           encoder,
@@ -3128,10 +4861,25 @@ export function createApp(options: AppOptions = {}) {
           skills,
           steeringThreads,
           threadId,
+          threadCoordinator: options.threadCoordinator,
+          ensureThreadOwner: ensureRelayThreadOwner,
+          forgetThreadOwner: forgetRelayThreadOwner,
+          initialQueuedInput,
+          initialTurnClaim,
           threadOptions: { ...threadOptions, workingDirectory: knownThread.cwd ?? workspacePath },
+          threadOwner,
           runOptions,
           threads,
-        }).finally(() => {
+          threadInputs: options.threadInputs,
+        }).finally(async () => {
+          if (durableSseContext) {
+            await Promise.all(
+              [...durableSseContext.threadIds].map((durableThreadId) =>
+                durableSseContext.publisher.flush(durableThreadId),
+              ),
+            );
+          }
+          durableSseContexts.delete(controller);
           streamSettled = true;
           relayDebugLog("thread.stream.finished", { mode: "run", threadId });
           closeStream();
@@ -3157,6 +4905,418 @@ export function createApp(options: AppOptions = {}) {
   });
 
   return app;
+}
+
+async function createManagementPairingResponse(
+  management: ManagementOptions | undefined,
+  pairing: PairingOptions | undefined,
+) {
+  const pairingPayload = management?.pairingPayload;
+  const pendingPairings = pairing
+    ? (await pairing.sessions.listPendingPairings(Date.now())).map((pending) => ({
+        approvalCode: pending.approvalCode,
+        approved: pending.approved,
+        clientName: pending.clientName,
+        expiresAt: new Date(pending.expiresAt).toISOString(),
+      }))
+    : [];
+  return {
+    connectUrl: management?.connectUrl,
+    connectUrlCandidates: management?.connectUrlCandidates ?? [],
+    listenUrl: management?.listenUrl,
+    pendingPairings,
+    pairingPayload,
+    port: management?.port,
+    qrText: pairingPayload ? terminalQrCode(pairingPayload) : undefined,
+  };
+}
+
+function terminalQrCode(payload: string) {
+  let qrText = "";
+  qrcode.generate(payload, { small: true }, (generated) => {
+    qrText = generated;
+  });
+  return qrText;
+}
+
+function isLocalManagementRequest(hostHeader: string | undefined) {
+  const host = hostHeader?.trim().toLowerCase();
+  if (!host) {
+    return false;
+  }
+
+  const hostname = host.startsWith("[") ? host.slice(1, host.indexOf("]")) : host.split(":")[0];
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+}
+
+function createManagementPage() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Relay Pairing</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101114;
+      --panel: #191b20;
+      --panel-2: #20232a;
+      --text: #f1f3f5;
+      --muted: #a6adb8;
+      --line: #343841;
+      --accent: #45c4a0;
+      --danger: #ff6b6b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(1120px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 40px;
+    }
+    header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+    .subtitle {
+      margin: 8px 0 0;
+      color: var(--muted);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(320px, 1fr) minmax(300px, 420px);
+      gap: 16px;
+      align-items: start;
+    }
+    section {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    h2 {
+      margin: 0 0 12px;
+      font-size: 15px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+    .qr {
+      overflow: auto;
+      min-height: 320px;
+      margin: 0;
+      padding: 14px;
+      border-radius: 6px;
+      background: #fff;
+      color: #000;
+      font: 8px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 10px;
+    }
+    .stack {
+      display: grid;
+      gap: 10px;
+    }
+    label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      text-transform: uppercase;
+    }
+    input, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--text);
+      font: inherit;
+      padding: 10px 11px;
+    }
+    textarea {
+      min-height: 108px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    button, a.button {
+      appearance: none;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--text);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      padding: 8px 12px;
+      text-decoration: none;
+      font: inherit;
+      font-weight: 600;
+    }
+    button.primary {
+      border-color: color-mix(in srgb, var(--accent), #000 20%);
+      background: var(--accent);
+      color: #08110e;
+    }
+    button:disabled, a[aria-disabled="true"] {
+      cursor: not-allowed;
+      opacity: .55;
+    }
+    .url-list {
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    .url-list li {
+      display: grid;
+      gap: 2px;
+      padding: 9px 10px;
+      border-radius: 6px;
+      background: var(--panel-2);
+    }
+    .label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    code {
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    .status {
+      min-height: 22px;
+      margin-top: 10px;
+      color: var(--muted);
+    }
+    .status.error { color: var(--danger); }
+    .pending {
+      display: none;
+      margin: 0 0 12px;
+      padding: 10px;
+      border: 1px solid color-mix(in srgb, var(--accent), #000 50%);
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--accent), transparent 88%);
+    }
+    .pending.visible {
+      display: grid;
+      gap: 3px;
+    }
+    .pending strong {
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+    @media (max-width: 760px) {
+      main { width: min(100vw - 20px, 1120px); padding-top: 16px; }
+      header, .grid { display: grid; }
+      .row { flex-wrap: wrap; }
+      .row > button, .row > a.button { flex: 1 1 140px; }
+      .qr { min-height: 260px; font-size: 6px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Codex Relay Pairing</h1>
+        <p class="subtitle">Local pairing controls for this relay server.</p>
+      </div>
+      <button id="refresh" type="button">Refresh</button>
+    </header>
+    <div class="grid">
+      <section>
+        <h2>Pairing QR</h2>
+        <pre id="qr" class="qr">Loading...</pre>
+        <div class="row">
+          <a id="openLink" class="button" href="#" aria-disabled="true">Open Pairing Link</a>
+          <button id="copyLink" type="button">Copy Link</button>
+        </div>
+      </section>
+      <div class="stack">
+        <section>
+          <h2>Approve Device</h2>
+          <div id="pendingPairing" class="pending">
+            <span class="label">Pending request</span>
+            <strong id="pendingCode"></strong>
+            <span id="pendingClient" class="label"></span>
+          </div>
+          <form id="approveForm">
+            <label for="approvalCode">Approval code</label>
+            <input id="approvalCode" autocomplete="off" inputmode="text" placeholder="BE01-C955">
+            <div class="row">
+              <button class="primary" type="submit">Approve</button>
+            </div>
+          </form>
+          <div id="approvalStatus" class="status"></div>
+        </section>
+        <section>
+          <h2>Pairing Link</h2>
+          <textarea id="pairingPayload" readonly></textarea>
+        </section>
+        <section>
+          <h2>Server Addresses</h2>
+          <ul id="addresses" class="url-list"></ul>
+        </section>
+      </div>
+    </div>
+  </main>
+  <script>
+    const state = {
+      pairingPayload: "",
+      activeApprovalCode: ""
+    };
+    const qr = document.querySelector("#qr");
+    const pairingPayload = document.querySelector("#pairingPayload");
+    const addresses = document.querySelector("#addresses");
+    const openLink = document.querySelector("#openLink");
+    const copyLink = document.querySelector("#copyLink");
+    const approvalCode = document.querySelector("#approvalCode");
+    const approvalStatus = document.querySelector("#approvalStatus");
+    const pendingPairing = document.querySelector("#pendingPairing");
+    const pendingCode = document.querySelector("#pendingCode");
+    const pendingClient = document.querySelector("#pendingClient");
+
+    async function loadPairing() {
+      const response = await fetch("/local/pairing", { headers: { accept: "application/json" } });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data?.error?.message ?? "Unable to load pairing data.");
+      }
+
+      state.pairingPayload = data.pairingPayload ?? "";
+      syncPendingPairing(data.pendingPairings ?? []);
+      qr.textContent = data.qrText || "Pairing QR is not ready yet.";
+      pairingPayload.value = state.pairingPayload;
+      openLink.href = state.pairingPayload || "#";
+      openLink.setAttribute("aria-disabled", state.pairingPayload ? "false" : "true");
+      addresses.replaceChildren(
+        ...((data.connectUrlCandidates ?? []).map((candidate) => {
+          const item = document.createElement("li");
+          const label = document.createElement("span");
+          const code = document.createElement("code");
+          label.className = "label";
+          label.textContent = candidate.label;
+          code.textContent = candidate.url;
+          item.append(label, code);
+          return item;
+        }))
+      );
+      if (!addresses.children.length && data.connectUrl) {
+        const item = document.createElement("li");
+        const label = document.createElement("span");
+        const code = document.createElement("code");
+        label.className = "label";
+        label.textContent = "Mobile";
+        code.textContent = data.connectUrl;
+        item.append(label, code);
+        addresses.append(item);
+      }
+    }
+
+    function syncPendingPairing(pendingPairings) {
+      const next = pendingPairings.find((pairing) => !pairing.approved);
+      if (!next) {
+        state.activeApprovalCode = "";
+        pendingPairing.classList.remove("visible");
+        pendingCode.textContent = "";
+        pendingClient.textContent = "Scan the QR code with the mobile app to request approval.";
+        return;
+      }
+
+      pendingPairing.classList.add("visible");
+      pendingCode.textContent = next.approvalCode;
+      pendingClient.textContent = next.clientName
+        ? "From " + next.clientName
+        : "From mobile app";
+      if (!approvalCode.value || approvalCode.value === state.activeApprovalCode) {
+        approvalCode.value = next.approvalCode;
+      }
+      if (state.activeApprovalCode !== next.approvalCode) {
+        approvalStatus.className = "status";
+        approvalStatus.textContent = "Approval code received from mobile app.";
+      }
+      state.activeApprovalCode = next.approvalCode;
+    }
+
+    async function approveDevice(event) {
+      event.preventDefault();
+      approvalStatus.className = "status";
+      approvalStatus.textContent = "Approving...";
+      const response = await fetch("/local/pairing/approve", {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({ approvalCode: approvalCode.value })
+      });
+      const data = await response.json().catch(() => undefined);
+      if (!response.ok) {
+        approvalStatus.className = "status error";
+        approvalStatus.textContent = data?.error?.message ?? "Approval failed.";
+        return;
+      }
+      approvalStatus.textContent = "Approved. The mobile app can finish pairing now.";
+      approvalCode.value = "";
+      state.activeApprovalCode = "";
+      await loadPairing();
+    }
+
+    document.querySelector("#refresh").addEventListener("click", () => {
+      loadPairing().catch((error) => {
+        qr.textContent = error.message;
+      });
+    });
+    document.querySelector("#approveForm").addEventListener("submit", approveDevice);
+    copyLink.addEventListener("click", async () => {
+      if (!state.pairingPayload) return;
+      await navigator.clipboard.writeText(state.pairingPayload);
+      copyLink.textContent = "Copied";
+      setTimeout(() => {
+        copyLink.textContent = "Copy Link";
+      }, 1200);
+    });
+    openLink.addEventListener("click", (event) => {
+      if (!state.pairingPayload) {
+        event.preventDefault();
+      }
+    });
+    loadPairing().catch((error) => {
+      qr.textContent = error.message;
+    });
+    setInterval(() => {
+      loadPairing().catch(() => {
+        // Keep the last good pairing page state during transient local server errors.
+      });
+    }, 1000);
+  </script>
+</body>
+</html>`;
 }
 
 function parseBearerToken(value: string | undefined) {
@@ -3212,6 +5372,136 @@ async function validateThreadWorkspacePath(rootPath: string, requestedPath: stri
   return { success: true as const, path: resolved };
 }
 
+type WorkspaceSelection = {
+  workspaceId?: string;
+  workspacePath?: string;
+};
+
+type WorkspaceSelectionFailure = {
+  code: string;
+  error: string;
+  success: false;
+};
+
+type ResolvedWorkspaceSelection = {
+  path: string;
+  success: true;
+  workspaceId?: string;
+};
+
+type OptionalResolvedWorkspaceSelection = {
+  path?: string;
+  success: true;
+  workspaceId?: string;
+};
+
+function workspaceSelectionFromQuery(c: {
+  req: { query: (key: string) => string | undefined };
+}): WorkspaceSelection {
+  return {
+    workspaceId: c.req.query("workspaceId"),
+    workspacePath: c.req.query("workspacePath"),
+  };
+}
+
+function resolveWorkspaceSelection(
+  rootPath: string,
+  registry: WorkspaceRegistry | undefined,
+  selection: WorkspaceSelection,
+): Promise<ResolvedWorkspaceSelection | WorkspaceSelectionFailure>;
+function resolveWorkspaceSelection(
+  rootPath: string,
+  registry: WorkspaceRegistry | undefined,
+  selection: WorkspaceSelection,
+  options: { allowUnvalidatedDefault: true },
+): Promise<ResolvedWorkspaceSelection | WorkspaceSelectionFailure>;
+function resolveWorkspaceSelection(
+  rootPath: string,
+  registry: WorkspaceRegistry | undefined,
+  selection: WorkspaceSelection,
+  options: { allowUnscoped: true },
+): Promise<OptionalResolvedWorkspaceSelection | WorkspaceSelectionFailure>;
+async function resolveWorkspaceSelection(
+  rootPath: string,
+  registry: WorkspaceRegistry | undefined,
+  selection: WorkspaceSelection,
+  options: { allowUnscoped?: boolean; allowUnvalidatedDefault?: boolean } = {},
+): Promise<OptionalResolvedWorkspaceSelection | WorkspaceSelectionFailure> {
+  const workspaceId = selection.workspaceId?.trim();
+  const workspacePath = selection.workspacePath?.trim();
+  if (!workspaceId && !workspacePath && options.allowUnscoped) {
+    return { success: true as const, path: undefined, workspaceId: undefined };
+  }
+  if (!workspaceId && !workspacePath && options.allowUnvalidatedDefault) {
+    const workspace = await registry?.resolveWorkspace(rootPath);
+    return {
+      success: true as const,
+      path: rootPath,
+      workspaceId: workspace?.workspaceId,
+    };
+  }
+
+  if (workspaceId) {
+    if (!registry) {
+      return {
+        success: false as const,
+        code: "invalid_workspace_selection",
+        error: "This Relay does not support workspace identities.",
+      };
+    }
+    const workspace = await registry.resolveWorkspaceById(workspaceId);
+    if (!workspace) {
+      return {
+        success: false as const,
+        code: "invalid_workspace_selection",
+        error: `Unknown workspace identity: ${workspaceId}`,
+      };
+    }
+    const validatedWorkspace = await validateThreadWorkspacePath(rootPath, workspace.canonicalPath);
+    if (!validatedWorkspace.success) {
+      return {
+        success: false as const,
+        code: "invalid_workspace_selection",
+        error: validatedWorkspace.error,
+      };
+    }
+    if (workspacePath) {
+      const pathWorkspace = await registry.resolveWorkspace(workspacePath);
+      if (pathWorkspace?.workspaceId !== workspaceId) {
+        return {
+          success: false as const,
+          code: "invalid_workspace_selection",
+          error: "workspaceId and workspacePath identify different workspaces.",
+        };
+      }
+    }
+    return {
+      success: true as const,
+      path: validatedWorkspace.path,
+      workspaceId,
+    };
+  }
+
+  const validatedPath = await validateThreadWorkspacePath(rootPath, workspacePath);
+  if (!validatedPath.success) {
+    return {
+      success: false as const,
+      code: "invalid_workspace_path",
+      error: validatedPath.error,
+    };
+  }
+  const workspace = await registry?.resolveWorkspace(validatedPath.path);
+  return {
+    success: true as const,
+    path: validatedPath.path,
+    workspaceId: workspace?.workspaceId,
+  };
+}
+
+function threadMatchesWorkspace(thread: ThreadSummary, workspacePath: string | undefined) {
+  return !workspacePath || resolve(thread.cwd ?? defaultWorkspacePath) === workspacePath;
+}
+
 async function createApprovalCode(sessions: PairingSessionStore) {
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const code = normalizeApprovalCode(crypto.randomUUID().replace(/-/g, "").slice(0, 8));
@@ -3250,6 +5540,7 @@ function createThreadRecord(input: {
   threadOptions: Parameters<CodexClient["startThread"]>[0];
   threads: Map<string, ThreadMetadata>;
   title?: string;
+  workspaceId?: string;
 }) {
   const now = new Date().toISOString();
   const thread = input.codex.startThread(input.threadOptions);
@@ -3260,6 +5551,7 @@ function createThreadRecord(input: {
     createdAt: now,
     updatedAt: now,
     state: "idle",
+    workspaceId: input.workspaceId,
     cwd: input.threadOptions?.workingDirectory,
     messageCount: 0,
     ...(input.prompt || hasExplicitRunOptions(input.runOptions ?? {})
@@ -3289,6 +5581,7 @@ async function createAppServerThreadRecord(input: {
   persistRuntimeOptions?: boolean;
   threads: Map<string, ThreadMetadata>;
   title?: string;
+  workspaceId?: string;
   workspacePath: string;
 }) {
   const runtime = resolveAppServerRuntime(input.options, input.workspacePath);
@@ -3306,11 +5599,22 @@ async function createAppServerThreadRecord(input: {
       name: input.title ?? thread.name,
       preview: input.title ?? thread.preview,
     }),
+    workspaceId: input.workspaceId,
     ...(input.persistRuntimeOptions ? runtimeMetadataFromOptions(input.options) : {}),
   });
   input.threads.set(thread.id, metadata);
   input.messagesByThreadId.set(thread.id, []);
   return { threadId: thread.id };
+}
+
+function rememberThreadWorkspaceId(
+  threads: Map<string, ThreadMetadata>,
+  thread: ThreadMetadata,
+  workspaceId: string,
+) {
+  const identifiedThread = ThreadSummarySchema.parse({ ...thread, workspaceId });
+  threads.set(identifiedThread.id, identifiedThread);
+  return identifiedThread;
 }
 
 async function runPromptBuffered(input: {
@@ -3415,12 +5719,19 @@ async function runPromptBuffered(input: {
 }
 
 async function runPromptStreamed(input: {
+  approvalStore?: PendingApprovalStore;
   activeAppServerTurnIdsByThreadId: Map<string, string>;
+  activeThreadInputIdsByThreadId: Map<string, string>;
+  activeTurnClaimsByThreadId: Map<string, TurnClaim>;
   appServer: CodexAppServerClient | null;
   attachments: PromptAttachment[];
   controller: ReadableStreamDefaultController<Uint8Array>;
   codex: CodexClient;
   encoder: TextEncoder;
+  ensureThreadOwner?: (threadId: string, workspaceId?: string) => Promise<ThreadOwner | undefined>;
+  forgetThreadOwner?: (threadId: string) => void;
+  initialQueuedInput?: QueuedThreadInput;
+  initialTurnClaim?: TurnClaim;
   liveThreads: Map<string, ReturnType<CodexClient["startThread"]>>;
   messagesByThreadId: Map<string, ChatMessage[]>;
   pendingApprovals: Map<string, PendingApproval>;
@@ -3441,16 +5752,26 @@ async function runPromptStreamed(input: {
   };
   skills: PromptSkill[];
   threadId: string;
+  threadCoordinator?: ThreadCoordinatorStore;
   threadOptions: Parameters<CodexClient["startThread"]>[0];
+  threadOwner?: ThreadOwner;
   threads: Map<string, ThreadMetadata>;
+  threadInputs?: ThreadInputStore;
 }) {
   if (input.appServer) {
     await runAppServerPromptStreamed({
+      approvalStore: input.approvalStore,
       appServer: input.appServer,
       attachments: input.attachments,
       activeAppServerTurnIdsByThreadId: input.activeAppServerTurnIdsByThreadId,
+      activeThreadInputIdsByThreadId: input.activeThreadInputIdsByThreadId,
+      activeTurnClaimsByThreadId: input.activeTurnClaimsByThreadId,
       controller: input.controller,
       encoder: input.encoder,
+      ensureThreadOwner: input.ensureThreadOwner,
+      forgetThreadOwner: input.forgetThreadOwner,
+      initialQueuedInput: input.initialQueuedInput,
+      initialTurnClaim: input.initialTurnClaim,
       messagesByThreadId: input.messagesByThreadId,
       pendingApprovals: input.pendingApprovals,
       queuedInputsByThreadId: input.queuedInputsByThreadId,
@@ -3462,7 +5783,10 @@ async function runPromptStreamed(input: {
       skills: input.skills,
       steeringThreads: input.steeringThreads,
       threadId: input.threadId,
+      threadCoordinator: input.threadCoordinator,
+      threadOwner: input.threadOwner,
       threads: input.threads,
+      threadInputs: input.threadInputs,
       workspacePath: input.threadOptions?.workingDirectory ?? defaultWorkspacePath,
     });
     return;
@@ -3691,7 +6015,7 @@ async function runPromptStreamed(input: {
       state: "failed",
       lastError: errorMessage(error),
     });
-    const errorBody = apiError("codex_run_failed", threadSummary.lastError ?? "Codex run failed.");
+    const errorBody = apiErrorForCodexRunError(error, threadSummary.lastError);
     appendMessage(input.messagesByThreadId, activeThreadId, {
       role: "error",
       content: errorBody.error.message,
@@ -3709,6 +6033,7 @@ async function startAppServerTurn(
   appServer: CodexAppServerClient,
   threadId: string,
   input: QueuedThreadInput,
+  dispatch?: TurnClaimDispatchContext,
 ) {
   const runtime = resolveAppServerRuntime(input.runOptions, input.workspacePath);
   const params: AppServerTurnStartParams = {
@@ -3724,16 +6049,58 @@ async function startAppServerTurn(
     threadId,
   };
 
+  const dispatchTurn = async () => {
+    if (dispatch) {
+      const marked = await dispatch.coordinator.markTurnClaimDispatch({
+        claimId: dispatch.claim.claimId,
+        ownerEpoch: dispatch.claim.ownerEpoch,
+        ownerId: dispatch.claim.ownerId,
+      });
+      if (marked.kind !== "updated" && marked.kind !== "already_marked") {
+        throw new Error(`Cannot dispatch turn claim ${dispatch.claim.claimId}: ${marked.kind}.`);
+      }
+      dispatch.claim = marked.claim;
+      dispatch.onMarked(marked.claim);
+    }
+    return appServer.startTurn(params);
+  };
+
   await resumeAppServerThreadIfNeeded(appServer, threadId, input, runtime);
   try {
-    return await appServer.startTurn(params);
+    return await dispatchTurn();
   } catch (error) {
     if (!isAppServerThreadNotLoadedError(error)) {
       throw error;
     }
     await resumeAppServerThread(appServer, threadId, input, runtime);
-    return appServer.startTurn(params);
+    return dispatchTurn();
   }
+}
+
+type TurnClaimDispatchContext = {
+  claim: TurnClaim;
+  coordinator: ThreadCoordinatorStore;
+  onMarked(claim: TurnClaim): void;
+};
+
+function activeTurnClaimDispatchContext(input: {
+  activeTurnClaimsByThreadId: Map<string, TurnClaim>;
+  coordinator?: ThreadCoordinatorStore;
+  threadId: string;
+}): TurnClaimDispatchContext | undefined {
+  const claim = input.activeTurnClaimsByThreadId.get(input.threadId);
+  if (!claim || !input.coordinator) {
+    return undefined;
+  }
+  return {
+    claim,
+    coordinator: input.coordinator,
+    onMarked(markedClaim) {
+      if (input.activeTurnClaimsByThreadId.get(input.threadId)?.claimId === markedClaim.claimId) {
+        input.activeTurnClaimsByThreadId.set(input.threadId, markedClaim);
+      }
+    },
+  };
 }
 
 async function resumeAppServerThreadIfNeeded(
@@ -3808,6 +6175,142 @@ function shiftQueuedInput(
   return nextInput;
 }
 
+async function hydrateQueuedThreadInputs(
+  store: ThreadInputStore,
+  queuedInputsByThreadId: Map<string, QueuedThreadInput[]>,
+) {
+  const inputs = await store.listThreadInputs({ states: ["queued"] });
+  for (const input of inputs) {
+    const queuedInput = queuedThreadInputFromRecord(input);
+    const queuedInputs = queuedInputsByThreadId.get(input.threadId) ?? [];
+    if (!queuedInputs.some((existing) => existing.id === queuedInput.id)) {
+      queuedInputs.push(queuedInput);
+      queuedInputsByThreadId.set(input.threadId, queuedInputs);
+    }
+  }
+}
+
+async function updateQueuedThreadInputStates(
+  store: ThreadInputStore | undefined,
+  inputs: QueuedThreadInput[],
+  state: ThreadInputState,
+) {
+  if (!store || inputs.length === 0) {
+    return;
+  }
+  await Promise.all(inputs.map((input) => store.updateThreadInputState(input.id, state)));
+}
+
+async function finalizeActiveThreadInputState(
+  store: ThreadInputStore | undefined,
+  coordinator: ThreadCoordinatorStore | undefined,
+  activeTurnClaimsByThreadId: Map<string, TurnClaim>,
+  activeThreadInputIdsByThreadId: Map<string, string>,
+  threadId: string,
+  state: ThreadInputState,
+  forgetThreadOwner?: (threadId: string) => void,
+) {
+  const claim = activeTurnClaimsByThreadId.get(threadId);
+  if (claim && coordinator) {
+    const finalized = await coordinator.finalizeTurnClaim({
+      claimId: claim.claimId,
+      ownerEpoch: claim.ownerEpoch,
+      ownerId: claim.ownerId,
+      state: state === "completed" ? "completed" : state === "failed" ? "failed" : "cancelled",
+    });
+    if (finalized.kind === "stale_owner") {
+      forgetThreadOwner?.(threadId);
+    }
+    activeTurnClaimsByThreadId.delete(threadId);
+    activeThreadInputIdsByThreadId.delete(threadId);
+    return;
+  }
+  const inputId = activeThreadInputIdsByThreadId.get(threadId);
+  if (!inputId) {
+    return;
+  }
+  await store?.updateThreadInputState(inputId, state);
+  activeThreadInputIdsByThreadId.delete(threadId);
+}
+
+async function bindActiveTurnClaimRuntimeTurn(input: {
+  activeThreadInputIdsByThreadId: Map<string, string>;
+  activeTurnClaimsByThreadId: Map<string, TurnClaim>;
+  coordinator?: ThreadCoordinatorStore;
+  forgetThreadOwner?: (threadId: string) => void;
+  threadId: string;
+  turnId: string;
+}) {
+  const claim = input.activeTurnClaimsByThreadId.get(input.threadId);
+  if (!claim || !input.coordinator) {
+    return;
+  }
+  let result: Awaited<ReturnType<ThreadCoordinatorStore["bindTurnClaimRuntimeTurn"]>>;
+  try {
+    result = await input.coordinator.bindTurnClaimRuntimeTurn({
+      claimId: claim.claimId,
+      ownerEpoch: claim.ownerEpoch,
+      ownerId: claim.ownerId,
+      runtimeTurnId: input.turnId,
+    });
+  } catch (error) {
+    relayDebugLog("thread.claim.runtime_turn_bind_failed", {
+      claimId: claim.claimId,
+      error: errorMessage(error),
+      threadId: input.threadId,
+      turnId: input.turnId,
+    });
+    return;
+  }
+  if (result.kind === "updated" || result.kind === "already_bound") {
+    input.activeTurnClaimsByThreadId.set(input.threadId, result.claim);
+    relayDebugLog("thread.claim.runtime_turn_bound", {
+      claimId: claim.claimId,
+      result: result.kind,
+      threadId: input.threadId,
+      turnId: input.turnId,
+    });
+    return;
+  }
+
+  input.activeTurnClaimsByThreadId.delete(input.threadId);
+  input.activeThreadInputIdsByThreadId.delete(input.threadId);
+  if (result.kind === "stale_owner") {
+    input.forgetThreadOwner?.(input.threadId);
+  }
+  relayDebugLog("thread.claim.runtime_turn_ignored", {
+    claimId: claim.claimId,
+    reason: result.kind,
+    threadId: input.threadId,
+    turnId: input.turnId,
+  });
+  throw new Error(`Cannot bind turn ${input.turnId} to claim ${claim.claimId}: ${result.kind}.`);
+}
+
+function queuedThreadInputFromRecord(input: ThreadInput): QueuedThreadInput {
+  if (!input.payload || typeof input.payload !== "object" || Array.isArray(input.payload)) {
+    throw new Error(`Persisted thread input ${input.inputId} has an invalid payload.`);
+  }
+  const payload = input.payload as Record<string, unknown>;
+  const summary = QueuedThreadInputSchema.safeParse({
+    ...payload,
+    clientEventId: input.clientEventId ?? payload.clientEventId,
+    id: input.inputId,
+  });
+  if (!summary.success || typeof payload.workspacePath !== "string") {
+    throw new Error(`Persisted thread input ${input.inputId} has an invalid queue payload.`);
+  }
+  const runOptions = payload.runOptions;
+  if (!runOptions || typeof runOptions !== "object" || Array.isArray(runOptions)) {
+    throw new Error(`Persisted thread input ${input.inputId} has invalid run options.`);
+  }
+  return {
+    ...summary.data,
+    runOptions: runOptions as QueuedThreadInput["runOptions"],
+    workspacePath: payload.workspacePath,
+  };
+}
+
 function removeQueuedInput(
   queuedInputsByThreadId: Map<string, QueuedThreadInput[]>,
   threadId: string,
@@ -3832,6 +6335,7 @@ function queuedThreadInputSummary(input: QueuedThreadInput) {
   const context = normalizePromptContext(input);
   return {
     attachments: context.attachments,
+    clientEventId: input.clientEventId,
     id: input.id,
     prompt: input.prompt,
     skills: context.skills,
@@ -3839,6 +6343,7 @@ function queuedThreadInputSummary(input: QueuedThreadInput) {
 }
 
 async function streamRunningAppServerThread(input: {
+  approvalStore?: PendingApprovalStore;
   appServer: CodexAppServerClient;
   controller: ReadableStreamDefaultController<Uint8Array>;
   encoder: TextEncoder;
@@ -3846,6 +6351,7 @@ async function streamRunningAppServerThread(input: {
   pendingApprovals: Map<string, PendingApproval>;
   secureSession?: SecureSessionHandle;
   signal: AbortSignal;
+  suppressEmptyTurnError?: boolean;
   threadId: string;
   threads: Map<string, ThreadMetadata>;
 }) {
@@ -3899,14 +6405,21 @@ async function streamRunningAppServerThread(input: {
         threadId: input.threadId,
         turnId: approval.turnId,
       } satisfies PendingApproval;
-      input.pendingApprovals.set(approval.approvalId, pending);
-      threadSummary = updateThread(input.threads, input.messagesByThreadId, input.threadId, {
-        state: "running",
-      });
-      sendSse(input.controller, input.encoder, input.secureSession, {
-        type: "thread.input_request.created",
-        thread: threadSummary,
-        request: pendingInputRequestFromApproval(approval, input.threadId),
+      recordPendingApproval({
+        approvalId: approval.approvalId,
+        approvalStore: input.approvalStore,
+        pending,
+        pendingApprovals: input.pendingApprovals,
+        onReady() {
+          threadSummary = updateThread(input.threads, input.messagesByThreadId, input.threadId, {
+            state: "running",
+          });
+          sendSse(input.controller, input.encoder, input.secureSession, {
+            type: "thread.input_request.created",
+            thread: threadSummary,
+            request: pendingInputRequestFromApproval(approval, input.threadId),
+          });
+        },
       });
       return;
     }
@@ -3919,21 +6432,30 @@ async function streamRunningAppServerThread(input: {
       state: "completed",
       turnId: approval.turnId,
     });
-    input.pendingApprovals.set(approval.approvalId, {
+    const pending = {
       appServer: input.appServer,
       kind: approval.kind,
+      message,
       messageId: message.id,
       method: request.method,
       requestId: request.id,
       threadId: input.threadId,
-    });
-    threadSummary = updateThread(input.threads, input.messagesByThreadId, input.threadId, {
-      state: "running",
-    });
-    sendSse(input.controller, input.encoder, input.secureSession, {
-      type: "thread.message.created",
-      thread: threadSummary,
-      message,
+    } satisfies PendingApproval;
+    recordPendingApproval({
+      approvalId: approval.approvalId,
+      approvalStore: input.approvalStore,
+      pending,
+      pendingApprovals: input.pendingApprovals,
+      onReady() {
+        threadSummary = updateThread(input.threads, input.messagesByThreadId, input.threadId, {
+          state: "running",
+        });
+        sendSse(input.controller, input.encoder, input.secureSession, {
+          type: "thread.message.created",
+          thread: threadSummary,
+          message,
+        });
+      },
     });
   });
 
@@ -4130,8 +6652,8 @@ async function streamRunningAppServerThread(input: {
           case "turn/completed":
           case "turn/failed": {
             observedTurnActivity = true;
-            const state = terminalTurnState(notification.method, params);
             const terminalTurn = appServerTurnFromParams(params);
+            const state = terminalTurnState(notification.method, params);
             if (terminalTurn) {
               activeTurnId = terminalTurn.id;
               for (const item of terminalTurn.items) {
@@ -4181,7 +6703,12 @@ async function streamRunningAppServerThread(input: {
               threadId: input.threadId,
               turnId: firstString(params, ["turnId"]) ?? activeTurnId,
             });
-            if (state === "completed" && !producedTurnOutput && !observedInputRequest) {
+            if (
+              state === "completed" &&
+              !producedTurnOutput &&
+              !observedInputRequest &&
+              !input.suppressEmptyTurnError
+            ) {
               sendEmptyAppServerTurnError({
                 activeTurnId,
                 controller: input.controller,
@@ -4308,11 +6835,18 @@ async function streamRunningAppServerThread(input: {
 }
 
 async function runAppServerPromptStreamed(input: {
+  approvalStore?: PendingApprovalStore;
   activeAppServerTurnIdsByThreadId: Map<string, string>;
+  activeThreadInputIdsByThreadId: Map<string, string>;
+  activeTurnClaimsByThreadId: Map<string, TurnClaim>;
   appServer: CodexAppServerClient;
   attachments: PromptAttachment[];
   controller: ReadableStreamDefaultController<Uint8Array>;
   encoder: TextEncoder;
+  ensureThreadOwner?: (threadId: string, workspaceId?: string) => Promise<ThreadOwner | undefined>;
+  forgetThreadOwner?: (threadId: string) => void;
+  initialQueuedInput?: QueuedThreadInput;
+  initialTurnClaim?: TurnClaim;
   messagesByThreadId: Map<string, ChatMessage[]>;
   pendingApprovals: Map<string, PendingApproval>;
   queuedInputsByThreadId: Map<string, QueuedThreadInput[]>;
@@ -4332,7 +6866,10 @@ async function runAppServerPromptStreamed(input: {
   skills: PromptSkill[];
   steeringThreads: Set<string>;
   threadId: string;
+  threadCoordinator?: ThreadCoordinatorStore;
+  threadOwner?: ThreadOwner;
   threads: Map<string, ThreadMetadata>;
+  threadInputs?: ThreadInputStore;
   workspacePath: string;
 }) {
   let activeThreadId = input.threadId;
@@ -4348,6 +6885,11 @@ async function runAppServerPromptStreamed(input: {
   let observedInputRequest = false;
   let producedTurnOutput = false;
   const asyncAgentMessageIds = new Set<string>();
+  input.steeringThreads.add(activeThreadId);
+  if (input.initialTurnClaim && input.initialQueuedInput) {
+    input.activeTurnClaimsByThreadId.set(activeThreadId, input.initialTurnClaim);
+    input.activeThreadInputIdsByThreadId.set(activeThreadId, input.initialQueuedInput.id);
+  }
 
   let userMessage = appendMessage(input.messagesByThreadId, activeThreadId, {
     role: "user",
@@ -4401,14 +6943,21 @@ async function runAppServerPromptStreamed(input: {
         threadId: activeThreadId,
         turnId: approval.turnId,
       } satisfies PendingApproval;
-      input.pendingApprovals.set(approval.approvalId, pending);
-      threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
-        state: "running",
-      });
-      sendSse(input.controller, input.encoder, input.secureSession, {
-        type: "thread.input_request.created",
-        thread: threadSummary,
-        request: pendingInputRequestFromApproval(approval, activeThreadId),
+      recordPendingApproval({
+        approvalId: approval.approvalId,
+        approvalStore: input.approvalStore,
+        pending,
+        pendingApprovals: input.pendingApprovals,
+        onReady() {
+          threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
+            state: "running",
+          });
+          sendSse(input.controller, input.encoder, input.secureSession, {
+            type: "thread.input_request.created",
+            thread: threadSummary,
+            request: pendingInputRequestFromApproval(approval, activeThreadId),
+          });
+        },
       });
       return;
     }
@@ -4421,28 +6970,39 @@ async function runAppServerPromptStreamed(input: {
       state: "completed",
       turnId: approval.turnId,
     });
-    input.pendingApprovals.set(approval.approvalId, {
+    const pending = {
       appServer: input.appServer,
       kind: approval.kind,
+      message,
       messageId: message.id,
       method: request.method,
       requestId: request.id,
       threadId: activeThreadId,
-    });
-    threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
-      state: "running",
-    });
-    sendSse(input.controller, input.encoder, input.secureSession, {
-      type: "thread.message.created",
-      thread: threadSummary,
-      message,
+    } satisfies PendingApproval;
+    recordPendingApproval({
+      approvalId: approval.approvalId,
+      approvalStore: input.approvalStore,
+      pending,
+      pendingApprovals: input.pendingApprovals,
+      onReady() {
+        threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
+          state: "running",
+        });
+        sendSse(input.controller, input.encoder, input.secureSession, {
+          type: "thread.message.created",
+          thread: threadSummary,
+          message,
+        });
+      },
     });
   });
 
   let cleanupNotificationHandler = (): void => undefined;
+  let cleanupConnectionStateHandler = (): void => undefined;
   let resolveCompleted = (): void => undefined;
   let rejectCompleted = (_error: unknown): void => undefined;
   const finalizedTurnIds = new Set<string>();
+  let streamActive = true;
 
   function resetTurnTracking() {
     activeTurnId = undefined;
@@ -4473,14 +7033,46 @@ async function runAppServerPromptStreamed(input: {
       turnId: terminalTurnId,
     });
     input.activeAppServerTurnIdsByThreadId.delete(activeThreadId);
-
     const hasQueuedInput = (input.queuedInputsByThreadId.get(activeThreadId)?.length ?? 0) > 0;
-    if (
+    const isEmptyCompletedTurn =
       options.state === "completed" &&
       !producedTurnOutput &&
       !observedInputRequest &&
-      !hasQueuedInput
-    ) {
+      !hasQueuedInput;
+    const durableInputState = isEmptyCompletedTurn ? "failed" : options.state;
+    const completedInputId = input.activeThreadInputIdsByThreadId.get(activeThreadId);
+    const completedClaim = input.activeTurnClaimsByThreadId.get(activeThreadId);
+    if (completedClaim && input.threadCoordinator) {
+      const finalized = await input.threadCoordinator.finalizeTurnClaim({
+        claimId: completedClaim.claimId,
+        ownerEpoch: completedClaim.ownerEpoch,
+        ownerId: completedClaim.ownerId,
+        state: durableInputState,
+      });
+      if (finalized.kind === "stale_owner" || finalized.kind === "stale_claim") {
+        relayDebugLog("thread.claim.terminal_ignored", {
+          claimId: completedClaim.claimId,
+          reason: finalized.kind,
+          threadId: activeThreadId,
+        });
+        input.activeTurnClaimsByThreadId.delete(activeThreadId);
+        input.activeThreadInputIdsByThreadId.delete(activeThreadId);
+        if (finalized.kind === "stale_owner") {
+          input.forgetThreadOwner?.(activeThreadId);
+        }
+        input.steeringThreads.delete(activeThreadId);
+        cleanupNotificationHandler();
+        resolveCompleted();
+        return;
+      }
+      input.activeTurnClaimsByThreadId.delete(activeThreadId);
+      input.activeThreadInputIdsByThreadId.delete(activeThreadId);
+    } else if (completedInputId) {
+      await input.threadInputs?.updateThreadInputState(completedInputId, durableInputState);
+      input.activeThreadInputIdsByThreadId.delete(activeThreadId);
+    }
+
+    if (isEmptyCompletedTurn) {
       sendEmptyAppServerTurnError({
         activeTurnId: terminalTurnId,
         controller: input.controller,
@@ -4515,10 +7107,32 @@ async function runAppServerPromptStreamed(input: {
       });
     }
 
-    const nextQueuedInput =
-      options.state === "completed"
-        ? shiftQueuedInput(input.queuedInputsByThreadId, activeThreadId)
-        : undefined;
+    let nextQueuedInput: QueuedThreadInput | undefined;
+    let nextTurnClaim: TurnClaim | undefined;
+    if (options.state === "completed" && input.threadCoordinator && input.threadOwner) {
+      const claimResult = await input.threadCoordinator.claimNextThreadInput({
+        ownerEpoch: input.threadOwner.epoch,
+        ownerId: input.threadOwner.ownerId,
+        threadId: activeThreadId,
+      });
+      if (claimResult.kind === "acquired") {
+        nextQueuedInput = queuedThreadInputFromRecord(claimResult.input);
+        nextTurnClaim = claimResult.claim;
+        removeQueuedInput(input.queuedInputsByThreadId, activeThreadId, nextQueuedInput.id);
+      } else if (claimResult.kind === "stale_owner") {
+        relayDebugLog("thread.claim.dispatch_ignored", {
+          reason: claimResult.kind,
+          threadId: activeThreadId,
+        });
+        input.forgetThreadOwner?.(activeThreadId);
+        input.steeringThreads.delete(activeThreadId);
+        cleanupNotificationHandler();
+        resolveCompleted();
+        return;
+      }
+    } else if (options.state === "completed") {
+      nextQueuedInput = shiftQueuedInput(input.queuedInputsByThreadId, activeThreadId);
+    }
     threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
       state: nextQueuedInput ? "running" : options.state,
       lastError: nextQueuedInput ? undefined : options.lastError,
@@ -4568,8 +7182,42 @@ async function runAppServerPromptStreamed(input: {
       handedOffToQueuedTurn = true;
       resetTurnTracking();
       input.steeringThreads.add(activeThreadId);
-      const nextTurn = await startAppServerTurn(input.appServer, activeThreadId, nextQueuedInput);
-      await processReturnedTurn(nextTurn);
+      if (nextTurnClaim) {
+        input.activeTurnClaimsByThreadId.set(activeThreadId, nextTurnClaim);
+      } else {
+        await input.threadInputs?.updateThreadInputState(nextQueuedInput.id, "running");
+      }
+      input.activeThreadInputIdsByThreadId.set(activeThreadId, nextQueuedInput.id);
+      try {
+        const nextTurn = await startAppServerTurn(
+          input.appServer,
+          activeThreadId,
+          nextQueuedInput,
+          activeTurnClaimDispatchContext({
+            activeTurnClaimsByThreadId: input.activeTurnClaimsByThreadId,
+            coordinator: input.threadCoordinator,
+            threadId: activeThreadId,
+          }),
+        );
+        await processReturnedTurn(nextTurn);
+      } catch (error) {
+        if (nextTurnClaim && input.threadCoordinator) {
+          const finalized = await input.threadCoordinator.finalizeTurnClaim({
+            claimId: nextTurnClaim.claimId,
+            ownerEpoch: nextTurnClaim.ownerEpoch,
+            ownerId: nextTurnClaim.ownerId,
+            state: "failed",
+          });
+          if (finalized.kind === "stale_owner") {
+            input.forgetThreadOwner?.(activeThreadId);
+          }
+          input.activeTurnClaimsByThreadId.delete(activeThreadId);
+        } else {
+          await input.threadInputs?.updateThreadInputState(nextQueuedInput.id, "failed");
+        }
+        input.activeThreadInputIdsByThreadId.delete(activeThreadId);
+        throw error;
+      }
       return;
     }
 
@@ -4581,7 +7229,6 @@ async function runAppServerPromptStreamed(input: {
   function processTurnItems(turn: AppServerTurn) {
     activeTurnId = turn.id;
     input.activeAppServerTurnIdsByThreadId.set(activeThreadId, turn.id);
-    const turnIsRunning = isAppServerTurnRunning(turn);
 
     for (const item of turn.items) {
       const previousUserMessage = userMessage;
@@ -4644,15 +7291,24 @@ async function runAppServerPromptStreamed(input: {
         message,
       });
     }
-
-    return turnIsRunning;
   }
 
   async function processReturnedTurn(turn: AppServerTurn) {
     if (finalizedTurnIds.has(turn.id)) {
       return;
     }
-    const turnIsRunning = processTurnItems(turn);
+    await bindActiveTurnClaimRuntimeTurn({
+      activeThreadInputIdsByThreadId: input.activeThreadInputIdsByThreadId,
+      activeTurnClaimsByThreadId: input.activeTurnClaimsByThreadId,
+      coordinator: input.threadCoordinator,
+      forgetThreadOwner: input.forgetThreadOwner,
+      threadId: activeThreadId,
+      turnId: turn.id,
+    });
+    activeTurnId = turn.id;
+    input.activeAppServerTurnIdsByThreadId.set(activeThreadId, turn.id);
+    const turnIsRunning = isAppServerTurnRunning(turn);
+    processTurnItems(turn);
 
     if (turnIsRunning) {
       return;
@@ -4672,7 +7328,16 @@ async function runAppServerPromptStreamed(input: {
     queuedInput: QueuedThreadInput,
   ): Promise<AppServerTurn> {
     return input.runAppServerMutation(threadId, async () => {
-      const turn = await startAppServerTurn(input.appServer, threadId, queuedInput);
+      const turn = await startAppServerTurn(
+        input.appServer,
+        threadId,
+        queuedInput,
+        activeTurnClaimDispatchContext({
+          activeTurnClaimsByThreadId: input.activeTurnClaimsByThreadId,
+          coordinator: input.threadCoordinator,
+          threadId,
+        }),
+      );
       await processReturnedTurn(turn);
       return turn;
     });
@@ -4886,7 +7551,10 @@ async function runAppServerPromptStreamed(input: {
             const state = terminalTurnState(notification.method, params);
             const terminalTurn = appServerTurnFromParams(params);
             const terminalTurnId =
-              firstString(params, ["turnId"]) ?? turnIdFromParams(params) ?? activeTurnId;
+              firstString(params, ["turnId"]) ??
+              terminalTurn?.id ??
+              turnIdFromParams(params) ??
+              activeTurnId;
             void input
               .runThreadOperation(activeThreadId, async () => {
                 await input.runAppServerMutation(activeThreadId, async () => {
@@ -4920,6 +7588,59 @@ async function runAppServerPromptStreamed(input: {
       }
     });
   });
+
+  if (typeof input.appServer.onConnectionState === "function") {
+    cleanupConnectionStateHandler = input.appServer.onConnectionState((event) => {
+      if (event.state !== "reconnected" || !streamActive) {
+        return;
+      }
+      const threadId = activeThreadId;
+      const turnId = activeTurnId;
+      if (!turnId || finalizedTurnIds.has(turnId)) {
+        return;
+      }
+
+      void input
+        .runThreadOperation(threadId, async () => {
+          await input.runAppServerMutation(threadId, async () => {
+            if (
+              !streamActive ||
+              activeThreadId !== threadId ||
+              activeTurnId !== turnId ||
+              finalizedTurnIds.has(turnId)
+            ) {
+              return;
+            }
+
+            let thread: AppServerThread;
+            try {
+              thread = await input.appServer.readThread(threadId, { includeTurns: true });
+            } catch {
+              relayDebugLog("app_server.turn.reconcile_read_failed", { threadId, turnId });
+              return;
+            }
+            if (!streamActive || finalizedTurnIds.has(turnId)) {
+              return;
+            }
+            const turn = thread.turns?.find((candidate) => candidate.id === turnId);
+            if (!turn) {
+              relayDebugLog("app_server.turn.reconcile_missing", { threadId, turnId });
+              return;
+            }
+
+            relayDebugLog("app_server.turn.reconciled", {
+              state: isAppServerTurnRunning(turn) ? "running" : "terminal",
+              threadId,
+              turnId,
+            });
+            await processReturnedTurn(turn);
+          });
+        })
+        .catch(() => {
+          relayDebugLog("app_server.turn.reconcile_failed", { threadId, turnId });
+        });
+    });
+  }
 
   try {
     const isFirstLocalMessage = (input.messagesByThreadId.get(activeThreadId) ?? []).every(
@@ -4981,15 +7702,18 @@ async function runAppServerPromptStreamed(input: {
     }
     debugStream("start turn begin", activeThreadId);
     let turn: AppServerTurn;
-    try {
-      turn = await startAndProcessAppServerTurn(activeThreadId, {
+    const initialQueuedInput =
+      input.initialQueuedInput ??
+      ({
         attachments: input.attachments,
         id: userMessage.id,
         prompt,
         runOptions: input.runOptions,
         skills: input.skills,
         workspacePath: input.workspacePath,
-      });
+      } satisfies QueuedThreadInput);
+    try {
+      turn = await startAndProcessAppServerTurn(activeThreadId, initialQueuedInput);
     } catch (error) {
       if (!isAppServerThreadNotFound(error)) {
         throw error;
@@ -5005,6 +7729,7 @@ async function runAppServerPromptStreamed(input: {
       }
 
       debugStream("recover missing thread begin", activeThreadId);
+      const previousThreadId = activeThreadId;
       const recovered = await recoverMissingAppServerThread({
         appServer: input.appServer,
         messagesByThreadId: input.messagesByThreadId,
@@ -5015,7 +7740,42 @@ async function runAppServerPromptStreamed(input: {
         userMessageId: userMessage.id,
         workspacePath: input.workspacePath,
       });
+      const activeClaim = input.activeTurnClaimsByThreadId.get(previousThreadId);
+      const activeInputId = input.activeThreadInputIdsByThreadId.get(previousThreadId);
+      const recoveredOwner = input.ensureThreadOwner
+        ? await input.ensureThreadOwner(recovered.threadId, recovered.threadSummary.workspaceId)
+        : undefined;
+      if (activeClaim) {
+        if (!input.threadCoordinator || !recoveredOwner) {
+          throw new Error(`Cannot remap turn claim ${activeClaim.claimId} after thread recovery.`);
+        }
+        const remapped = await input.threadCoordinator.remapActiveTurnClaim({
+          claimId: activeClaim.claimId,
+          fromOwnerEpoch: activeClaim.ownerEpoch,
+          fromOwnerId: activeClaim.ownerId,
+          ownerEpoch: recoveredOwner.epoch,
+          ownerId: recoveredOwner.ownerId,
+          threadId: recovered.threadId,
+          workspaceId: recovered.threadSummary.workspaceId,
+        });
+        if (remapped.kind !== "updated") {
+          if (remapped.kind === "stale_owner") {
+            input.forgetThreadOwner?.(previousThreadId);
+            input.forgetThreadOwner?.(recovered.threadId);
+          }
+          throw new Error(`Cannot remap turn claim ${activeClaim.claimId}: ${remapped.kind}.`);
+        }
+        input.activeTurnClaimsByThreadId.delete(previousThreadId);
+        input.activeTurnClaimsByThreadId.set(recovered.threadId, remapped.claim);
+      }
+      if (activeInputId) {
+        input.activeThreadInputIdsByThreadId.delete(previousThreadId);
+        input.activeThreadInputIdsByThreadId.set(recovered.threadId, activeInputId);
+      }
+      input.threadOwner = recoveredOwner ?? input.threadOwner;
+      input.steeringThreads.delete(activeThreadId);
       activeThreadId = recovered.threadId;
+      input.steeringThreads.add(activeThreadId);
       userMessage = recovered.userMessage;
       threadSummary = recovered.threadSummary;
       sendSse(input.controller, input.encoder, input.secureSession, {
@@ -5024,23 +7784,29 @@ async function runAppServerPromptStreamed(input: {
         message: userMessage,
       });
       turn = await startAndProcessAppServerTurn(activeThreadId, {
-        attachments: input.attachments,
+        ...initialQueuedInput,
         id: userMessage.id,
-        prompt,
-        runOptions: input.runOptions,
-        skills: input.skills,
-        workspacePath: input.workspacePath,
+        workspacePath: recovered.threadSummary.cwd ?? input.workspacePath,
       });
     }
     debugStream("start turn complete", activeThreadId, turn.id);
     await completed;
   } catch (error) {
+    await finalizeActiveThreadInputState(
+      input.threadInputs,
+      input.threadCoordinator,
+      input.activeTurnClaimsByThreadId,
+      input.activeThreadInputIdsByThreadId,
+      activeThreadId,
+      "failed",
+      input.forgetThreadOwner,
+    );
     debugStream(`failed ${errorMessage(error)}`, activeThreadId, activeTurnId);
     const threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
       state: "failed",
       lastError: errorMessage(error),
     });
-    const errorBody = apiError("codex_run_failed", threadSummary.lastError ?? "Codex run failed.");
+    const errorBody = apiErrorForCodexRunError(error, threadSummary.lastError);
     appendMessage(input.messagesByThreadId, activeThreadId, {
       role: "error",
       content: errorBody.error.message,
@@ -5052,6 +7818,8 @@ async function runAppServerPromptStreamed(input: {
       error: errorBody.error,
     });
   } finally {
+    streamActive = false;
+    cleanupConnectionStateHandler();
     cleanupRequestHandler();
     if (!handedOffToQueuedTurn) {
       input.activeAppServerTurnIdsByThreadId.delete(activeThreadId);
@@ -5278,6 +8046,18 @@ async function parseRequestJson<T extends z.ZodType>(
   }
 
   return schema.safeParse(payload);
+}
+
+async function parseOptionalRequestJson<T extends z.ZodType>(
+  c: { req: { header: (name: string) => string | undefined; raw: Request } },
+  pairing: PairingOptions | undefined,
+  secureSessionsByTokenHash: Map<string, SecureSession>,
+  schema: T,
+) {
+  if (c.req.raw.body === null) {
+    return schema.safeParse({});
+  }
+  return parseRequestJson(c, pairing, secureSessionsByTokenHash, schema);
 }
 
 async function parsePlainJson<T extends z.ZodType>(request: Request, schema: T) {
@@ -6047,6 +8827,17 @@ function updateThread(
   threadId: string,
   update: Partial<ThreadMetadata>,
 ) {
+  const next = updatedThreadSummary(threads, messagesByThreadId, threadId, update);
+  threads.set(threadId, next);
+  return next;
+}
+
+function updatedThreadSummary(
+  threads: Map<string, ThreadMetadata>,
+  messagesByThreadId: Map<string, ChatMessage[]>,
+  threadId: string,
+  update: Partial<ThreadMetadata>,
+) {
   const existing = threads.get(threadId);
   if (!existing) {
     throw new Error(`Unknown thread: ${threadId}`);
@@ -6064,7 +8855,6 @@ function updateThread(
     lastActivityAt: lastMessage?.updatedAt ?? lastMessage?.createdAt ?? existing.lastActivityAt,
     updatedAt: new Date().toISOString(),
   });
-  threads.set(threadId, next);
   return next;
 }
 
@@ -6075,6 +8865,29 @@ function sendSse(
   event: StreamThreadRunEvent,
 ): boolean {
   const parsed = StreamThreadRunEventSchema.parse(event);
+  const durableContext = durableSseContexts.get(controller);
+  if (durableContext) {
+    const durableThreadId = threadIdFromStreamEvent(parsed) ?? durableContext.fallbackThreadId;
+    durableContext.threadIds.add(durableThreadId);
+    durableContext.publisher.publish({
+      deliver: ({ event: durableEvent }) => {
+        deliverSse(controller, encoder, secureSession, durableEvent);
+      },
+      event: parsed,
+      threadId: durableThreadId,
+      workspaceId: durableContext.workspaceId,
+    });
+    return true;
+  }
+  return deliverSse(controller, encoder, secureSession, parsed);
+}
+
+function deliverSse(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder,
+  secureSession: SecureSessionHandle | undefined,
+  parsed: StreamThreadRunEvent,
+): boolean {
   const threadId = threadIdFromStreamEvent(parsed);
   relayDebugLog("thread.stream.sse", {
     direction: "server_to_mobile",
@@ -6134,6 +8947,13 @@ function threadIdFromStreamEvent(event: StreamThreadRunEvent) {
     return event.thread.id;
   }
   return undefined;
+}
+
+function isTerminalThreadStreamEvent(event: StreamThreadRunEvent) {
+  return (
+    event.type === "thread.error" ||
+    (event.type === "thread.state.changed" && event.thread.state !== "running")
+  );
 }
 
 function enqueueSseChunk(
@@ -6615,11 +9435,106 @@ function rememberAppServerThread(
   const threadWithLocalRuntime = ThreadSummarySchema.parse({
     ...mappedThread,
     goal: existingThread?.goal ?? mappedThread.goal,
+    ownerEpoch: existingThread?.ownerEpoch ?? mappedThread.ownerEpoch,
+    workspaceId: existingThread?.workspaceId ?? mappedThread.workspaceId,
     ...runtimeMetadataFromOptions(existingThread ?? {}),
     model: existingThread?.model ?? mappedThread.model,
   });
   threads.set(threadWithLocalRuntime.id, threadWithLocalRuntime);
   return threadWithLocalRuntime;
+}
+
+function publishRecoveredAppServerTurnSnapshot(input: {
+  claimId: string;
+  completedItemId?: string;
+  messagesByThreadId: Map<string, ChatMessage[]>;
+  publisher: DurableThreadEventPublisher;
+  publishTurnMessages: boolean;
+  state: "cancelled" | "completed" | "failed" | "running";
+  thread: AppServerThread;
+  threads: Map<string, ThreadMetadata>;
+  turn: AppServerTurn;
+  workspaceId?: string;
+}) {
+  const existingMessages = input.messagesByThreadId.get(input.thread.id) ?? [];
+  const canonicalMessages = mapAppServerMessages(input.thread);
+  input.messagesByThreadId.set(
+    input.thread.id,
+    mergeAppServerMessagesWithLocalStatus(canonicalMessages, existingMessages),
+  );
+  const mappedThread = rememberAppServerThread(input.threads, input.thread, {
+    authoritativeMessageCount: true,
+  });
+  const turnMessages = input.publishTurnMessages
+    ? canonicalMessages.filter(
+        (message) =>
+          message.turnId === input.turn.id &&
+          (!input.completedItemId || message.id === input.completedItemId),
+      )
+    : [];
+  const lastAssistantMessage = [...canonicalMessages]
+    .reverse()
+    .find((message) => message.role === "assistant");
+  const threadState =
+    input.state === "running" ? "running" : input.state === "completed" ? "completed" : "failed";
+  const threadSummary = ThreadSummarySchema.parse({
+    ...mappedThread,
+    workspaceId: input.workspaceId ?? mappedThread.workspaceId,
+    state: threadState,
+    lastResult: lastAssistantMessage?.content,
+    lastError:
+      input.state === "failed"
+        ? input.turn.error?.message || "Codex turn did not complete."
+        : undefined,
+  });
+  input.threads.set(input.thread.id, threadSummary);
+
+  for (const message of turnMessages) {
+    const event = StreamThreadRunEventSchema.parse({
+      type: message.role === "assistant" ? "thread.message.completed" : "thread.message.created",
+      thread: threadSummary,
+      message,
+    });
+    input.publisher.publish({
+      deliver: () => undefined,
+      event,
+      eventId: recoveredThreadEventId(input.claimId, event),
+      threadId: input.thread.id,
+      workspaceId: input.workspaceId,
+    });
+  }
+
+  const stateEvent = StreamThreadRunEventSchema.parse({
+    type: "thread.state.changed",
+    thread: threadSummary,
+  });
+  input.publisher.publish({
+    deliver: () => undefined,
+    event: stateEvent,
+    eventId: recoveredThreadEventId(input.claimId, stateEvent),
+    threadId: input.thread.id,
+    workspaceId: input.workspaceId,
+  });
+}
+
+function recoveredThreadEventId(claimId: string, event: StreamThreadRunEvent) {
+  const identity =
+    "message" in event && event.message
+      ? {
+          content: event.message.content,
+          details: event.message.details,
+          id: event.message.id,
+          state: event.message.state,
+          turnId: event.message.turnId,
+          type: event.type,
+        }
+      : {
+          error: "error" in event ? event.error : undefined,
+          state: "thread" in event && event.thread ? event.thread.state : undefined,
+          type: event.type,
+        };
+  const digest = createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+  return `recovery:${claimId}:${digest}`;
 }
 
 function isSubagentThread(thread: { readonly parentThreadId?: string | null }) {
@@ -7495,15 +10410,50 @@ function isRolloutMessageLine(line: string) {
 }
 
 function threadDetailResponse(input: {
+  beforeMessageId?: string;
   messages: ChatMessage[];
   pendingInputRequests: PendingInputRequest[];
   thread: ThreadMetadata;
 }) {
+  const page = threadDetailMessagePage(input.messages, input.beforeMessageId);
   return ThreadDetailResponseSchema.parse({
     thread: input.thread,
-    messages: input.messages,
+    ...page,
     pendingInputRequests: input.pendingInputRequests,
   });
+}
+
+const defaultThreadDetailMessageLimit = 300;
+
+function threadDetailMessagePage(messages: ChatMessage[], beforeMessageId?: string) {
+  const limit = configuredThreadDetailMessageLimit();
+  if (!limit || messages.length <= limit) {
+    return { hasOlderMessages: false, messages };
+  }
+  const beforeIndex = beforeMessageId
+    ? messages.findIndex((message) => message.id === beforeMessageId)
+    : messages.length;
+  const end = beforeIndex >= 0 ? beforeIndex : messages.length;
+  const start = Math.max(0, end - limit);
+  const pageMessages = messages.slice(start, end);
+  const hasOlderMessages = start > 0;
+  return {
+    hasOlderMessages,
+    messages: pageMessages,
+    ...(hasOlderMessages && pageMessages[0] ? { olderMessagesCursor: pageMessages[0].id } : {}),
+  };
+}
+
+function configuredThreadDetailMessageLimit() {
+  const configured = process.env.CODEX_RELAY_THREAD_DETAIL_MESSAGE_LIMIT?.trim();
+  if (!configured) {
+    return defaultThreadDetailMessageLimit;
+  }
+  const limit = Number(configured);
+  if (!Number.isFinite(limit) || limit < 0) {
+    return defaultThreadDetailMessageLimit;
+  }
+  return Math.floor(limit);
 }
 
 const threadDetailLargeTextPreviewLimit = 8 * 1024;
@@ -8466,6 +11416,19 @@ function pendingInputRequestsForThread(
   });
 }
 
+function messagesWithPendingApprovals(
+  messages: ChatMessage[],
+  pendingApprovals: Map<string, PendingApproval>,
+  threadId: string,
+) {
+  return dedupeThreadMessages([
+    ...messages,
+    ...Array.from(pendingApprovals.values()).flatMap((pending) =>
+      pending.threadId === threadId && pending.message ? [pending.message] : [],
+    ),
+  ]);
+}
+
 function structuredUserInputResponse(
   questions: PendingInputRequestQuestion[],
   decision: "approve" | "approve-for-session" | "deny" | "cancel",
@@ -8644,10 +11607,29 @@ function appServerTurnFromParams(
     return undefined;
   }
   const record = turn as Record<string, unknown>;
-  if (typeof record.id !== "string" || !Array.isArray(record.items)) {
+  const id = firstString(record, ["id"]);
+  if (!id || !Array.isArray(record.items)) {
     return undefined;
   }
-  return turn as AppServerTurn;
+  return {
+    id,
+    items: record.items.filter(isAppServerThreadItem),
+    status: record.status,
+    error:
+      record.error && typeof record.error === "object"
+        ? (record.error as AppServerTurn["error"])
+        : null,
+    startedAt: typeof record.startedAt === "number" ? record.startedAt : null,
+    completedAt: typeof record.completedAt === "number" ? record.completedAt : null,
+  } satisfies AppServerTurn;
+}
+
+function isAppServerThreadItem(item: unknown): item is AppServerThreadItem {
+  if (!item || typeof item !== "object") {
+    return false;
+  }
+  const record = item as Record<string, unknown>;
+  return typeof record.id === "string" && typeof record.type === "string";
 }
 
 function turnStatus(params: Record<string, unknown> | undefined) {
@@ -9695,6 +12677,23 @@ function apiError(code: string, message: string, issues?: string[]): ErrorRespon
       issues,
     },
   };
+}
+
+function activeThreadWriterError() {
+  return apiError(
+    "thread_active_writer",
+    "This conversation is currently open in a desktop Codex session. Close that desktop session or use a new mobile conversation before sending from your phone.",
+  );
+}
+
+function apiErrorForCodexRunError(error: unknown, fallback?: string) {
+  return isActiveThreadWriterError(error)
+    ? activeThreadWriterError()
+    : apiError("codex_run_failed", fallback ?? errorMessage(error));
+}
+
+function isActiveThreadWriterError(error: unknown) {
+  return errorMessage(error).includes("already has an active writer");
 }
 
 function errorMessage(error: unknown) {

@@ -216,4 +216,59 @@ describe("thread mutation OpenAPI paths", () => {
       });
     },
   );
+
+  it("exposes optional owner epoch guards without requiring upgraded clients", () => {
+    expect(
+      apiSchema.RunThreadRequestSchema.parse({
+        expectedOwnerEpoch: 3,
+        prompt: "Continue",
+      }),
+    ).toMatchObject({ expectedOwnerEpoch: 3 });
+    expect(apiSchema.ThreadOwnerMutationRequestSchema.parse({})).toEqual({});
+    expect(
+      apiSchema.ResolveApprovalRequestSchema.parse({
+        decision: "approve",
+        expectedOwnerEpoch: 3,
+      }),
+    ).toMatchObject({ expectedOwnerEpoch: 3 });
+    expect(
+      apiSchema.RewindThreadRequestSchema.parse({
+        expectedOwnerEpoch: 3,
+        turnId: "turn-1",
+      }),
+    ).toMatchObject({ expectedOwnerEpoch: 3 });
+    expect(
+      apiSchema.UpdateThreadGoalRequestSchema.parse({
+        expectedOwnerEpoch: 3,
+        status: "paused",
+      }),
+    ).toMatchObject({ expectedOwnerEpoch: 3 });
+    expect(
+      apiSchema.ThreadOwnerMutationRequestSchema.safeParse({ expectedOwnerEpoch: 0 }).success,
+    ).toBe(false);
+
+    const document = createOpenApiDocument();
+    expect(document.components.schemas.ThreadSummary.properties.ownerEpoch).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
+    expect(document.components.schemas.RunThreadRequest.properties.expectedOwnerEpoch).toEqual({
+      type: "integer",
+      minimum: 1,
+    });
+    expect(document.paths["/v1/threads/{threadId}/runs/interrupt"]?.post?.requestBody).toEqual({
+      required: false,
+      content: {
+        "application/json": {
+          schema: { $ref: "#/components/schemas/ThreadOwnerMutationRequest" },
+        },
+      },
+    });
+    expect(document.paths["/v1/threads/{threadId}"]?.delete?.requestBody).toMatchObject({
+      required: false,
+    });
+    expect(document.paths["/v1/threads/{threadId}/goal"]?.delete?.requestBody).toMatchObject({
+      required: false,
+    });
+  });
 });

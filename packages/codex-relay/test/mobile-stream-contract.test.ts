@@ -18,6 +18,8 @@ import {
   completeThreadRunSession,
   createThreadRunSseDispatcher,
   handleThreadRunStreamEvent,
+  isThreadActiveWriterStreamEvent,
+  isThreadMessageStreamEvent,
   reconcileThreadRunEventAfterTerminal,
   threadRunStreamEventTypes,
 } from "../../../apps/mobile/src/lib/thread-run-stream.js";
@@ -30,6 +32,96 @@ describe("mobile stream contract", () => {
   it("subscribes to pending input request events on named SSE streams", () => {
     expect(threadRunStreamEventTypes).toContain("thread.input_request.created");
     expect(threadRunStreamEventTypes).toContain("thread.input_request.resolved");
+  });
+
+  it("preserves durable cursor metadata from named SSE events", () => {
+    const events: Array<{ eventId?: string; sequence?: number }> = [];
+    const dispatcher = createThreadRunSseDispatcher({
+      onEvent(event) {
+        events.push(event);
+      },
+      onError(error) {
+        throw error;
+      },
+    });
+
+    dispatcher.push(
+      `event: thread.state.changed\ndata: ${JSON.stringify({
+        eventId: "event-9",
+        sequence: 9,
+        type: "thread.state.changed",
+        thread: {
+          id: "thread-cursor",
+          title: "Cursor",
+          createdAt: "2026-08-26T00:00:00.000Z",
+          updatedAt: "2026-08-26T00:00:00.000Z",
+          state: "running",
+          messageCount: 0,
+        },
+      })}\n\n`,
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ eventId: "event-9", sequence: 9 });
+  });
+
+  it("distinguishes message stream events from state-only attach events", () => {
+    expect(
+      isThreadMessageStreamEvent({
+        type: "thread.message.completed",
+        thread: {
+          id: "thread-1",
+          title: "Thread",
+          createdAt: "2026-04-29T00:00:00.000Z",
+          updatedAt: "2026-04-29T00:00:00.000Z",
+          state: "idle",
+          messageCount: 1,
+        },
+        message: {
+          id: "message-1",
+          threadId: "thread-1",
+          role: "assistant",
+          kind: "chat",
+          content: "done",
+          createdAt: "2026-04-29T00:00:00.000Z",
+          state: "completed",
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isThreadMessageStreamEvent({
+        type: "thread.state.changed",
+        thread: {
+          id: "thread-1",
+          title: "Thread",
+          createdAt: "2026-04-29T00:00:00.000Z",
+          updatedAt: "2026-04-29T00:00:00.000Z",
+          state: "idle",
+          messageCount: 1,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("identifies active desktop writer stream errors", () => {
+    expect(
+      isThreadActiveWriterStreamEvent({
+        type: "thread.error",
+        error: {
+          code: "thread_active_writer",
+          message: "This conversation is currently open in a desktop Codex session.",
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isThreadActiveWriterStreamEvent({
+        type: "thread.error",
+        error: {
+          code: "codex_run_failed",
+          message: "Codex run failed.",
+        },
+      }),
+    ).toBe(false);
   });
 
   it("feeds server SSE through the same mobile parser and chat reducer used by the app", async () => {

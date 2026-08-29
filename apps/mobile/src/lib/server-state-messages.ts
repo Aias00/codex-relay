@@ -40,6 +40,8 @@ export function appendOptimisticSteeringMessageToDetail(
     thread,
     messages: upsertMessage(current?.messages ?? [], message),
     pendingInputRequests: current?.pendingInputRequests ?? [],
+    hasOlderMessages: current?.hasOlderMessages ?? false,
+    ...(current?.olderMessagesCursor ? { olderMessagesCursor: current.olderMessagesCursor } : {}),
   };
 }
 

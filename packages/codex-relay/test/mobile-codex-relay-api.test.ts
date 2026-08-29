@@ -6,6 +6,7 @@ import {
   getCodexRelayServerUrlCandidates,
   saveCodexRelayServerUrlCandidates,
   setCodexRelayServerUrl,
+  sortServerUrlsByConnectionPreference,
 } from "../../../apps/mobile/src/lib/codex-relay-server-url-storage.js";
 import { requestWithNetworkTimeout } from "../../../apps/mobile/src/lib/network-timeout.js";
 
@@ -31,6 +32,49 @@ describe("mobile Codex Relay API session storage", () => {
         label: "Localhost",
         url: fallbackCodexRelayServerUrl,
       },
+    ]);
+  });
+
+  it("keeps the configured fallback URL in candidates after an older LAN URL was selected", () => {
+    setCodexRelayServerUrl("http://192.168.47.15:8788");
+
+    expect(getCodexRelayServerUrlCandidates()).toEqual([
+      {
+        label: "LAN IP",
+        url: "http://192.168.47.15:8788",
+      },
+      {
+        label: "Localhost",
+        url: fallbackCodexRelayServerUrl,
+      },
+    ]);
+  });
+
+  it("prefers public HTTPS URLs over LAN and Tailscale DNS candidates", () => {
+    expect(
+      sortServerUrlsByConnectionPreference([
+        "http://192.168.47.15:8788",
+        "http://macbook-pro-m4.tail73d4c.ts.net:8788",
+        "https://codex-relay.aias.eu.org",
+      ]),
+    ).toEqual([
+      "https://codex-relay.aias.eu.org",
+      "http://macbook-pro-m4.tail73d4c.ts.net:8788",
+      "http://192.168.47.15:8788",
+    ]);
+  });
+
+  it("keeps the currently verified server URL ahead of higher-scored fallbacks", () => {
+    saveCodexRelayServerUrlCandidates([
+      "https://codex-relay.aias.eu.org",
+      "http://100.126.212.81:8788",
+    ]);
+    setCodexRelayServerUrl("http://100.126.212.81:8788");
+
+    expect(getCodexRelayServerUrlCandidates().map(({ url }) => url)).toEqual([
+      "http://100.126.212.81:8788",
+      "https://codex-relay.aias.eu.org",
+      fallbackCodexRelayServerUrl,
     ]);
   });
 
