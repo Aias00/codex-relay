@@ -352,7 +352,7 @@ export type RelayStateStore = ThreadCoordinatorStore &
   PendingApprovalStore &
   WorkspaceRegistry;
 
-const currentSchemaVersion = 7;
+const currentSchemaVersion = 8;
 const defaultPageLimit = 200;
 const maximumPageLimit = 500;
 
@@ -500,6 +500,19 @@ export async function createRelayStateStore(path: string): Promise<RelayStateSto
   if (!turnClaimColumns.some((column) => String(column.name) === "dispatch_started_at")) {
     try {
       await database.exec("ALTER TABLE turn_claims ADD COLUMN dispatch_started_at INTEGER");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/duplicate column name/i.test(message)) {
+        throw error;
+      }
+    }
+  }
+  const pendingApprovalColumns = await database
+    .prepare("PRAGMA table_info(pending_approvals)")
+    .all();
+  if (!pendingApprovalColumns.some((column) => String(column.name) === "message_json")) {
+    try {
+      await database.exec("ALTER TABLE pending_approvals ADD COLUMN message_json TEXT");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!/duplicate column name/i.test(message)) {

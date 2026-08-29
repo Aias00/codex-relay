@@ -162,6 +162,11 @@ Checkpoint 19 persists and restores pending app-server approvals:
 - A successful app-server response marks the durable request resolved; a persistence failure remains fail-open for the current live interaction and is recorded in diagnostics.
 - Content-safe diagnostics, online-consistent SQLite backup, explicit event compaction, and expired-owner repair are available through the CLI.
 
+Checkpoint 20 repairs early schema v7 approval stores:
+
+- `relay-state.db` schema v8 detects an existing `pending_approvals` table without `message_json` and adds the column in place before approval hydration runs.
+- Existing pending rows remain readable with no message payload, while newly persisted command and file approvals retain their mobile status message across restart.
+
 Prompt-stream token deltas are persisted before delivery through the durable publisher. Attach streams intentionally do not republish deltas because multiple subscribers would create duplicate durable events; recovered turns persist completed canonical items and terminal snapshots.
 
 ## Summary

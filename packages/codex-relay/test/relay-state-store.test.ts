@@ -1141,7 +1141,74 @@ describe("relay state store", () => {
         .execute("SELECT version FROM relay_state_schema ORDER BY version")
         .then((result) => result.rows.map((row) => Number(row.version)));
       migratedClient.close();
-      expect(versions).toEqual([4, 7]);
+      expect(versions).toEqual([4, 8]);
+    } finally {
+      client.close();
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("migrates v7 pending approvals before reading message payloads", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codex-relay-v7-approvals-"));
+    const databasePath = join(directory, "relay-state.db");
+    const client = createClient({
+      intMode: "number",
+      url: pathToFileURL(databasePath).href,
+    });
+    const now = Date.now();
+
+    try {
+      await client.batch(
+        [
+          {
+            sql: `CREATE TABLE relay_state_schema (
+                    version INTEGER PRIMARY KEY,
+                    applied_at INTEGER NOT NULL
+                  )`,
+            args: [],
+          },
+          {
+            sql: "INSERT INTO relay_state_schema (version, applied_at) VALUES (7, ?)",
+            args: [now],
+          },
+          {
+            sql: `CREATE TABLE pending_approvals (
+                    approval_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT,
+                    request_id INTEGER NOT NULL,
+                    method TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    message_id TEXT,
+                    questions_json TEXT,
+                    state TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                  )`,
+            args: [],
+          },
+          {
+            sql: `INSERT INTO pending_approvals (
+                    approval_id, thread_id, turn_id, request_id, method, kind,
+                    message_id, questions_json, state, created_at, updated_at
+                  ) VALUES ('approval-v7', 'thread-v7', 'turn-v7', 7,
+                    'item/tool/requestUserInput', 'structuredUserInput', NULL,
+                    '[{"id":"scope","question":"Continue?"}]', 'pending', ?, ?)`,
+            args: [now, now],
+          },
+        ],
+        "write",
+      );
+      client.close();
+
+      const store = await createRelayStateStore(databasePath);
+      await expect(store.listPendingApprovals()).resolves.toMatchObject([
+        {
+          approvalId: "approval-v7",
+          message: undefined,
+          questions: [{ id: "scope", question: "Continue?" }],
+        },
+      ]);
     } finally {
       client.close();
       await rm(directory, { force: true, recursive: true });

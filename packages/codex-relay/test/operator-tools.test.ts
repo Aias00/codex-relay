@@ -31,7 +31,7 @@ describe("relay operator tools", () => {
         exists: true,
         path: statePath,
         pendingApprovalCount: 1,
-        schemaVersion: 7,
+        schemaVersion: 8,
       });
     } finally {
       await rm(directory, { force: true, recursive: true });
