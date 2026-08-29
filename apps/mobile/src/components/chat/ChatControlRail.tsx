@@ -13,6 +13,7 @@ export function ChatControlRail({
   modelLabel,
   onModelPress,
   onRuntimePress,
+  runtimeDisabled,
   runtimeOption,
 }: {
   isFastModeEnabled: boolean;
@@ -20,6 +21,7 @@ export function ChatControlRail({
   modelLabel: string;
   onModelPress: () => void;
   onRuntimePress: () => void;
+  runtimeDisabled?: boolean;
   runtimeOption: RuntimePickerOption;
 }) {
   return (
@@ -29,6 +31,7 @@ export function ChatControlRail({
           accessibilityLabel={`Runtime mode ${runtimeOption.compactLabel}`}
           icon={runtimeOption.icon}
           label={runtimeOption.compactLabel}
+          disabled={runtimeDisabled}
           onPress={onRuntimePress}
           style={styles.runtimeButton}
           tintColor={runtimeOption.iconTintColor}

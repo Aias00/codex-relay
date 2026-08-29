@@ -167,6 +167,15 @@ Checkpoint 20 repairs early schema v7 approval stores:
 - `relay-state.db` schema v8 detects an existing `pending_approvals` table without `message_json` and adds the column in place before approval hydration runs.
 - Existing pending rows remain readable with no message payload, while newly persisted command and file approvals retain their mobile status message across restart.
 
+Checkpoint 21 closes the current runtime-preference acknowledgement UX:
+
+- Mobile stages model, service-tier, reasoning, and runtime-mode revisions per workspace, serializes writes, and keeps the optimistic value visible until the latest revision is acknowledged.
+- Runtime and model controls are disabled while that workspace has an unacknowledged revision, preventing overlapping picker changes from appearing settled.
+- Accepted responses replace cached preferences with the server response. Rejected writes clear the optimistic revision and refresh authoritative status, restoring the observed value.
+- Collaboration mode remains thread/composer state and app-server turn input; approval and structured input requests use their separate durable pending/resolve protocol.
+
+Optional Desktop Bridge is deferred as a separate vertical integration. Shared app-server is the supported desktop-session path. A bridge will only be implemented together with a real desktop runtime adapter that can register, heartbeat, publish canonical events, accept or queue input, and acknowledge controls; Relay-only registration endpoints would be unusable scaffolding and an unnecessary local attack surface.
+
 Prompt-stream token deltas are persisted before delivery through the durable publisher. Attach streams intentionally do not republish deltas because multiple subscribers would create duplicate durable events; recovered turns persist completed canonical items and terminal snapshots.
 
 ## Summary
@@ -785,6 +794,8 @@ Existing server state modules adopt these boundaries incrementally rather than b
 
 **Rollback:** Expose snapshots read-only and retain current preference behavior for new turns.
 
+**Current delivery:** Workspace runtime preferences have pending/acknowledged/rejected UI behavior and durable permission requests are restored in shared mode. Full active-runtime reconfiguration remains capability-dependent and is applied at the next authoritative turn start when the app-server does not expose a live configure method.
+
 ### Phase 7: Optional Desktop Bridge
 
 - Implement bridge registration, lease, heartbeat, event publication, input dispatch, and control acknowledgement.
@@ -794,6 +805,8 @@ Existing server state modules adopt these boundaries incrementally rather than b
 **Primary result:** Share supported desktop runtimes that cannot use the official shared app-server transport.
 
 **Rollback:** Disable bridge registration and continue with shared app-server or explicit writer rejection.
+
+**Delivery decision:** Deferred until a concrete non-app-server desktop runtime adapter is in scope. The current repository has no desktop process that could consume bridge dispatches, so a Relay-only protocol would not satisfy the primary result.
 
 ### Phase 8: Operations, Compaction, and Legacy Retirement
 
@@ -826,7 +839,7 @@ Existing server state modules adopt these boundaries incrementally rather than b
 - Route switching preserves pairing and pending inputs.
 - Writer rejection restores composer content.
 - Delivery state progresses through persisted, queued/steered, running, and terminal states.
-- Runtime controls remain pending until acknowledgement and revert on rejection.
+- Runtime controls remain pending until acknowledgement and revert on rejection. Covered by the workspace revision coordinator and disabled control state.
 
 ### Integration and Device Tests
 

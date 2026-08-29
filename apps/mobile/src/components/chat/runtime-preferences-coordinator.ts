@@ -25,6 +25,10 @@ export function createRuntimePreferencesCoordinator() {
     return draftsByScope.get(scopeKey)?.preferences;
   }
 
+  function isPending(scopeKey: string) {
+    return draftsByScope.has(scopeKey);
+  }
+
   function settle(stageToSettle: RuntimePreferencesStage) {
     if (draftsByScope.get(stageToSettle.scopeKey)?.revision !== stageToSettle.revision) {
       return false;
@@ -46,5 +50,5 @@ export function createRuntimePreferencesCoordinator() {
     return updateQueue;
   }
 
-  return { afterUpdates, current, enqueue, settle, stage };
+  return { afterUpdates, current, enqueue, isPending, settle, stage };
 }

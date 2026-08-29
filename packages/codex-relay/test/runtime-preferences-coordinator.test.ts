@@ -51,6 +51,24 @@ describe("runtime preferences coordinator", () => {
     expect(coordinator.current("/workspace/a")?.reasoningEffort).toBe("ultra");
   });
 
+  it("keeps controls pending until the newest workspace revision is acknowledged", () => {
+    const coordinator = createRuntimePreferencesCoordinator();
+    const older = coordinator.stage("/workspace/a", {
+      model: "gpt-5.6-sol",
+      runtimeMode: "default",
+    });
+    const newest = coordinator.stage("/workspace/a", {
+      model: "gpt-5.6-sol",
+      runtimeMode: "full-access",
+    });
+
+    expect(coordinator.isPending("/workspace/a")).toBe(true);
+    expect(coordinator.settle(older)).toBe(false);
+    expect(coordinator.isPending("/workspace/a")).toBe(true);
+    expect(coordinator.settle(newest)).toBe(true);
+    expect(coordinator.isPending("/workspace/a")).toBe(false);
+  });
+
   it("waits for queued preference updates before starting a status read", async () => {
     // Given
     const coordinator = createRuntimePreferencesCoordinator();

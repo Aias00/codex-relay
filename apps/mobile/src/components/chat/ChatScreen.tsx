@@ -587,6 +587,9 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   const optimisticWorkspacePreferences = activeWorkspacePath
     ? optimisticRuntimePreferencesByWorkspacePath[activeWorkspacePath]
     : optimisticRuntimePreferences;
+  const runtimeControlsPending = activeWorkspacePath
+    ? Boolean(optimisticRuntimePreferencesByWorkspacePath[activeWorkspacePath])
+    : Boolean(optimisticRuntimePreferences);
   const activeRuntimePreferences = runtimePreferencesWithAvailableServiceTier(
     runtimePreferencesForWorkspace(
       optimisticWorkspacePreferences ?? workspacePreferences,
@@ -2596,6 +2599,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       composerFocusRequestKey={composerFocusRequestKey}
       composerFooter={
         <ChatControls
+          controlsPending={runtimeControlsPending}
           models={models}
           runtimeMode={runtimeMode}
           selectedReasoningEffort={selectedReasoningEffort}

@@ -14,6 +14,7 @@ import {
 import { RuntimeModeSheet, runtimeOptionForMode } from "./RuntimeModeSheet";
 
 export function ChatControls({
+  controlsPending = false,
   models,
   onRuntimeModeChange,
   onSelectedModelChange,
@@ -24,6 +25,7 @@ export function ChatControls({
   selectedReasoningEffort,
   selectedServiceTier,
 }: {
+  controlsPending?: boolean;
   models: CodexModel[];
   onRuntimeModeChange: (mode: RuntimeMode) => void;
   onSelectedModelChange: (model: string, reasoningEffort?: ReasoningEffort) => void;
@@ -57,10 +59,11 @@ export function ChatControls({
     <>
       <ChatControlRail
         isFastModeEnabled={isFastModeEnabled}
-        modelDisabled={models.length === 0}
+        modelDisabled={controlsPending || models.length === 0}
         modelLabel={modelLabel}
         onModelPress={() => openPicker("model")}
         onRuntimePress={() => openPicker("runtime")}
+        runtimeDisabled={controlsPending}
         runtimeOption={selectedRuntimeOption}
       />
       <RuntimeModeSheet
