@@ -78,6 +78,9 @@ import {
 } from "./server-state-messages";
 import { prioritizeThreadPrefetch, runBoundedThreadPrefetch } from "./thread-prefetch";
 
+export const threadListStaleTimeMs = 30_000;
+export const workspaceDirectoryStaleTimeMs = 5 * 60_000;
+
 export const serverStateKeys = {
   all: () => [serverStateRootKey, getCodexRelayServerUrl()] as const,
   contextWindow: (threadId: string, selection?: WorkspaceCacheSelection | string) =>
@@ -135,6 +138,14 @@ export function fetchThreadsState(
   return queryClient.fetchQuery({
     queryKey: serverStateKeys.threads(normalized),
     queryFn: () => listThreads(normalized),
+  });
+}
+
+export function prefetchAllThreadsState(queryClient: QueryClient) {
+  return queryClient.prefetchQuery({
+    queryKey: serverStateKeys.threads({}),
+    queryFn: () => listThreads({}),
+    staleTime: threadListStaleTimeMs,
   });
 }
 
@@ -247,6 +258,7 @@ export function fetchWorkspaceDirectoriesState(queryClient: QueryClient, path: s
   return queryClient.fetchQuery({
     queryKey: serverStateKeys.workspaceDirectories(path),
     queryFn: () => listWorkspaceDirectories(path),
+    staleTime: workspaceDirectoryStaleTimeMs,
   });
 }
 

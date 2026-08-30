@@ -58,6 +58,7 @@ import {
   setStatusState,
   setThreadDetailState,
   setThreadsState,
+  threadListStaleTimeMs,
 } from "@/lib/server-state";
 import {
   shouldBlockThreadActivation,
@@ -238,6 +239,7 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
     queryKey: serverStateKeys.threads({}),
     queryFn: () => serverStateQueryFns.threads({}),
     enabled: isDrawerVisible,
+    staleTime: threadListStaleTimeMs,
   });
   const versionQuery = useQuery({
     queryKey: serverStateKeys.version(),

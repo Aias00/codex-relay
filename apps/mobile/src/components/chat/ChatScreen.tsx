@@ -106,6 +106,7 @@ import {
   fetchWorkspaceChangesState,
   hydrateOlderThreadMessagesState,
   optimisticallySteerQueuedInputState,
+  prefetchAllThreadsState,
   prefetchThreadDetailsState,
   removePendingInputRequestState,
   removeQueuedThreadInputServerState,
@@ -859,6 +860,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         if (rateLimitsResponse) {
           queryClient.setQueryData(serverStateKeys.rateLimits(), rateLimitsResponse);
         }
+        void prefetchAllThreadsState(queryClient).catch(() => undefined);
         const currentActiveThreadId = chatStore$.activeThreadId.peek();
         void prefetchThreadDetailsState(
           queryClient,
