@@ -394,6 +394,16 @@ export const ListWorkspacesResponseSchema = z.object({
   workspaces: z.array(WorkspaceSchema),
 });
 
+export const WorkspaceSummarySchema = WorkspaceSchema.extend({
+  lastActivityAt: IsoDateTimeSchema.optional(),
+  runningThreadCount: z.number().int().nonnegative(),
+  threadCount: z.number().int().nonnegative(),
+});
+
+export const ListWorkspaceSummariesResponseSchema = z.object({
+  workspaces: z.array(WorkspaceSummarySchema),
+});
+
 export const WorkspaceDirectoryEntrySchema = z.object({
   name: z.string().min(1),
   path: z.string().min(1),
@@ -950,6 +960,8 @@ export type ThreadSummary = z.infer<typeof ThreadSummarySchema>;
 export type StatusResponse = z.infer<typeof StatusResponseSchema>;
 export type Workspace = z.infer<typeof WorkspaceSchema>;
 export type ListWorkspacesResponse = z.infer<typeof ListWorkspacesResponseSchema>;
+export type WorkspaceSummary = z.infer<typeof WorkspaceSummarySchema>;
+export type ListWorkspaceSummariesResponse = z.infer<typeof ListWorkspaceSummariesResponseSchema>;
 export type WorkspaceDirectoryEntry = z.infer<typeof WorkspaceDirectoryEntrySchema>;
 export type ListWorkspaceDirectoriesResponse = z.infer<
   typeof ListWorkspaceDirectoriesResponseSchema
@@ -1228,6 +1240,7 @@ export const apiPaths = {
   sessionRefresh: "/v1/session/refresh",
   status: "/v1/status",
   workspaces: "/v1/workspaces",
+  workspaceSummaries: "/v1/workspaces/summary",
   preferences: "/v1/preferences",
   pushNotifications: "/v1/notifications/push",
   rateLimits: "/v1/rate-limits",
@@ -1327,6 +1340,15 @@ export function createOpenApiDocument() {
           summary: "List trusted workspaces known to this Relay",
           responses: {
             "200": jsonResponse("ListWorkspacesResponse"),
+            "401": jsonResponse("ErrorResponse"),
+          },
+        },
+      },
+      "/v1/workspaces/summary": {
+        get: {
+          summary: "List lightweight workspace summaries for project navigation",
+          responses: {
+            "200": jsonResponse("ListWorkspaceSummariesResponse"),
             "401": jsonResponse("ErrorResponse"),
           },
         },
@@ -1862,6 +1884,41 @@ export function createOpenApiDocument() {
             workspaces: {
               type: "array",
               items: { $ref: "#/components/schemas/Workspace" },
+            },
+          },
+        },
+        WorkspaceSummary: {
+          type: "object",
+          required: [
+            "workspaceId",
+            "canonicalPath",
+            "displayName",
+            "createdAt",
+            "lastSeenAt",
+            "state",
+            "threadCount",
+            "runningThreadCount",
+          ],
+          properties: {
+            workspaceId: { type: "string" },
+            canonicalPath: { type: "string" },
+            displayName: { type: "string" },
+            repositoryIdentity: { type: "string" },
+            createdAt: { type: "string", format: "date-time" },
+            lastSeenAt: { type: "string", format: "date-time" },
+            state: { type: "string", enum: WorkspaceStateSchema.options },
+            threadCount: { type: "integer", minimum: 0 },
+            runningThreadCount: { type: "integer", minimum: 0 },
+            lastActivityAt: { type: "string", format: "date-time" },
+          },
+        },
+        ListWorkspaceSummariesResponse: {
+          type: "object",
+          required: ["workspaces"],
+          properties: {
+            workspaces: {
+              type: "array",
+              items: { $ref: "#/components/schemas/WorkspaceSummary" },
             },
           },
         },

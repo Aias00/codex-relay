@@ -156,6 +156,7 @@ The relay listens on `0.0.0.0:8787` by default. Configure it with environment va
 | `CODEX_RELAY_OWNER_LEASE_MS`           | Optional cross-process owner lease duration in milliseconds. Unset disables lease enforcement; an active lease prevents another Relay from starting a turn.     |
 | `CODEX_RELAY_APPROVAL_SECRET`          | Secret used by the local approve command. Usually generated automatically.                                                                                      |
 | `CODEX_RELAY_PUBLIC_URL`               | Public URL printed first and embedded first in the pairing QR, for example a Cloudflare Tunnel URL proxying the relay port.                                     |
+| `CODEX_RELAY_THREAD_LIST_CACHE_TTL_MS` | Short server-side cache for app-server thread list reads. Defaults to `3000`; set to `0` to disable.                                                            |
 | `CODEX_RELAY_DANGEROUSLY_AUTO_APPROVE` | Set to `1` to auto-approve mobile pairing requests. Prefer the CLI flag for local use.                                                                          |
 | `CODEX_RELAY_APP_SERVER_MODE`          | Set to `socket` to require shared mode or `stdio` to require private mode. Unset prefers shared mode with startup fallback on macOS and private mode elsewhere. |
 | `CODEX_HOME`                           | Codex home directory, used when reading Codex session metadata.                                                                                                 |

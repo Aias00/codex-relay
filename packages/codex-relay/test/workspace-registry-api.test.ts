@@ -2,7 +2,11 @@ import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
 
-import { ListWorkspacesResponseSchema, apiPaths } from "../src/api-schema.js";
+import {
+  ListWorkspaceSummariesResponseSchema,
+  ListWorkspacesResponseSchema,
+  apiPaths,
+} from "../src/api-schema.js";
 import { CodexAppServerClient, type AppServerThread } from "../src/app-server.js";
 import { createApp } from "../src/app.js";
 import { createTursoPairingSessionStore } from "../src/pairing-store.js";
@@ -51,8 +55,10 @@ describe("workspace registry API", () => {
     });
 
     const response = await app.request(apiPaths.workspaces);
+    const summaryResponse = await app.request(apiPaths.workspaceSummaries);
 
     expect(response.status).toBe(401);
+    expect(summaryResponse.status).toBe(401);
   });
 
   it("flushes app-server thread workspace discovery before listing workspaces", async () => {
@@ -79,13 +85,21 @@ describe("workspace registry API", () => {
       const app = createApp({ appServer, workspaceRegistry: registry });
 
       const threadsResponse = await app.request(apiPaths.threads);
+      const cachedThreadsResponse = await app.request(apiPaths.threads);
       const workspacesResponse = await app.request(apiPaths.workspaces);
+      const summariesResponse = await app.request(apiPaths.workspaceSummaries);
       const workspaces = ListWorkspacesResponseSchema.parse(await workspacesResponse.json());
+      const summaries = ListWorkspaceSummariesResponseSchema.parse(await summariesResponse.json());
 
       expect(threadsResponse.status).toBe(200);
+      expect(cachedThreadsResponse.status).toBe(200);
       expect(workspaces.workspaces).toMatchObject([
         { displayName: workspacePath.split("/").at(-1), state: "available" },
       ]);
+      expect(summaries.workspaces).toMatchObject([
+        { displayName: workspacePath.split("/").at(-1), threadCount: 1, runningThreadCount: 0 },
+      ]);
+      expect(appServer.listThreads).toHaveBeenCalledTimes(1);
     } finally {
       await rm(workspacePath, { force: true, recursive: true });
     }

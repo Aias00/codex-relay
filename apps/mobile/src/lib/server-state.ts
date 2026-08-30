@@ -40,6 +40,7 @@ import {
   listThreadEvents,
   listQueuedThreadInputs,
   listThreads,
+  listWorkspaceSummaries,
   listWorkspaceDirectories,
   removeQueuedThreadInput,
   renameThread,
@@ -112,6 +113,7 @@ export const serverStateKeys = {
       "threads",
       workspaceCacheIdentity(selection ?? currentWorkspaceSelection()),
     ] as const,
+  workspaceSummaries: () => [...serverStateKeys.all(), "workspace-summaries"] as const,
   version: () => [...serverStateKeys.all(), "version"] as const,
   workspaceChanges: (selection: WorkspaceCacheSelection | string | undefined) =>
     [...serverStateKeys.all(), "workspace-changes", workspaceCacheIdentity(selection)] as const,
@@ -145,6 +147,14 @@ export function prefetchAllThreadsState(queryClient: QueryClient) {
   return queryClient.prefetchQuery({
     queryKey: serverStateKeys.threads({}),
     queryFn: () => listThreads({}),
+    staleTime: threadListStaleTimeMs,
+  });
+}
+
+export function prefetchWorkspaceSummariesState(queryClient: QueryClient) {
+  return queryClient.prefetchQuery({
+    queryKey: serverStateKeys.workspaceSummaries(),
+    queryFn: listWorkspaceSummaries,
     staleTime: threadListStaleTimeMs,
   });
 }
@@ -472,6 +482,7 @@ export const serverStateQueryFns = {
   thread: getThread,
   threadEvents: listThreadEvents,
   threads: listThreads,
+  workspaceSummaries: listWorkspaceSummaries,
   version: getVersion,
   workspaceChanges: getWorkspaceChanges,
   workspaceDirectories: listWorkspaceDirectories,

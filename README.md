@@ -198,18 +198,19 @@ release pull request and publishes it after that pull request is merged. See
 
 The relay listens on `0.0.0.0:8787` by default.
 
-| Variable                        | Purpose                                                                                        |
-| ------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `PORT`                          | Server port. Defaults to `8787`.                                                               |
-| `HOST`                          | Listen host. Defaults to `0.0.0.0`.                                                            |
-| `CODEX_RELAY_WORKSPACE_PATH`    | Workspace path Codex should use. Defaults to the current directory.                            |
-| `CODEX_RELAY_AUTH_DB_PATH`      | Pairing and session database path.                                                             |
-| `CODEX_RELAY_MAX_THREAD_EVENTS` | Optional per-thread durable event retention limit. Unset keeps all events.                     |
-| `CODEX_RELAY_OWNER_LEASE_MS`    | Optional cross-process owner lease duration in milliseconds. Unset disables lease enforcement. |
-| `CODEX_RELAY_PUBLIC_URL`        | Public URL to prefer in the pairing QR, such as a Cloudflare Tunnel URL.                       |
-| `CODEX_RELAY_APP_SERVER_MODE`   | `socket` for shared terminal/mobile sessions; defaults to `stdio`.                             |
-| `CODEX_BIN`                     | Codex CLI executable path.                                                                     |
-| `CODEX_HOME`                    | Codex home directory for reading local session metadata.                                       |
+| Variable                               | Purpose                                                                                              |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `PORT`                                 | Server port. Defaults to `8787`.                                                                     |
+| `HOST`                                 | Listen host. Defaults to `0.0.0.0`.                                                                  |
+| `CODEX_RELAY_WORKSPACE_PATH`           | Workspace path Codex should use. Defaults to the current directory.                                  |
+| `CODEX_RELAY_AUTH_DB_PATH`             | Pairing and session database path.                                                                   |
+| `CODEX_RELAY_MAX_THREAD_EVENTS`        | Optional per-thread durable event retention limit. Unset keeps all events.                           |
+| `CODEX_RELAY_OWNER_LEASE_MS`           | Optional cross-process owner lease duration in milliseconds. Unset disables lease enforcement.       |
+| `CODEX_RELAY_PUBLIC_URL`               | Public URL to prefer in the pairing QR, such as a Cloudflare Tunnel URL.                             |
+| `CODEX_RELAY_THREAD_LIST_CACHE_TTL_MS` | Short server-side cache for app-server thread list reads. Defaults to `3000`; set to `0` to disable. |
+| `CODEX_RELAY_APP_SERVER_MODE`          | `socket` for shared terminal/mobile sessions; defaults to `stdio`.                                   |
+| `CODEX_BIN`                            | Codex CLI executable path.                                                                           |
+| `CODEX_HOME`                           | Codex home directory for reading local session metadata.                                             |
 
 Background mode writes runtime files under `.codex-relay/` in the current
 workspace, including server logs, process state, and pairing data.

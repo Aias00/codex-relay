@@ -1961,7 +1961,7 @@ describe("Codex Relay server routes", () => {
       "selected-thread",
     ]);
     expect(listThreads).toHaveBeenCalledWith(500);
-    expect(listThreads).toHaveBeenCalledTimes(2);
+    expect(listThreads).toHaveBeenCalledTimes(1);
   });
 
   it("starts a new thread in the selected workspace directory", async () => {

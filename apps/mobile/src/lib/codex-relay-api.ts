@@ -14,6 +14,7 @@ import {
   ListSkillsResponseSchema,
   ListThreadEventsResponseSchema,
   ListThreadsResponseSchema,
+  ListWorkspaceSummariesResponseSchema,
   ListWorkspaceFilesResponseSchema,
   ListWorkspaceDirectoriesResponseSchema,
   PairResponseSchema,
@@ -56,6 +57,7 @@ import {
   type ListSkillsResponse,
   type ListThreadEventsResponse,
   type ListThreadsResponse,
+  type ListWorkspaceSummariesResponse,
   type ListWorkspaceFilesResponse,
   type ListWorkspaceDirectoriesResponse,
   type PushNotificationSettingsResponse,
@@ -724,6 +726,14 @@ export async function listThreads(
     `${apiPaths.threads}${workspaceQuery(options)}`,
     undefined,
     ListThreadsResponseSchema.parse,
+  );
+}
+
+export async function listWorkspaceSummaries(): Promise<ListWorkspaceSummariesResponse> {
+  return request(
+    apiPaths.workspaceSummaries,
+    undefined,
+    ListWorkspaceSummariesResponseSchema.parse,
   );
 }
 

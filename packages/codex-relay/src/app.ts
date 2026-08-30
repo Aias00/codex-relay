@@ -16,6 +16,7 @@ import {
   ListThreadEventsResponseSchema,
   ListThreadsResponseSchema,
   ListWorkspacesResponseSchema,
+  ListWorkspaceSummariesResponseSchema,
   ListWorkspaceFilesResponseSchema,
   ListWorkspaceDirectoriesResponseSchema,
   PairRequestSchema,
@@ -457,6 +458,9 @@ export function createApp(options: AppOptions = {}) {
   const serverEpoch = options.connectionPlan?.serverEpoch ?? randomUUID();
   const threads = new Map<string, ThreadMetadata>();
   const messagesByThreadId = new Map<string, ChatMessage[]>();
+  const appServerThreadListCacheTtlMs = configuredThreadListCacheTtlMs();
+  let appServerThreadListCache: { fetchedAt: number; threads: AppServerThread[] } | undefined;
+  let appServerThreadListRequest: Promise<AppServerThread[]> | undefined;
   const liveThreads = new Map<string, ReturnType<CodexClient["startThread"]>>();
   const pendingApprovals = new Map<string, PendingApproval>();
   const resolvedApprovals = new Map<string, ResolvedApproval>();
@@ -500,6 +504,42 @@ export function createApp(options: AppOptions = {}) {
     appServerRolloutPathsByThreadId.delete(threadId);
     messagesByThreadId.delete(threadId);
   };
+  const invalidateAppServerThreadListCache = () => {
+    appServerThreadListCache = undefined;
+  };
+  const readAppServerThreadList = async () => {
+    if (!appServer) {
+      return [];
+    }
+    const now = Date.now();
+    if (
+      appServerThreadListCache &&
+      now - appServerThreadListCache.fetchedAt < appServerThreadListCacheTtlMs
+    ) {
+      relayDebugLog("threads.list.cache_hit", {
+        ageMs: now - appServerThreadListCache.fetchedAt,
+        threadCount: appServerThreadListCache.threads.length,
+      });
+      return appServerThreadListCache.threads;
+    }
+    if (!appServerThreadListRequest) {
+      const startedAt = now;
+      appServerThreadListRequest = appServer
+        .listThreads(500)
+        .then((nextThreads) => {
+          appServerThreadListCache = { fetchedAt: Date.now(), threads: nextThreads };
+          relayDebugLog("threads.list.cache_refreshed", {
+            durationMs: Date.now() - startedAt,
+            threadCount: nextThreads.length,
+          });
+          return nextThreads;
+        })
+        .finally(() => {
+          appServerThreadListRequest = undefined;
+        });
+    }
+    return appServerThreadListRequest;
+  };
   if (appServer && typeof appServer.onNotification === "function") {
     appServer.onNotification((notification) => {
       const params = recordParams(notification);
@@ -507,6 +547,7 @@ export function createApp(options: AppOptions = {}) {
       if (!threadId) {
         return;
       }
+      invalidateAppServerThreadListCache();
       if (notification.method === "thread/reverted") {
         invalidateAppServerHistory(threadId);
         return;
@@ -1457,6 +1498,64 @@ export function createApp(options: AppOptions = {}) {
     await threadWorkspaceRegistrationTail;
     const response: ListWorkspacesResponse = ListWorkspacesResponseSchema.parse({
       workspaces: (await options.workspaceRegistry?.listWorkspaces()) ?? [],
+    });
+    return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+  });
+
+  app.get(apiPaths.workspaceSummaries, async (c) => {
+    let workspaceRows = (await options.workspaceRegistry?.listWorkspaces()) ?? [];
+    if (appServer && threads.size === 0) {
+      try {
+        const appServerThreads = await readAppServerThreadList();
+        const knownAppServerThreads = appServerThreads
+          .filter((thread) => !isSubagentThread(thread))
+          .map((thread) => rememberAppServerThread(threads, thread));
+        scheduleThreadWorkspaceRegistration(knownAppServerThreads);
+        await threadWorkspaceRegistrationTail;
+        workspaceRows = (await options.workspaceRegistry?.listWorkspaces()) ?? workspaceRows;
+      } catch {
+        // Use the locally remembered summaries while app-server discovery is unavailable.
+      }
+    }
+    const statsByWorkspaceId = new Map<
+      string,
+      { lastActivityAt?: string; runningThreadCount: number; threadCount: number }
+    >();
+    const workspaceByPath = new Map(
+      workspaceRows.map((workspace) => [resolve(workspace.canonicalPath), workspace]),
+    );
+    for (const thread of threads.values()) {
+      const workspace =
+        (thread.workspaceId
+          ? workspaceRows.find((candidate) => candidate.workspaceId === thread.workspaceId)
+          : undefined) ?? (thread.cwd ? workspaceByPath.get(resolve(thread.cwd)) : undefined);
+      if (!workspace) {
+        continue;
+      }
+      const current = statsByWorkspaceId.get(workspace.workspaceId) ?? {
+        lastActivityAt: undefined,
+        runningThreadCount: 0,
+        threadCount: 0,
+      };
+      current.threadCount += 1;
+      if (thread.state === "running") {
+        current.runningThreadCount += 1;
+      }
+      if (
+        thread.lastActivityAt &&
+        (!current.lastActivityAt || thread.lastActivityAt > current.lastActivityAt)
+      ) {
+        current.lastActivityAt = thread.lastActivityAt;
+      }
+      statsByWorkspaceId.set(workspace.workspaceId, current);
+    }
+    const response = ListWorkspaceSummariesResponseSchema.parse({
+      workspaces: workspaceRows.map((workspace) => ({
+        ...workspace,
+        lastActivityAt: statsByWorkspaceId.get(workspace.workspaceId)?.lastActivityAt,
+        runningThreadCount: statsByWorkspaceId.get(workspace.workspaceId)?.runningThreadCount ?? 0,
+        threadCount: statsByWorkspaceId.get(workspace.workspaceId)?.threadCount ?? 0,
+      })),
     });
     return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
   });
@@ -2527,7 +2626,7 @@ export function createApp(options: AppOptions = {}) {
 
     if (appServer) {
       try {
-        const appServerThreads = await appServer.listThreads(500);
+        const appServerThreads = await readAppServerThreadList();
         const knownAppServerThreads = appServerThreads
           .filter((thread) => !isSubagentThread(thread))
           .map((thread) => rememberAppServerThread(threads, thread));
@@ -10429,6 +10528,7 @@ function threadDetailResponse(input: {
 }
 
 const defaultThreadDetailMessageLimit = 300;
+const defaultThreadListCacheTtlMs = 3_000;
 
 function threadDetailMessagePage(
   messages: ChatMessage[],
@@ -10469,6 +10569,18 @@ function configuredThreadDetailMessageLimit() {
     return defaultThreadDetailMessageLimit;
   }
   return Math.floor(limit);
+}
+
+function configuredThreadListCacheTtlMs() {
+  const configured = process.env.CODEX_RELAY_THREAD_LIST_CACHE_TTL_MS?.trim();
+  if (!configured) {
+    return defaultThreadListCacheTtlMs;
+  }
+  const ttlMs = Number(configured);
+  if (!Number.isFinite(ttlMs) || ttlMs < 0) {
+    return defaultThreadListCacheTtlMs;
+  }
+  return Math.floor(ttlMs);
 }
 
 const threadDetailLargeTextPreviewLimit = 8 * 1024;
