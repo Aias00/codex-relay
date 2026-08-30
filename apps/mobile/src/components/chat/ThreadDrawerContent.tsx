@@ -241,6 +241,12 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
     enabled: isDrawerVisible,
     staleTime: threadListStaleTimeMs,
   });
+  const workspaceSummariesQuery = useQuery({
+    queryKey: serverStateKeys.workspaceSummaries(),
+    queryFn: serverStateQueryFns.workspaceSummaries,
+    enabled: isDrawerVisible,
+    staleTime: threadListStaleTimeMs,
+  });
   const versionQuery = useQuery({
     queryKey: serverStateKeys.version(),
     queryFn: serverStateQueryFns.version,
@@ -290,8 +296,16 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
         activeThreadId,
         pinnedThreadIds,
         Boolean(normalizedSearchQuery),
+        workspaceSummariesQuery.data?.workspaces,
       ),
-    [activeThreadId, expandedProjects, normalizedSearchQuery, pinnedThreadIds, visibleThreads],
+    [
+      activeThreadId,
+      expandedProjects,
+      normalizedSearchQuery,
+      pinnedThreadIds,
+      visibleThreads,
+      workspaceSummariesQuery.data?.workspaces,
+    ],
   );
   const workspaceRows = useMemo(() => workspaceBrowserRows(workspaceBrowser), [workspaceBrowser]);
   const threadWithActionsIsPinned = Boolean(

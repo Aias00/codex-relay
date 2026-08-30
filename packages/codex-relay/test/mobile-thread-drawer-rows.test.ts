@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ThreadSummary } from "../src/api-schema.js";
+import type { ThreadSummary, WorkspaceSummary } from "../src/api-schema.js";
 
 import { buildDrawerRows } from "../../../apps/mobile/src/components/chat/thread-drawer-rows.js";
 
@@ -179,6 +179,20 @@ describe("mobile thread drawer rows", () => {
       },
     ]);
   });
+
+  it("renders cached workspace summaries before thread rows arrive", () => {
+    const summaries = [workspaceSummary("workspace-a", "/work/project-a")];
+
+    expect(buildDrawerRows([], {}, undefined, [], false, summaries)).toEqual([
+      {
+        id: "project:workspace-a",
+        kind: "project",
+        projectKey: "workspace-a",
+        title: "project-a",
+        workspacePath: "/work/project-a",
+      },
+    ]);
+  });
 });
 
 function threadSummary(id: string, cwd?: string): ThreadSummary {
@@ -191,6 +205,20 @@ function threadSummary(id: string, cwd?: string): ThreadSummary {
     state: "completed",
     cwd,
     messageCount: 0,
+  };
+}
+
+function workspaceSummary(workspaceId: string, canonicalPath: string): WorkspaceSummary {
+  const now = "2026-08-05T00:00:00.000Z";
+  return {
+    canonicalPath,
+    createdAt: now,
+    displayName: canonicalPath.split("/").at(-1)!,
+    lastSeenAt: now,
+    runningThreadCount: 0,
+    state: "available",
+    threadCount: 0,
+    workspaceId,
   };
 }
 
