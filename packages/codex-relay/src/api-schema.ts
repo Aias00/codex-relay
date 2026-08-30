@@ -800,6 +800,7 @@ export const ThreadDetailResponseSchema = z.object({
 
 export const ThreadDetailQuerySchema = z.object({
   beforeMessageId: z.string().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(300).optional(),
   refresh: z.enum(["true", "false"]).optional(),
 });
 
@@ -1401,6 +1402,11 @@ export function createOpenApiDocument() {
               name: "beforeMessageId",
               in: "query",
               schema: { type: "string" },
+            },
+            {
+              name: "limit",
+              in: "query",
+              schema: { type: "integer", minimum: 1, maximum: 300 },
             },
           ],
           responses: {

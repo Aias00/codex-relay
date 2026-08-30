@@ -3135,6 +3135,7 @@ export function createApp(options: AppOptions = {}) {
     }
     const forceRefresh = parsedQuery.data.refresh === "true";
     const beforeMessageId = parsedQuery.data.beforeMessageId;
+    const messageLimit = parsedQuery.data.limit;
     const detailStartedAt = Date.now();
     relayDebugLog("thread.detail.requested", {
       threadId,
@@ -3241,6 +3242,7 @@ export function createApp(options: AppOptions = {}) {
         }
 
         const response = threadDetailResponse({
+          messageLimit,
           thread: await withCurrentThreadOwnerEpoch(responseThread),
           messages: messagesWithPendingApprovals(messages, pendingApprovals, threadId),
           pendingInputRequests: pendingInputRequestsForThread(pendingApprovals, threadId),
@@ -3290,6 +3292,7 @@ export function createApp(options: AppOptions = {}) {
       );
       messagesByThreadId.set(threadId, messages);
       const response = threadDetailResponse({
+        messageLimit,
         thread: await withCurrentThreadOwnerEpoch(responseThread),
         messages: messagesWithPendingApprovals(messages, pendingApprovals, threadId),
         pendingInputRequests: pendingInputRequestsForThread(pendingApprovals, threadId),
@@ -3325,6 +3328,7 @@ export function createApp(options: AppOptions = {}) {
       options.pairing,
       secureSessionsByTokenHash,
       threadDetailResponse({
+        messageLimit,
         thread: await withCurrentThreadOwnerEpoch(thread),
         messages: messagesWithPendingApprovals(
           messagesByThreadId.get(threadId) ?? [],
@@ -10411,11 +10415,12 @@ function isRolloutMessageLine(line: string) {
 
 function threadDetailResponse(input: {
   beforeMessageId?: string;
+  messageLimit?: number;
   messages: ChatMessage[];
   pendingInputRequests: PendingInputRequest[];
   thread: ThreadMetadata;
 }) {
-  const page = threadDetailMessagePage(input.messages, input.beforeMessageId);
+  const page = threadDetailMessagePage(input.messages, input.beforeMessageId, input.messageLimit);
   return ThreadDetailResponseSchema.parse({
     thread: input.thread,
     ...page,
@@ -10425,8 +10430,18 @@ function threadDetailResponse(input: {
 
 const defaultThreadDetailMessageLimit = 300;
 
-function threadDetailMessagePage(messages: ChatMessage[], beforeMessageId?: string) {
-  const limit = configuredThreadDetailMessageLimit();
+function threadDetailMessagePage(
+  messages: ChatMessage[],
+  beforeMessageId?: string,
+  requestedLimit?: number,
+) {
+  const configuredLimit = configuredThreadDetailMessageLimit();
+  const limit =
+    requestedLimit === undefined
+      ? configuredLimit
+      : configuredLimit > 0
+        ? Math.min(requestedLimit, configuredLimit)
+        : requestedLimit;
   if (!limit || messages.length <= limit) {
     return { hasOlderMessages: false, messages };
   }

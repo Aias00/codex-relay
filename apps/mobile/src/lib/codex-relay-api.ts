@@ -144,6 +144,7 @@ const legacyClientTokenExpiresAtStorageKey = "codex-relay.client-token-expires-a
 const clientTokenStorageKey = "codex-relay.client-token";
 const pairingConnectTimeoutMs = 2500;
 const fullThreadRefreshTimeoutMs = 45_000;
+const mobileThreadDetailMessageLimit = 100;
 const streamRequestTimeoutMs = 10 * 60 * 1000;
 const terminalStreamRequestTimeoutMs = 24 * 60 * 60 * 1000;
 
@@ -1094,7 +1095,7 @@ export async function getRateLimits(): Promise<RateLimitsResponse> {
 
 export async function getThread(
   threadId: string,
-  options: { beforeMessageId?: string; refresh?: boolean } = {},
+  options: { beforeMessageId?: string; limit?: number; refresh?: boolean } = {},
 ): Promise<ThreadDetailResponse> {
   const query = new URLSearchParams();
   if (options.beforeMessageId) {
@@ -1103,6 +1104,7 @@ export async function getThread(
   if (options.refresh) {
     query.set("refresh", "true");
   }
+  query.set("limit", String(options.limit ?? mobileThreadDetailMessageLimit));
   const path = query.size > 0 ? `${apiPaths.thread(threadId)}?${query}` : apiPaths.thread(threadId);
   return request(path, undefined, ThreadDetailResponseSchema.parse, {
     timeoutMs: options.refresh ? fullThreadRefreshTimeoutMs : undefined,

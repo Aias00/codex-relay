@@ -8978,32 +8978,33 @@ describe("Codex Relay server routes", () => {
 
     try {
       await app.request("/v1/threads");
-      const response = await app.request("/v1/threads/app-thread-capped");
+      const response = await app.request("/v1/threads/app-thread-capped?limit=2");
       const body = await response.json();
 
       expect(response.status).toBe(200);
       expect(body.thread.messageCount).toBe(5);
       expect(body.messages.map((message: { content: string }) => message.content)).toEqual([
-        "Message 2",
         "Message 3",
         "Message 4",
       ]);
       expect(body).toMatchObject({
         hasOlderMessages: true,
-        olderMessagesCursor: "user-capped-2",
+        olderMessagesCursor: "user-capped-3",
       });
 
       const olderResponse = await app.request(
-        "/v1/threads/app-thread-capped?beforeMessageId=user-capped-2",
+        "/v1/threads/app-thread-capped?beforeMessageId=user-capped-3&limit=2",
       );
       const olderBody = await olderResponse.json();
       expect(olderResponse.status).toBe(200);
       expect(olderBody.messages.map((message: { content: string }) => message.content)).toEqual([
-        "Message 0",
         "Message 1",
+        "Message 2",
       ]);
-      expect(olderBody).toMatchObject({ hasOlderMessages: false });
-      expect(olderBody).not.toHaveProperty("olderMessagesCursor");
+      expect(olderBody).toMatchObject({
+        hasOlderMessages: true,
+        olderMessagesCursor: "user-capped-1",
+      });
     } finally {
       if (previousLimit === undefined) {
         delete process.env.CODEX_RELAY_THREAD_DETAIL_MESSAGE_LIMIT;
