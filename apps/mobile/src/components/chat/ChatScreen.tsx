@@ -11,6 +11,7 @@ import type {
   RuntimePreferences,
   StreamThreadRunEvent,
   StreamThreadRunRequest,
+  ThreadDetailResponse,
   ThreadCollaborationMode,
   ThreadSummary,
   WebPreviewTarget,
@@ -105,6 +106,7 @@ import {
   fetchWorkspaceChangesState,
   hydrateOlderThreadMessagesState,
   optimisticallySteerQueuedInputState,
+  prefetchThreadDetailsState,
   removePendingInputRequestState,
   removeQueuedThreadInputServerState,
   replayThreadEventsState,
@@ -163,6 +165,7 @@ import {
   setServerUrl,
   setThreadCollaborationMode,
   setThreadMessagesLoading,
+  setThreadSyncState,
   type LocalPromptAttachment,
   type QueuedComposerPrompt,
 } from "@/state/chat-store";
@@ -493,6 +496,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   const threadMessagesLoadingByThreadId = useSelector(() =>
     chatStore$.threadMessagesLoadingByThreadId.get(),
   );
+  const threadSyncStateByThreadId = useSelector(() => chatStore$.threadSyncStateByThreadId.get());
   const threadStreamReconnectRequest = useSelector(() =>
     chatStore$.threadStreamReconnectRequest.get(),
   );
@@ -705,11 +709,14 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   const syncThreadSnapshot = useCallback(
     async (threadId: string, options: { refresh?: boolean; setOfflineOnError?: boolean } = {}) => {
       const setOfflineOnError = options.setOfflineOnError ?? true;
-      const cachedDetail = queryClient.getQueryData(
+      const cachedDetail = queryClient.getQueryData<ThreadDetailResponse>(
         serverStateKeys.thread(threadId, selectedWorkspaceSelection),
       );
+      const hasCachedMessages = Boolean(cachedDetail?.messages.length);
+      setThreadSyncState(threadId, hasCachedMessages ? "cached" : "syncing");
       setThreadMessagesLoading(threadId, shouldBlockThreadActivation(cachedDetail));
       try {
+        setThreadSyncState(threadId, "syncing");
         const response = await fetchThreadState(
           queryClient,
           threadId,
@@ -730,13 +737,22 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             replaceMessages: options.refresh,
           },
         );
-        void hydrateOlderThreadMessagesState(queryClient, threadId).catch(() => undefined);
+        const olderHistoryHydration = response.hasOlderMessages
+          ? hydrateOlderThreadMessagesState(queryClient, threadId)
+          : Promise.resolve();
+        setThreadSyncState(threadId, response.hasOlderMessages ? "hydrating-history" : "syncing");
+        void olderHistoryHydration
+          .then(() => setThreadSyncState(threadId, "synced"))
+          .catch(() => setThreadSyncState(threadId, "stale"));
         await replayThreadEventsState(queryClient, threadId).catch(() => undefined);
         const synchronizedThread =
           queryClient.getQueryData<Awaited<ReturnType<typeof serverStateQueryFns.thread>>>(
             serverStateKeys.thread(threadId, selectedWorkspaceSelection),
           )?.thread ?? response.thread;
         setThreadMessagesLoading(threadId, false);
+        if (!response.hasOlderMessages) {
+          setThreadSyncState(threadId, "synced");
+        }
         await Promise.all([
           fetchQueuedInputsState(queryClient, threadId).catch(() => undefined),
           fetchContextWindowState(queryClient, threadId).catch(() => undefined),
@@ -745,6 +761,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         setConnection("connected");
         return synchronizedThread.state;
       } catch (caught) {
+        setThreadSyncState(threadId, "stale");
         syncPairedSessionState();
         if (setOfflineOnError && chatStore$.activeThreadId.peek() === threadId) {
           setConnection("offline", errorMessage(caught));
@@ -843,6 +860,15 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
           queryClient.setQueryData(serverStateKeys.rateLimits(), rateLimitsResponse);
         }
         const currentActiveThreadId = chatStore$.activeThreadId.peek();
+        void prefetchThreadDetailsState(
+          queryClient,
+          response.threads,
+          {
+            workspaceId: chatStore$.workspaceId.peek(),
+            workspacePath: chatStore$.workspacePath.peek(),
+          },
+          currentActiveThreadId,
+        ).catch(() => undefined);
         const preferFirstThread = consumeHydratedDefaultThread(currentActiveThreadId);
         const hasCurrentActiveThread =
           !!currentActiveThreadId &&
@@ -2587,6 +2613,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             hasPairedSession={hasPairedSession}
             serverUrl={serverUrl}
             workspacePath={workspacePath}
+            syncState={activeThreadId ? threadSyncStateByThreadId[activeThreadId] : undefined}
             onRefresh={refresh}
             onScanConnect={openScanner}
           />

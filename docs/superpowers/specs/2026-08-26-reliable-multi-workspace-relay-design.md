@@ -176,6 +176,13 @@ Checkpoint 21 closes the current runtime-preference acknowledgement UX:
 
 Optional Desktop Bridge is deferred as a separate vertical integration. Shared app-server is the supported desktop-session path. A bridge will only be implemented together with a real desktop runtime adapter that can register, heartbeat, publish canonical events, accept or queue input, and acknowledge controls; Relay-only registration endpoints would be unusable scaffolding and an unnecessary local attack surface.
 
+Checkpoint 22 improves mobile conversation responsiveness without changing server contracts:
+
+- Workspace refresh opportunistically prefetches up to four likely-to-open thread snapshots with concurrency capped at two; running threads receive priority, while the active thread is excluded because its foreground hydration owns the latest request.
+- Prefetch failures are isolated from the active screen and never replace cached content or connection state.
+- Thread hydration exposes cache, latest-sync, older-history hydration, synced, and stale states. Cached messages remain visible while network work continues, and older pagination runs in the background.
+- The conversation list continues using the existing virtualized `LegendList` and memoized message bubbles; no new list dependency or risky recycling behavior is introduced.
+
 Prompt-stream token deltas are persisted before delivery through the durable publisher. Attach streams intentionally do not republish deltas because multiple subscribers would create duplicate durable events; recovered turns persist completed canonical items and terminal snapshots.
 
 ## Summary

@@ -22,6 +22,7 @@ import {
 import { resetWorkspacePreviewState } from "./workspace-preview-store";
 
 type ConnectionState = "checking" | "connected" | "offline";
+export type ThreadSyncState = "cached" | "syncing" | "hydrating-history" | "synced" | "stale";
 
 export type ComposerAttachment = {
   id: string;
@@ -49,6 +50,7 @@ type ChatState = {
   error?: string;
   hasPairedSession: boolean;
   threadMessagesLoadingByThreadId: Record<string, boolean>;
+  threadSyncStateByThreadId: Record<string, ThreadSyncState>;
   threadStreamReconnectRequest?: {
     requestId: number;
     threadId: string;
@@ -82,6 +84,7 @@ export const chatStore$ = observable<ChatState>({
   error: undefined,
   hasPairedSession: false,
   threadMessagesLoadingByThreadId: {},
+  threadSyncStateByThreadId: {},
   threadStreamReconnectRequest: undefined,
   machineName: undefined,
   contextUsageByThreadId: {},
@@ -350,6 +353,15 @@ export function setThreadMessagesLoading(threadId: string | undefined, isLoading
   });
 }
 
+export function setThreadSyncState(threadId: string | undefined, state: ThreadSyncState) {
+  if (!threadId) {
+    return;
+  }
+  chatStore$.threadSyncStateByThreadId.set((current) =>
+    current[threadId] === state ? current : { ...current, [threadId]: state },
+  );
+}
+
 export function setModels(models: CodexModel[]) {
   chatStore$.models.set(models);
   const selectedModel = chatStore$.selectedModel.peek();
@@ -477,6 +489,7 @@ export function resetChatSessionState() {
   chatStore$.error.set("Pair with your computer to continue.");
   chatStore$.hasPairedSession.set(false);
   chatStore$.threadMessagesLoadingByThreadId.set({});
+  chatStore$.threadSyncStateByThreadId.set({});
   chatStore$.threadStreamReconnectRequest.set(undefined);
   chatStore$.contextUsageByThreadId.set({});
   chatStore$.messagesByThreadId.set({});
@@ -721,6 +734,7 @@ function moveThreadScopedState(sourceThreadId: string, targetThreadId: string) {
   moveRecordValue(chatStore$.contextUsageByThreadId, sourceThreadId, targetThreadId);
   moveRecordValue(chatStore$.queuedPromptsByThreadId, sourceThreadId, targetThreadId);
   moveRecordValue(chatStore$.threadMessagesLoadingByThreadId, sourceThreadId, targetThreadId);
+  moveRecordValue(chatStore$.threadSyncStateByThreadId, sourceThreadId, targetThreadId);
 }
 
 function moveRecordValue<T>(

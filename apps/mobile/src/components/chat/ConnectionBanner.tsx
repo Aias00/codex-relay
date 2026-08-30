@@ -7,6 +7,8 @@ import { Button } from "@/components/ui/button";
 import { CopyableCommand } from "@/components/ui/copyable-command";
 import { Icon } from "@/components/ui/icon";
 import { workspaceName } from "@/lib/workspace-name";
+import { threadSyncLabel } from "@/lib/thread-sync-state";
+import type { ThreadSyncState } from "@/state/chat-store";
 
 import { relayStartCommand } from "./pairing-commands";
 
@@ -19,6 +21,7 @@ export function ConnectionBanner({
   onRefresh,
   onScanConnect,
   serverUrl,
+  syncState,
   workspacePath,
 }: {
   connection: "checking" | "connected" | "offline";
@@ -27,6 +30,7 @@ export function ConnectionBanner({
   onRefresh: () => void;
   onScanConnect: () => void;
   serverUrl: string;
+  syncState?: ThreadSyncState;
   workspacePath?: string;
 }) {
   const isConnected = connection === "connected";
@@ -71,6 +75,24 @@ export function ConnectionBanner({
             </View>
           </View>
         </Animated.View>
+      </Animated.View>
+    );
+  }
+
+  if (isConnected && syncState && syncState !== "synced") {
+    return (
+      <Animated.View
+        entering={connectionBannerEnterTransition}
+        exiting={connectionBannerExitTransition}
+        layout={connectionBannerLayoutTransition}
+        style={styles.container}
+      >
+        <View style={styles.syncStrip}>
+          <View style={styles.syncStatusDot} />
+          <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>
+            {threadSyncLabel(syncState)}
+          </ThemedText>
+        </View>
       </Animated.View>
     );
   }
@@ -283,6 +305,20 @@ const styles = StyleSheet.create({
     gap: 12,
     padding: 12,
     position: "relative",
+  },
+  syncStatusDot: {
+    backgroundColor: "#7CC7FF",
+    borderRadius: 4,
+    height: 7,
+    width: 7,
+  },
+  syncStrip: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: 7,
+    justifyContent: "center",
+    minHeight: 24,
+    paddingHorizontal: 18,
   },
   pairHeader: {
     minHeight: 37,

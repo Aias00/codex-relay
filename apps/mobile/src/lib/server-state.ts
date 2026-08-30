@@ -69,12 +69,14 @@ import {
   type ThreadEventApplyResult,
   type ThreadEventCursor,
 } from "./thread-event-reducer";
+import { threadDetailSwitchStaleTimeMs } from "./thread-activation";
 import {
   appendOptimisticSteeringMessageToDetail,
   mergeThreadDetailState,
   preferredThreadSnapshot,
   upsertMessage,
 } from "./server-state-messages";
+import { prioritizeThreadPrefetch, runBoundedThreadPrefetch } from "./thread-prefetch";
 
 export const serverStateKeys = {
   all: () => [serverStateRootKey, getCodexRelayServerUrl()] as const,
@@ -178,6 +180,34 @@ export async function fetchThreadState(
     response;
   upsertThreadState(queryClient, merged.thread);
   return merged;
+}
+
+export async function prefetchThreadDetailsState(
+  queryClient: QueryClient,
+  threads: ThreadSummary[],
+  selection: WorkspaceCacheSelection | string | undefined,
+  activeThreadId?: string,
+) {
+  const normalized = normalizeWorkspaceCacheSelection(selection);
+  const candidates = prioritizeThreadPrefetch(threads, activeThreadId, 4);
+  await runBoundedThreadPrefetch(candidates, async (candidate) => {
+    const threadSelection = selectionForThread(candidate, normalized);
+    const response = await queryClient.fetchQuery({
+      queryKey: serverStateKeys.thread(candidate.id, threadSelection),
+      queryFn: () => getThread(candidate.id),
+      staleTime: threadDetailSwitchStaleTimeMs,
+    });
+    setThreadDetailState(
+      queryClient,
+      response.thread,
+      response.messages,
+      response.pendingInputRequests,
+      {
+        hasOlderMessages: response.hasOlderMessages,
+        olderMessagesCursor: response.olderMessagesCursor,
+      },
+    );
+  });
 }
 
 export function fetchQueuedInputsState(queryClient: QueryClient, threadId: string) {
