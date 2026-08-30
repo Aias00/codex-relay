@@ -246,12 +246,11 @@ function isLocalIPv6Host(host: string) {
 }
 
 function getTailscaleStatus() {
+  const output = execTailscaleJson(["status", "--json"]);
+  if (!output) {
+    return undefined;
+  }
   try {
-    const output = execFileSync("tailscale", ["status", "--json"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 1500,
-    });
     return JSON.parse(output) as {
       Self?: {
         DNSName?: string;
@@ -264,12 +263,11 @@ function getTailscaleStatus() {
 }
 
 function getTailscaleServeHttpsUrl(dnsName: string, port: number) {
+  const output = execTailscaleJson(["serve", "status", "--json"]);
+  if (!output) {
+    return undefined;
+  }
   try {
-    const output = execFileSync("tailscale", ["serve", "status", "--json"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 1500,
-    });
     const serveStatus = JSON.parse(output) as {
       TCP?: Record<string, { HTTPS?: boolean }>;
       Web?: Record<string, unknown>;
@@ -282,4 +280,27 @@ function getTailscaleServeHttpsUrl(dnsName: string, port: number) {
   } catch {
     return undefined;
   }
+}
+
+function execTailscaleJson(args: string[]) {
+  const commands = [
+    process.env.CODEX_RELAY_TAILSCALE_BIN?.trim(),
+    "tailscale",
+    "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+    "/usr/bin/tailscale",
+  ].filter((command): command is string => Boolean(command));
+
+  for (const command of commands) {
+    try {
+      return execFileSync(command, args, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1500,
+      });
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
 }

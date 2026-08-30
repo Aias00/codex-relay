@@ -479,7 +479,7 @@ export async function refreshSession() {
   if (!hasCodexRelaySession()) {
     return false;
   }
-  await refreshCodexRelayConnectionPlan({ force: true }).catch(() => undefined);
+  await refreshCodexRelayConnectionPlan().catch(() => undefined);
   return true;
 }
 
