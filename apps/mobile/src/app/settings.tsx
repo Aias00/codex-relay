@@ -5,7 +5,7 @@ import Constants from "expo-constants";
 import { router } from "expo-router";
 import { Heart } from "lucide-react-native";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Linking, Pressable, ScrollView, Switch, View } from "react-native";
+import { Alert, Linking, Pressable, ScrollView, Share, Switch, View } from "react-native";
 import Animated, { FadeIn, FadeOut, LinearTransition } from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { StyleSheet } from "react-native-unistyles";
@@ -23,6 +23,7 @@ import { Colors, Fonts, MaxContentWidth, Spacing } from "@/constants/theme";
 import {
   getCodexRelayServerUrlCandidates,
   getPushNotificationSettings,
+  probeCodexRelayServerUrl,
   registerPushNotifications,
   refreshSession,
   setCodexRelayServerUrl,
@@ -30,6 +31,7 @@ import {
   unregisterPushNotifications,
   type CodexRelayServerUrlCandidate,
 } from "@/lib/codex-relay-api";
+import { transportBenchmarkRouteForServerUrl } from "@/lib/codex-relay-connection-plan";
 import { hapticSelection, hapticWarning } from "@/lib/haptics";
 import {
   clearHotUpdaterLogs,
@@ -54,6 +56,12 @@ import {
   setStatusState,
 } from "@/lib/server-state";
 import { chatStore$, resetChatSessionState, setConnection, setServerUrl } from "@/state/chat-store";
+import {
+  clearMobileTransportBenchmarks,
+  exportMobileTransportBenchmarksJsonl,
+  listMobileTransportBenchmarks,
+  recordMobileTransportBenchmark,
+} from "@/lib/transport-benchmark";
 
 import mobilePackage from "../../package.json";
 
@@ -112,6 +120,9 @@ export default function SettingsScreen() {
   );
   const [pushNotificationsLoading, setPushNotificationsLoading] = useState(false);
   const [pushNotificationsUpdating, setPushNotificationsUpdating] = useState(false);
+  const [transportSampleCount, setTransportSampleCount] = useState(
+    () => listMobileTransportBenchmarks().length,
+  );
   const pushNotificationsSupported = supportsPushNotifications();
   const rateLimitRows = visibleRateLimitRows(rateLimitsQuery.data?.buckets ?? []);
   const isAppUpdatePending =
@@ -180,6 +191,10 @@ export default function SettingsScreen() {
   useEffect(() => {
     setServerUrlCandidates(getCodexRelayServerUrlCandidates());
   }, [serverUrl]);
+
+  useEffect(() => {
+    setTransportSampleCount(listMobileTransportBenchmarks().length);
+  }, [connection, serverUrl]);
 
   useEffect(() => {
     let isActive = true;
@@ -271,6 +286,19 @@ export default function SettingsScreen() {
     }
 
     hapticSelection();
+    const benchmarkRoute = transportBenchmarkRouteForServerUrl(candidate.url);
+    const benchmarkStartedAt = Date.now();
+    const benchmarkProbe = benchmarkRoute
+      ? probeCodexRelayServerUrl(candidate.url)
+          .then((health) => ({
+            durationMs: Math.max(0, Date.now() - benchmarkStartedAt),
+            success: Boolean(health?.ok),
+          }))
+          .catch(() => ({
+            durationMs: Math.max(0, Date.now() - benchmarkStartedAt),
+            success: false,
+          }))
+      : undefined;
     setSwitchingServerUrl(candidate.url);
     const normalizedServerUrl = setCodexRelayServerUrl(candidate.url);
     setServerUrl(normalizedServerUrl);
@@ -291,6 +319,16 @@ export default function SettingsScreen() {
       setConnection("offline", message);
       Alert.alert("Server unavailable", message);
     } finally {
+      if (benchmarkRoute && benchmarkProbe) {
+        const benchmark = await benchmarkProbe;
+        recordMobileTransportBenchmark({
+          durationMs: benchmark.durationMs,
+          route: benchmarkRoute,
+          scenario: "connect",
+          success: benchmark.success,
+        });
+        setTransportSampleCount(listMobileTransportBenchmarks().length);
+      }
       setSwitchingServerUrl(undefined);
     }
   }
@@ -330,6 +368,39 @@ export default function SettingsScreen() {
   function openProjectLink(url: string) {
     hapticSelection();
     void Linking.openURL(url);
+  }
+
+  async function shareTransportBenchmarks() {
+    const jsonl = exportMobileTransportBenchmarksJsonl();
+    if (!jsonl) {
+      Alert.alert("No transport samples", "Run a connection check before exporting diagnostics.");
+      return;
+    }
+    hapticSelection();
+    try {
+      await Share.share({ message: jsonl, title: "Codex Relay transport benchmarks" });
+    } catch (caught) {
+      hapticWarning();
+      Alert.alert("Unable to export", settingsErrorMessage(caught));
+    }
+  }
+
+  function confirmClearTransportBenchmarks() {
+    if (transportSampleCount === 0) {
+      return;
+    }
+    hapticWarning();
+    Alert.alert("Clear transport samples?", `${transportSampleCount} samples will be removed.`, [
+      { style: "cancel", text: "Cancel" },
+      {
+        onPress() {
+          clearMobileTransportBenchmarks();
+          setTransportSampleCount(0);
+        },
+        style: "destructive",
+        text: "Clear",
+      },
+    ]);
   }
 
   return (
@@ -624,6 +695,51 @@ export default function SettingsScreen() {
               </Pressable>
             </Animated.View>
           ) : null}
+
+          <Animated.View layout={settingsLayoutTransition} style={styles.section}>
+            <ThemedText type="small" themeColor="textSecondary" style={styles.sectionLabel}>
+              Diagnostics
+            </ThemedText>
+            <View style={styles.diagnosticsPanel}>
+              <View style={styles.diagnosticsRow}>
+                <View style={styles.diagnosticsCopy}>
+                  <ThemedText type="smallBold" style={styles.diagnosticsTitle}>
+                    Transport samples
+                  </ThemedText>
+                  <ThemedText
+                    type="small"
+                    themeColor="textSecondary"
+                    style={styles.diagnosticsSubtitle}
+                  >
+                    {transportSampleCount} captured
+                  </ThemedText>
+                </View>
+                <View style={styles.diagnosticsActions}>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Export transport samples"
+                    onPress={() => void shareTransportBenchmarks()}
+                    style={({ pressed }) => [styles.diagnosticsButton, pressed && styles.pressed]}
+                  >
+                    <Icon name="upload" size={16} tintColor={Colors.dark.text} />
+                  </Pressable>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Clear transport samples"
+                    disabled={transportSampleCount === 0}
+                    onPress={confirmClearTransportBenchmarks}
+                    style={({ pressed }) => [
+                      styles.diagnosticsButton,
+                      transportSampleCount === 0 && styles.diagnosticsButtonDisabled,
+                      pressed && styles.pressed,
+                    ]}
+                  >
+                    <Icon name="trash" size={16} tintColor="#FFB4A8" />
+                  </Pressable>
+                </View>
+              </View>
+            </View>
+          </Animated.View>
 
           <Animated.View layout={settingsLayoutTransition} style={styles.versionFooter}>
             <Animated.View layout={settingsLayoutTransition} style={styles.versionRow}>
@@ -1257,6 +1373,50 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     borderWidth: 1,
     overflow: "hidden",
+  },
+  diagnosticsPanel: {
+    backgroundColor: Colors.dark.backgroundElement,
+    borderColor: "rgba(255, 255, 255, 0.09)",
+    borderRadius: 8,
+    borderWidth: 1,
+  },
+  diagnosticsRow: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: Spacing.two,
+    minHeight: 64,
+    paddingHorizontal: Spacing.three,
+    paddingVertical: 10,
+  },
+  diagnosticsCopy: {
+    flex: 1,
+    gap: 2,
+    minWidth: 0,
+  },
+  diagnosticsTitle: {
+    fontSize: 14,
+    lineHeight: 19,
+  },
+  diagnosticsSubtitle: {
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  diagnosticsActions: {
+    flexDirection: "row",
+    gap: Spacing.one,
+  },
+  diagnosticsButton: {
+    alignItems: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.05)",
+    borderColor: "rgba(255, 255, 255, 0.11)",
+    borderRadius: 7,
+    borderWidth: 1,
+    height: 36,
+    justifyContent: "center",
+    width: 36,
+  },
+  diagnosticsButtonDisabled: {
+    opacity: 0.4,
   },
   notificationIntro: {
     fontSize: 12,

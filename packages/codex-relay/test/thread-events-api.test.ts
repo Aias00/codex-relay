@@ -341,6 +341,102 @@ describe("thread event replay API", () => {
     expect(assistant?.event).toMatchObject({ message: { content: "first second" } });
   });
 
+  it("continues persisting app-server notifications after the mobile run stream is cancelled", async () => {
+    const events = await createRelayStateStore(":memory:");
+    const notificationHandlers = new Set<(notification: unknown) => void>();
+    const now = Date.now() / 1000;
+    const threadId = "app-thread-disconnected-stream";
+    let subscribed = false;
+    let markTurnStarted!: () => void;
+    const turnStarted = new Promise<void>((resolve) => {
+      markTurnStarted = resolve;
+    });
+    const appThread = {
+      id: threadId,
+      createdAt: now,
+      cwd: process.cwd(),
+      modelProvider: "gpt-5.5",
+      name: "Disconnected app-server stream",
+      preview: "Existing TUI message",
+      source: "cli",
+      status: { type: "idle" },
+      turns: [],
+      updatedAt: now,
+    };
+    const appServer = {
+      isThreadSubscribed: () => subscribed,
+      onNotification(handler: (notification: unknown) => void) {
+        notificationHandlers.add(handler);
+        return () => notificationHandlers.delete(handler);
+      },
+      onRequest() {
+        return () => undefined;
+      },
+      readThread: async () => appThread,
+      async resumeThread() {
+        subscribed = true;
+        return appThread;
+      },
+      async startTurn() {
+        markTurnStarted();
+        return {
+          id: "turn-disconnected-stream",
+          items: [],
+          status: "inProgress",
+          startedAt: now,
+          completedAt: null,
+        };
+      },
+    };
+    const app = createApp({ appServer: appServer as never, threadEvents: events });
+    const response = await app.request(apiPaths.threadRunStream(threadId), {
+      body: JSON.stringify({ prompt: "Finish after disconnect" }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    const reader = response.body?.getReader();
+
+    expect(reader).toBeDefined();
+    await reader!.read();
+    await turnStarted;
+    await reader!.cancel("mobile switched to durable events");
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "item/agentMessage/delta",
+        params: {
+          delta: "app-server reply after disconnect",
+          itemId: "assistant-disconnected-stream",
+          threadId,
+          turnId: "turn-disconnected-stream",
+        },
+      });
+      handler({
+        method: "turn/completed",
+        params: {
+          threadId,
+          turn: {
+            id: "turn-disconnected-stream",
+            items: [],
+            status: "completed",
+            error: null,
+            startedAt: now,
+            completedAt: now,
+          },
+        },
+      });
+    }
+
+    const replay = await waitForCompletedReplay(events, threadId);
+    expect(replay).toContainEqual(
+      expect.objectContaining({
+        event: expect.objectContaining({
+          type: "thread.message.delta",
+          delta: "app-server reply after disconnect",
+        }),
+      }),
+    );
+  });
+
   it("keeps attach streams live without recording duplicate durable events", async () => {
     const events = await createRelayStateStore(":memory:");
     const appendThreadEvent = vi.spyOn(events, "appendThreadEvent");
@@ -396,6 +492,78 @@ describe("thread event replay API", () => {
     expect(streamedEvents.map((event) => event.type)).toContain("thread.state.changed");
     expect(appendThreadEvent).not.toHaveBeenCalled();
     expect(replay.events).toEqual([]);
+  });
+
+  it("persists terminal events for externally owned app-server turns", async () => {
+    const events = await createRelayStateStore(":memory:");
+    const notificationHandlers = new Set<(notification: never) => void>();
+    const now = Date.now() / 1000;
+    const threadId = "external-tui-thread";
+    const completedTurn = {
+      id: "external-tui-turn",
+      items: [
+        {
+          id: "external-tui-assistant",
+          text: "External turn completed",
+          type: "agentMessage",
+        },
+      ],
+      status: "completed",
+      error: null,
+      startedAt: now,
+      completedAt: now,
+    };
+    const appServerThread = {
+      id: threadId,
+      createdAt: now,
+      cwd: process.cwd(),
+      modelProvider: "gpt-5.5",
+      name: "External TUI thread",
+      preview: "External TUI thread",
+      source: "cli",
+      status: { type: "active" },
+      turns: [],
+      updatedAt: now,
+    };
+    const appServer = {
+      onNotification(handler: (notification: never) => void) {
+        notificationHandlers.add(handler);
+        return () => notificationHandlers.delete(handler);
+      },
+      onRequest() {
+        return () => undefined;
+      },
+      async readThread() {
+        return appServerThread;
+      },
+    };
+    createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      threadEvents: events,
+    });
+
+    appServerThread.status = { type: "idle" };
+    appServerThread.turns = [completedTurn] as never;
+    for (const handler of notificationHandlers) {
+      const notification = {
+        method: "turn/completed",
+        params: { threadId, turn: completedTurn },
+      } as never;
+      handler(notification);
+      handler(notification);
+    }
+
+    const replay = await waitForCompletedReplay(events, threadId);
+
+    expect(replay.map((item) => item.event.type)).toEqual([
+      "thread.message.completed",
+      "thread.state.changed",
+    ]);
+    expect(replay.at(-1)?.event).toMatchObject({
+      type: "thread.state.changed",
+      thread: { id: threadId, state: "completed" },
+    });
   });
 });
 

@@ -42,13 +42,48 @@ describe("connection plan", () => {
       relayId: "relay-stable",
       serverEpoch: "epoch-current",
     });
-    expect(plan.candidates.map(({ kind, url }) => [kind, url])).toEqual([
+    expect(
+      plan.candidates.filter((candidate) => "url" in candidate).map(({ kind, url }) => [kind, url]),
+    ).toEqual([
       ["public_https", "https://relay.example.com"],
       ["tailscale", "http://100.126.212.81:8788"],
       ["lan", "http://192.168.31.114:8788"],
       ["link_local", "http://169.254.4.20:8788"],
     ]);
     expect(new Set(plan.candidates.map((candidate) => candidate.routeId)).size).toBe(4);
+  });
+
+  it("adds a Tailcat candidate without changing HTTP candidate shapes", () => {
+    const plan = createConnectionPlan({
+      candidates: [{ label: "Public", url: "https://relay.example.com" }],
+      relayId: "relay-tailcat",
+      serverEpoch: "epoch-tailcat",
+      tailcatCandidates: [
+        {
+          localTargetPort: 8788,
+          priority: 550,
+          routeId: "route-tailcat",
+          token: "tailcat-secret-token",
+          transport: "tailcat",
+        },
+      ],
+    });
+
+    expect(plan.candidates).toEqual([
+      {
+        localTargetPort: 8788,
+        priority: 550,
+        routeId: "route-tailcat",
+        token: "tailcat-secret-token",
+        transport: "tailcat",
+      },
+      {
+        kind: "public_https",
+        priority: 500,
+        routeId: expect.any(String),
+        url: "https://relay.example.com",
+      },
+    ]);
   });
 
   it("serves matching health and refreshable connection plan identities", async () => {
@@ -83,6 +118,58 @@ describe("connection plan", () => {
       serverEpoch: "epoch-api",
     });
     expect(plan.candidates).toHaveLength(2);
+  });
+
+  it("advertises Tailcat only to capable clients while the sidecar is healthy", async () => {
+    let healthy = true;
+    const app = createApp({
+      appServer: null,
+      connectionPlan: {
+        relayId: "relay-tailcat-api",
+        serverEpoch: "epoch-tailcat-api",
+        tailcatCandidate: () =>
+          healthy
+            ? {
+                localTargetPort: 8788,
+                priority: 550,
+                routeId: "route-tailcat-api",
+                token: "tailcat-capability-token",
+                transport: "tailcat" as const,
+              }
+            : undefined,
+      },
+      management: {
+        connectUrl: "https://relay.example.com",
+        connectUrlCandidates: [{ label: "Public", url: "https://relay.example.com" }],
+      },
+    });
+
+    const legacyPlan = ConnectionPlanResponseSchema.parse(
+      await (await app.request(apiPaths.connectionPlan)).json(),
+    );
+    const capablePlan = ConnectionPlanResponseSchema.parse(
+      await (
+        await app.request(apiPaths.connectionPlan, {
+          headers: { "x-codex-relay-capabilities": "tailcat" },
+        })
+      ).json(),
+    );
+    healthy = false;
+    const failedPlan = ConnectionPlanResponseSchema.parse(
+      await (
+        await app.request(apiPaths.connectionPlan, {
+          headers: { "x-codex-relay-capabilities": "tailcat" },
+        })
+      ).json(),
+    );
+
+    expect(legacyPlan.candidates).toHaveLength(1);
+    expect(capablePlan.candidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ routeId: "route-tailcat-api", transport: "tailcat" }),
+      ]),
+    );
+    expect(failedPlan.candidates).toHaveLength(1);
   });
 
   it("keeps health and connection plans behind existing pairing authentication", async () => {

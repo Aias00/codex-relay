@@ -136,6 +136,21 @@ export function isSuccessfulThreadRunTerminalEvent(event: StreamThreadRunEvent) 
   return event.type === "thread.state.changed" && event.thread.state === "completed";
 }
 
+export function durableStreamCheckpointAction(input: {
+  activeThreadId?: string;
+  recoveredState: "idle" | "running" | "completed" | "failed";
+  threadId: string;
+}) {
+  if (input.activeThreadId !== input.threadId) {
+    return "ignore" as const;
+  }
+  return input.recoveredState === "running" ? ("reconnect" as const) : ("settle" as const);
+}
+
+export function streamTerminalSettlementTiming(transport: "durable" | "legacy") {
+  return transport === "durable" ? ("after-checkpoint" as const) : ("immediate" as const);
+}
+
 export function reconcileThreadRunEventAfterTerminal(
   event: StreamThreadRunEvent,
   terminalEvent: StreamThreadRunEvent | undefined,

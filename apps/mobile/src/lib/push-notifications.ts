@@ -4,6 +4,16 @@ import type { PushNotificationPreferences } from "codex-relay/api-schema";
 import { Platform } from "react-native";
 
 import { codexRelayStorage } from "./codex-relay-server-url-storage";
+import { parsePushNotificationTarget } from "./push-notification-routing";
+
+export {
+  claimPushNotificationEvent,
+  clearPendingPushNotificationTarget,
+  isPushNotificationEventProcessed,
+  readPendingPushNotificationTarget,
+  stagePushNotificationTarget,
+  subscribePendingPushNotificationTarget,
+} from "./push-notification-state";
 
 const initialPushNotificationRegistrationStorageKey =
   "codex-relay.initial-push-notification-registration-completed";
@@ -74,10 +84,12 @@ export function markInitialPushNotificationRegistrationCompleted() {
   codexRelayStorage.set(initialPushNotificationRegistrationStorageKey, true);
 }
 
+export function notificationResponseTarget(response: Notifications.NotificationResponse) {
+  return parsePushNotificationTarget(response.notification.request.content.data);
+}
+
 export function notificationResponseThreadId(response: Notifications.NotificationResponse) {
-  const data = response.notification.request.content.data;
-  const threadId = data?.threadId;
-  return typeof threadId === "string" && threadId.trim() ? threadId : undefined;
+  return notificationResponseTarget(response)?.threadId;
 }
 
 export function pushNotificationPlatform(): "android" | "ios" {

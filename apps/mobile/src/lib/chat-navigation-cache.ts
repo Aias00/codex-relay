@@ -2,12 +2,13 @@ import { createMMKV } from "react-native-mmkv";
 
 export type CachedChatNavigation = {
   activeThreadId?: string;
+  relayId?: string;
   workspaceId?: string;
   workspacePath?: string;
 };
 
 const storage = createMMKV({ id: "codex-relay-chat-navigation" });
-const navigationStorageKey = "selection-v1";
+const navigationStorageKey = "selection-v2";
 
 export function readCachedChatNavigation(): CachedChatNavigation {
   return parseCachedChatNavigation(storage.getString(navigationStorageKey));
@@ -15,7 +16,12 @@ export function readCachedChatNavigation(): CachedChatNavigation {
 
 export function cacheChatNavigation(selection: CachedChatNavigation) {
   const normalized = normalizeCachedChatNavigation(selection);
-  if (!normalized.activeThreadId && !normalized.workspaceId && !normalized.workspacePath) {
+  if (
+    !normalized.activeThreadId &&
+    !normalized.relayId &&
+    !normalized.workspaceId &&
+    !normalized.workspacePath
+  ) {
     storage.remove(navigationStorageKey);
     return;
   }
@@ -40,11 +46,25 @@ export function parseCachedChatNavigation(value: string | undefined): CachedChat
   }
 }
 
+export function cachedChatNavigationForRelay(
+  selection: CachedChatNavigation,
+  currentRelayId: string | undefined,
+): CachedChatNavigation {
+  if (!currentRelayId) {
+    return selection;
+  }
+  if (selection.relayId && selection.relayId !== currentRelayId) {
+    return { relayId: currentRelayId };
+  }
+  return { ...selection, relayId: currentRelayId };
+}
+
 function normalizeCachedChatNavigation(
   selection: Record<string, unknown> | CachedChatNavigation,
 ): CachedChatNavigation {
   return {
     activeThreadId: normalizedString(selection.activeThreadId),
+    relayId: normalizedString(selection.relayId),
     workspaceId: normalizedString(selection.workspaceId),
     workspacePath: normalizedString(selection.workspacePath),
   };

@@ -3,6 +3,8 @@ import {
   type ConnectionPlanCandidate,
   type ConnectionPlanResponse,
   type HealthResponse,
+  type HttpConnectionPlanCandidate,
+  type TailcatConnectionPlanCandidate,
 } from "codex-relay/api-schema";
 
 import { codexRelayStorage as storage } from "./codex-relay-server-url-storage";
@@ -31,10 +33,47 @@ export type ConnectionPlanFetchResult =
 export type ConnectionPlanResolution =
   | {
       status: "resolved";
-      candidate: ConnectionPlanCandidate;
+      candidate: HttpConnectionPlanCandidate;
       plan: ConnectionPlanResponse;
+      sourceCandidate: ConnectionPlanCandidate;
     }
   | { status: "legacy"; planUnavailable: boolean };
+
+export type MaterializedConnectionPlanCandidate = {
+  candidate: HttpConnectionPlanCandidate;
+  cleanup?: () => Promise<void> | void;
+  onSelected?: () => Promise<void> | void;
+};
+
+export type ConnectionPlanProbeObservation = {
+  durationMs: number;
+  route: "cloudflare" | "lan" | "tailscale";
+  success: boolean;
+};
+
+export function currentConnectionPlanServerUrls(
+  plan: ConnectionPlanResponse,
+  selectedCandidate: HttpConnectionPlanCandidate,
+) {
+  return dedupeUrls([
+    selectedCandidate.url,
+    ...httpConnectionPlanCandidates(plan).map(({ url }) => url),
+  ]);
+}
+
+export function persistentConnectionPlanServerUrls(plan: ConnectionPlanResponse) {
+  return dedupeUrls(httpConnectionPlanCandidates(plan).map(({ url }) => url));
+}
+
+export function currentStoredConnectionPlanServerUrls(selectedServerUrl: string) {
+  const plan = getStoredConnectionPlan();
+  const selectedCandidate = plan
+    ? httpConnectionPlanCandidates(plan).find(({ url }) => url === selectedServerUrl)
+    : undefined;
+  return plan && selectedCandidate
+    ? currentConnectionPlanServerUrls(plan, selectedCandidate)
+    : undefined;
+}
 
 export async function requestWithConnectionCandidateRefresh<T>(input: {
   getCandidateUrls: () => string[];
@@ -60,11 +99,16 @@ export async function requestWithConnectionCandidateRefresh<T>(input: {
 export async function resolveConnectionPlanRoute(input: {
   bootstrapUrls: string[];
   fetchPlan: (serverUrl: string, timeoutMs: number) => Promise<ConnectionPlanFetchResult>;
+  materializeCandidate?: (
+    candidate: TailcatConnectionPlanCandidate,
+    timeoutMs: number,
+  ) => Promise<MaterializedConnectionPlanCandidate | undefined>;
   probeHealth: (
-    candidate: ConnectionPlanCandidate,
+    candidate: HttpConnectionPlanCandidate,
     timeoutMs: number,
   ) => Promise<HealthResponse | undefined>;
   now?: () => number;
+  observeProbe?: (observation: ConnectionPlanProbeObservation) => void;
   perRouteTimeoutMs?: number;
   totalBudgetMs?: number;
 }): Promise<ConnectionPlanResolution> {
@@ -74,7 +118,9 @@ export async function resolveConnectionPlanRoute(input: {
   const cachedPlan = getStoredConnectionPlan();
   const discoveryUrls = dedupeUrls([
     ...input.bootstrapUrls,
-    ...(cachedPlan ? orderConnectionPlanCandidates(cachedPlan, now()).map(({ url }) => url) : []),
+    ...(cachedPlan
+      ? orderHttpConnectionPlanCandidates(cachedPlan, now()).map(({ url }) => url)
+      : []),
   ]);
   const initialRequest = await fetchFirstPlan({
     deadline,
@@ -91,10 +137,12 @@ export async function resolveConnectionPlanRoute(input: {
         now,
         perRouteTimeoutMs,
         plan: cachedPlan,
+        materializeCandidate: input.materializeCandidate,
+        observeProbe: input.observeProbe,
         probeHealth: input.probeHealth,
       });
       if (cachedCandidate) {
-        return { candidate: cachedCandidate, plan: cachedPlan, status: "resolved" };
+        return { ...cachedCandidate, plan: cachedPlan, status: "resolved" };
       }
     }
     return {
@@ -111,10 +159,12 @@ export async function resolveConnectionPlanRoute(input: {
     now,
     perRouteTimeoutMs,
     plan: initialRequest.plan,
+    materializeCandidate: input.materializeCandidate,
+    observeProbe: input.observeProbe,
     probeHealth: input.probeHealth,
   });
   if (initialCandidate) {
-    return { candidate: initialCandidate, plan: initialRequest.plan, status: "resolved" };
+    return { ...initialCandidate, plan: initialRequest.plan, status: "resolved" };
   }
 
   const refreshedRequest = await fetchFirstPlan({
@@ -123,7 +173,7 @@ export async function resolveConnectionPlanRoute(input: {
     now,
     perRouteTimeoutMs,
     serverUrls: dedupeUrls([
-      ...orderConnectionPlanCandidates(initialRequest.plan, now()).map(({ url }) => url),
+      ...orderHttpConnectionPlanCandidates(initialRequest.plan, now()).map(({ url }) => url),
       ...discoveryUrls,
     ]),
   });
@@ -137,10 +187,12 @@ export async function resolveConnectionPlanRoute(input: {
     now,
     perRouteTimeoutMs,
     plan: refreshedRequest.plan,
+    materializeCandidate: input.materializeCandidate,
+    observeProbe: input.observeProbe,
     probeHealth: input.probeHealth,
   });
   return refreshedCandidate
-    ? { candidate: refreshedCandidate, plan: refreshedRequest.plan, status: "resolved" }
+    ? { ...refreshedCandidate, plan: refreshedRequest.plan, status: "resolved" }
     : { planUnavailable: false, status: "legacy" };
 }
 
@@ -151,11 +203,21 @@ export function orderConnectionPlanCandidates(plan: ConnectionPlanResponse, now 
       .map((observation) => [observation.routeId, observation]),
   );
   return [...plan.candidates].sort((left, right) => {
-    const leftObservation = matchingObservation(observations.get(left.routeId), left);
-    const rightObservation = matchingObservation(observations.get(right.routeId), right);
+    const leftObservation = isHttpConnectionPlanCandidate(left)
+      ? matchingObservation(observations.get(left.routeId), left)
+      : undefined;
+    const rightObservation = isHttpConnectionPlanCandidate(right)
+      ? matchingObservation(observations.get(right.routeId), right)
+      : undefined;
     const leftFresh = isFreshSuccess(leftObservation, now);
     const rightFresh = isFreshSuccess(rightObservation, now);
     if (leftFresh !== rightFresh) {
+      if (!leftFresh && "transport" in left && left.priority > right.priority) {
+        return -1;
+      }
+      if (!rightFresh && "transport" in right && right.priority > left.priority) {
+        return 1;
+      }
       return rightFresh ? 1 : -1;
     }
     if (leftFresh && rightFresh) {
@@ -171,7 +233,7 @@ export function orderConnectionPlanCandidates(plan: ConnectionPlanResponse, now 
 
 export function recordConnectionRouteSuccess(
   plan: ConnectionPlanResponse,
-  candidate: ConnectionPlanCandidate,
+  candidate: HttpConnectionPlanCandidate,
   now = Date.now(),
 ) {
   updateConnectionRouteObservation(plan, candidate, (current) => ({
@@ -184,7 +246,7 @@ export function recordConnectionRouteSuccess(
 
 export function recordConnectionRouteFailure(
   plan: ConnectionPlanResponse,
-  candidate: ConnectionPlanCandidate,
+  candidate: HttpConnectionPlanCandidate,
   now = Date.now(),
 ) {
   updateConnectionRouteObservation(plan, candidate, (current) => ({
@@ -199,6 +261,16 @@ export function getStoredConnectionPlan() {
   const parsed = readStoredJson(connectionPlanStorageKey);
   const result = ConnectionPlanResponseSchema.safeParse(parsed);
   return result.success ? result.data : undefined;
+}
+
+export function transportBenchmarkRouteForServerUrl(
+  serverUrl: string,
+  plan = getStoredConnectionPlan(),
+): ConnectionPlanProbeObservation["route"] | undefined {
+  const candidate = plan?.candidates.find(
+    (item): item is HttpConnectionPlanCandidate => "url" in item && item.url === serverUrl,
+  );
+  return candidate ? transportBenchmarkRouteForCandidate(candidate) : undefined;
 }
 
 export function getConnectionRouteObservations(): ConnectionRouteObservation[] {
@@ -222,6 +294,7 @@ async function fetchFirstPlan(input: {
   deadline: number;
   fetchPlan: (serverUrl: string, timeoutMs: number) => Promise<ConnectionPlanFetchResult>;
   now: () => number;
+  observeProbe?: (observation: ConnectionPlanProbeObservation) => void;
   perRouteTimeoutMs: number;
   serverUrls: string[];
 }) {
@@ -251,21 +324,48 @@ async function fetchFirstPlan(input: {
   return { attempts, plan: undefined, unsupportedAttempts };
 }
 
-async function probePlan(input: {
+type ProbePlanInput = {
   deadline: number;
+  materializeCandidate?: (
+    candidate: TailcatConnectionPlanCandidate,
+    timeoutMs: number,
+  ) => Promise<MaterializedConnectionPlanCandidate | undefined>;
   now: () => number;
+  observeProbe?: (observation: ConnectionPlanProbeObservation) => void;
   perRouteTimeoutMs: number;
   plan: ConnectionPlanResponse;
   probeHealth: (
-    candidate: ConnectionPlanCandidate,
+    candidate: HttpConnectionPlanCandidate,
     timeoutMs: number,
   ) => Promise<HealthResponse | undefined>;
-}) {
-  for (const candidate of orderConnectionPlanCandidates(input.plan, input.now())) {
+};
+
+async function probePlan(input: ProbePlanInput) {
+  for (const sourceCandidate of orderConnectionPlanCandidates(input.plan, input.now())) {
     const timeoutMs = remainingAttemptTimeout(input.deadline, input.now(), input.perRouteTimeoutMs);
     if (timeoutMs === 0) {
       break;
     }
+    let materialized: MaterializedConnectionPlanCandidate | undefined;
+    if (isHttpConnectionPlanCandidate(sourceCandidate)) {
+      materialized = { candidate: sourceCandidate };
+    } else if (input.materializeCandidate) {
+      try {
+        materialized = await input.materializeCandidate(sourceCandidate, timeoutMs);
+      } catch {
+        continue;
+      }
+    }
+    if (!materialized) {
+      continue;
+    }
+    const candidate = {
+      ...materialized.candidate,
+      priority: sourceCandidate.priority,
+      routeId: sourceCandidate.routeId,
+    };
+    let succeeded = false;
+    const probeStartedAt = input.now();
     try {
       const health = await input.probeHealth(candidate, timeoutMs);
       if (
@@ -275,18 +375,87 @@ async function probePlan(input: {
         health.serverEpoch === input.plan.serverEpoch
       ) {
         recordConnectionRouteSuccess(input.plan, candidate, input.now());
-        return candidate;
+        succeeded = true;
+        scheduleSelectedRouteObservation(materialized.onSelected);
+        return { candidate, sourceCandidate };
       }
     } catch {
       // A failed probe is a route observation, not a session failure.
+    } finally {
+      recordProbeObservation(input, sourceCandidate, probeStartedAt, succeeded);
+      if (!succeeded) {
+        await Promise.resolve(materialized.cleanup?.()).catch(() => undefined);
+      }
     }
     recordConnectionRouteFailure(input.plan, candidate, input.now());
   }
   return undefined;
 }
 
+function recordProbeObservation(
+  input: Pick<ProbePlanInput, "now" | "observeProbe">,
+  candidate: ConnectionPlanCandidate,
+  startedAt: number,
+  success: boolean,
+) {
+  if (!input.observeProbe || "transport" in candidate) {
+    return;
+  }
+  const route = transportBenchmarkRouteForCandidate(candidate);
+  if (!route) {
+    return;
+  }
+  try {
+    input.observeProbe({
+      durationMs: Math.max(0, input.now() - startedAt),
+      route,
+      success,
+    });
+  } catch {
+    // Benchmark collection never participates in route selection.
+  }
+}
+
+function transportBenchmarkRouteForCandidate(
+  candidate: HttpConnectionPlanCandidate,
+): ConnectionPlanProbeObservation["route"] | undefined {
+  return candidate.kind === "tailscale"
+    ? "tailscale"
+    : candidate.kind === "lan" || candidate.kind === "link_local"
+      ? "lan"
+      : candidate.kind === "public_https"
+        ? "cloudflare"
+        : undefined;
+}
+
+function scheduleSelectedRouteObservation(observe: (() => Promise<void> | void) | undefined) {
+  if (!observe) {
+    return;
+  }
+  queueMicrotask(() => {
+    try {
+      void Promise.resolve(observe()).catch(() => undefined);
+    } catch {
+      // Route diagnostics never participate in connection success or fallback.
+    }
+  });
+}
+
 function saveConnectionPlan(plan: ConnectionPlanResponse) {
-  storage.set(connectionPlanStorageKey, JSON.stringify(ConnectionPlanResponseSchema.parse(plan)));
+  const parsedPlan = ConnectionPlanResponseSchema.parse({
+    ...plan,
+    candidates: httpConnectionPlanCandidates(plan),
+  });
+  storage.set(connectionPlanStorageKey, JSON.stringify(parsedPlan));
+  const currentRouteIds = new Set(parsedPlan.candidates.map(({ routeId }) => routeId));
+  storage.set(
+    routeObservationsStorageKey,
+    JSON.stringify(
+      getConnectionRouteObservations().filter(
+        ({ relayId, routeId }) => relayId !== parsedPlan.relayId || currentRouteIds.has(routeId),
+      ),
+    ),
+  );
 }
 
 async function requestFirstCandidate<T>(
@@ -306,7 +475,7 @@ async function requestFirstCandidate<T>(
 
 function updateConnectionRouteObservation(
   plan: ConnectionPlanResponse,
-  candidate: ConnectionPlanCandidate,
+  candidate: HttpConnectionPlanCandidate,
   update: (current: ConnectionRouteObservation) => ConnectionRouteObservation,
 ) {
   const observations = getConnectionRouteObservations();
@@ -337,7 +506,7 @@ function updateConnectionRouteObservation(
 
 function matchingObservation(
   observation: ConnectionRouteObservation | undefined,
-  candidate: ConnectionPlanCandidate,
+  candidate: HttpConnectionPlanCandidate,
 ) {
   return observation?.url === candidate.url ? observation : undefined;
 }
@@ -350,6 +519,27 @@ function isFreshSuccess(observation: ConnectionRouteObservation | undefined, now
     observation.lastSucceededAt >= now - lastSuccessFreshnessMs &&
     (observation.lastFailedAt ?? 0) <= observation.lastSucceededAt
   );
+}
+
+function orderHttpConnectionPlanCandidates(plan: ConnectionPlanResponse, now: number) {
+  const orderedRouteIds = new Map(
+    orderConnectionPlanCandidates(plan, now).map((candidate, index) => [candidate.routeId, index]),
+  );
+  return httpConnectionPlanCandidates(plan).sort(
+    (left, right) =>
+      (orderedRouteIds.get(left.routeId) ?? Number.MAX_SAFE_INTEGER) -
+      (orderedRouteIds.get(right.routeId) ?? Number.MAX_SAFE_INTEGER),
+  );
+}
+
+function httpConnectionPlanCandidates(plan: ConnectionPlanResponse) {
+  return plan.candidates.filter(isHttpConnectionPlanCandidate);
+}
+
+function isHttpConnectionPlanCandidate(
+  candidate: ConnectionPlanCandidate,
+): candidate is HttpConnectionPlanCandidate {
+  return "url" in candidate;
 }
 
 function remainingAttemptTimeout(deadline: number, now: number, perRouteTimeoutMs: number) {

@@ -6,6 +6,8 @@ import {
   apiPaths,
   type ConnectionPlanResponse,
   type HealthResponse,
+  type HttpConnectionPlanCandidate,
+  type TailcatConnectionPlanCandidate,
 } from "./api-schema.js";
 
 export type ConnectionPlanSourceCandidate = {
@@ -40,10 +42,16 @@ export function createConnectionPlan(input: {
   now?: number;
   relayId: string;
   serverEpoch: string;
+  tailcatCandidates?: TailcatConnectionPlanCandidate[];
   ttlMs?: number;
 }): ConnectionPlanResponse {
   const now = input.now ?? Date.now();
-  const candidates = normalizeConnectionPlanCandidates(input.candidates);
+  const candidates = [
+    ...(input.tailcatCandidates ?? []),
+    ...normalizeConnectionPlanCandidates(input.candidates),
+  ].sort(
+    (left, right) => right.priority - left.priority || left.routeId.localeCompare(right.routeId),
+  );
   return ConnectionPlanResponseSchema.parse({
     candidates,
     expiresAt: new Date(now + (input.ttlMs ?? defaultConnectionPlanTtlMs)).toISOString(),
@@ -54,7 +62,7 @@ export function createConnectionPlan(input: {
 }
 
 export function normalizeConnectionPlanCandidates(candidates: ConnectionPlanSourceCandidate[]) {
-  const deduped = new Map<string, ConnectionPlanResponse["candidates"][number]>();
+  const deduped = new Map<string, HttpConnectionPlanCandidate>();
   for (const candidate of candidates) {
     const normalizedUrl = normalizeCandidateUrl(candidate.url);
     if (!normalizedUrl || deduped.has(normalizedUrl)) {
@@ -77,7 +85,7 @@ export function normalizeConnectionPlanCandidates(candidates: ConnectionPlanSour
 function connectionRouteKind(
   url: string,
   label: string | undefined,
-): ConnectionPlanResponse["candidates"][number]["kind"] | undefined {
+): HttpConnectionPlanCandidate["kind"] | undefined {
   const parsed = new URL(url);
   const host = parsed.hostname.toLowerCase();
   const normalizedLabel = label?.toLowerCase() ?? "";
@@ -104,7 +112,7 @@ function connectionRouteKind(
   return undefined;
 }
 
-function routePriority(kind: ConnectionPlanResponse["candidates"][number]["kind"]) {
+function routePriority(kind: HttpConnectionPlanCandidate["kind"]) {
   switch (kind) {
     case "public_https":
       return 500;

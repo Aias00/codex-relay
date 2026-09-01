@@ -117,9 +117,17 @@ import { requestWithNetworkTimeout, withTimeout } from "./network-timeout";
 import {
   clearCodexRelayConnectionPlanState,
   clearStoredConnectionPlan,
+  currentConnectionPlanServerUrls,
+  currentStoredConnectionPlanServerUrls,
+  persistentConnectionPlanServerUrls,
   requestWithConnectionCandidateRefresh,
   resolveConnectionPlanRoute,
 } from "./codex-relay-connection-plan";
+import {
+  materializeTailcatConnectionPlanCandidate,
+  stopMaterializedTailcatTransport,
+  tailcatConnectionPlanCapability,
+} from "./tailcat-transport";
 import {
   clearCodexRelayServerUrlState,
   codexRelayStorage as storage,
@@ -134,10 +142,12 @@ import {
   normalizeServerUrl,
   saveCodexRelayServerUrlCandidates,
   setCodexRelayServerUrl,
+  setEphemeralCodexRelayServerUrl,
   sortServerUrlsByConnectionPreference,
   type CodexRelayServerUrlCandidate,
 } from "./codex-relay-server-url-storage";
 import { workspaceSelectionQuery } from "./server-state-workspace-cache";
+import { recordMobileTransportBenchmark } from "./transport-benchmark";
 
 const skillsPath = "/v1/skills";
 const skillsRequestTimeoutMs = 8000;
@@ -244,6 +254,7 @@ export function signOutCodexRelaySession() {
   connectionPlanUnavailableForCurrentSession = false;
   connectionPlanPreparedForCurrentSession = false;
   connectionPlanSessionGeneration += 1;
+  void stopMaterializedTailcatTransport();
 }
 
 export function hasCodexRelaySession() {
@@ -505,15 +516,30 @@ async function refreshCodexRelayConnectionPlan(options: { force?: boolean } = {}
   const clientToken = storage.getString(clientTokenStorageKey);
   const request = (async () => {
     const bootstrapUrls = getCodexRelayServerUrlCandidates().map(({ url }) => url);
+    const tailcatCapability = tailcatConnectionPlanCapability();
     const resolution = await resolveConnectionPlanRoute({
       bootstrapUrls,
       fetchPlan: fetchConnectionPlanFromServer,
+      materializeCandidate: tailcatCapability
+        ? materializeTailcatConnectionPlanCandidate
+        : undefined,
+      observeProbe: (observation) => {
+        recordMobileTransportBenchmark({
+          durationMs: observation.durationMs,
+          route: observation.route,
+          scenario: "connect",
+          success: observation.success,
+        });
+      },
       probeHealth: probeConnectionPlanCandidate,
     });
     if (
       generation !== connectionPlanSessionGeneration ||
       clientToken !== storage.getString(clientTokenStorageKey)
     ) {
+      if (resolution.status === "resolved" && "transport" in resolution.sourceCandidate) {
+        await stopMaterializedTailcatTransport();
+      }
       return false;
     }
     if (resolution.status === "legacy") {
@@ -524,12 +550,17 @@ async function refreshCodexRelayConnectionPlan(options: { force?: boolean } = {}
     }
 
     connectionPlanUnavailableForCurrentSession = false;
+    if ("transport" in resolution.sourceCandidate) {
+      setEphemeralCodexRelayServerUrl(resolution.candidate.url);
+      saveCodexRelayServerUrlCandidates(persistentConnectionPlanServerUrls(resolution.plan));
+      return true;
+    } else {
+      await stopMaterializedTailcatTransport();
+    }
     setCodexRelayServerUrl(resolution.candidate.url);
-    saveCodexRelayServerUrlCandidates([
-      resolution.candidate.url,
-      ...resolution.plan.candidates.map(({ url }) => url),
-      ...bootstrapUrls,
-    ]);
+    saveCodexRelayServerUrlCandidates(
+      currentConnectionPlanServerUrls(resolution.plan, resolution.candidate),
+    );
     return true;
   })();
   connectionPlanRefreshPromise = request;
@@ -546,8 +577,13 @@ async function refreshCodexRelayConnectionPlan(options: { force?: boolean } = {}
 }
 
 async function fetchConnectionPlanFromServer(serverUrl: string, timeoutMs: number) {
+  const headers = requestHeaders(undefined, { jsonContentType: false });
+  const capability = tailcatConnectionPlanCapability();
+  if (capability) {
+    headers.set("x-codex-relay-capabilities", capability);
+  }
   const response = await fetchWithNetworkContext(`${serverUrl}${apiPaths.connectionPlan}`, {
-    headers: requestHeaders(undefined, { jsonContentType: false }),
+    headers,
     timeoutMs,
   });
   const payload = decryptResponsePayload(await response.json().catch(() => undefined));
@@ -568,7 +604,11 @@ async function fetchConnectionPlanFromServer(serverUrl: string, timeoutMs: numbe
 }
 
 async function probeConnectionPlanCandidate(candidate: { url: string }, timeoutMs: number) {
-  const response = await fetchWithNetworkContext(`${candidate.url}${apiPaths.health}`, {
+  return probeCodexRelayServerUrl(candidate.url, timeoutMs);
+}
+
+export async function probeCodexRelayServerUrl(serverUrl: string, timeoutMs = 2_000) {
+  const response = await fetchWithNetworkContext(`${serverUrl}${apiPaths.health}`, {
     headers: requestHeaders(undefined, { jsonContentType: false }),
     timeoutMs,
   });
@@ -1105,9 +1145,17 @@ export async function getRateLimits(): Promise<RateLimitsResponse> {
 
 export async function getThread(
   threadId: string,
-  options: { beforeMessageId?: string; limit?: number; refresh?: boolean } = {},
+  options: {
+    afterMessageId?: string;
+    beforeMessageId?: string;
+    limit?: number;
+    refresh?: boolean;
+  } = {},
 ): Promise<ThreadDetailResponse> {
   const query = new URLSearchParams();
+  if (options.afterMessageId) {
+    query.set("afterMessageId", options.afterMessageId);
+  }
   if (options.beforeMessageId) {
     query.set("beforeMessageId", options.beforeMessageId);
   }
@@ -1116,9 +1164,23 @@ export async function getThread(
   }
   query.set("limit", String(options.limit ?? mobileThreadDetailMessageLimit));
   const path = query.size > 0 ? `${apiPaths.thread(threadId)}?${query}` : apiPaths.thread(threadId);
-  return request(path, undefined, ThreadDetailResponseSchema.parse, {
-    timeoutMs: options.refresh ? fullThreadRefreshTimeoutMs : undefined,
-  });
+  return request(
+    path,
+    undefined,
+    (payload) => {
+      const response = ThreadDetailResponseSchema.parse(payload);
+      if (
+        response.thread.id !== threadId ||
+        response.messages.some((message) => message.threadId !== threadId)
+      ) {
+        throw new Error(`Codex Relay returned mismatched messages for thread ${threadId}.`);
+      }
+      return response;
+    },
+    {
+      timeoutMs: options.refresh ? fullThreadRefreshTimeoutMs : undefined,
+    },
+  );
 }
 
 export async function listThreadEvents(
@@ -1652,6 +1714,10 @@ function promoteCodexRelayServerUrl(serverUrl: string) {
   if (serverUrl !== getCodexRelayServerUrl()) {
     setCodexRelayServerUrl(serverUrl);
   }
+  const currentPlanUrls = currentStoredConnectionPlanServerUrls(serverUrl);
+  if (currentPlanUrls) {
+    saveCodexRelayServerUrlCandidates(currentPlanUrls);
+  }
 }
 
 function requestHeaders(
@@ -1684,6 +1750,7 @@ function saveSession(serverUrl: string, clientToken: string) {
   connectionPlanUnavailableForCurrentSession = false;
   connectionPlanPreparedForCurrentSession = false;
   connectionPlanSessionGeneration += 1;
+  void stopMaterializedTailcatTransport();
   setCodexRelayServerUrl(serverUrl);
   storage.set(clientTokenStorageKey, clientToken);
   storage.remove(legacyClientTokenExpiresAtStorageKey);

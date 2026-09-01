@@ -48,6 +48,7 @@ async function runService(serviceCommand) {
       result.reason === "unhealthy"
         ? await terminateUnhealthyChild(child, exitPromise)
         : result.exit;
+    await stopRemainingServiceTree(child);
     child = undefined;
 
     if (stopping) {
@@ -68,6 +69,7 @@ async function runCommandOnce(serviceCommand) {
   child = spawnService(serviceCommand);
   await log(`command spawned pid=${child.pid}`);
   const exit = await waitForExit(child);
+  await stopRemainingServiceTree(child);
   child = undefined;
   process.exitCode = exit.code ?? 1;
 }
@@ -75,6 +77,7 @@ async function runCommandOnce(serviceCommand) {
 function spawnService(serviceCommand) {
   return spawn(serviceCommand.command, serviceCommand.args, {
     cwd: root,
+    detached: process.platform !== "win32",
     env: {
       ...process.env,
       NODE_ENV: "development",
@@ -127,14 +130,12 @@ async function waitForUnhealthyListener(runningChild, startedAt, signal) {
 
 async function terminateUnhealthyChild(runningChild, exitPromise) {
   await log(`listener unhealthy; terminating server wrapper pid=${runningChild.pid}`);
-  if (!runningChild.killed) {
-    runningChild.kill("SIGTERM");
-  }
+  signalServiceTree(runningChild, "SIGTERM");
 
   const timeoutExit = delay(5000).then(() => ({ code: null, signal: "SIGKILL_TIMEOUT" }));
   const exit = await Promise.race([exitPromise, timeoutExit]);
   if (exit.signal === "SIGKILL_TIMEOUT") {
-    runningChild.kill("SIGKILL");
+    signalServiceTree(runningChild, "SIGKILL");
     return await exitPromise;
   }
   return exit;
@@ -152,8 +153,49 @@ async function abortableDelay(ms, signal) {
 
 function stop() {
   stopping = true;
-  if (child && !child.killed) {
-    child.kill("SIGTERM");
+  if (child) {
+    signalServiceTree(child, "SIGTERM");
+  }
+}
+
+async function stopRemainingServiceTree(runningChild) {
+  if (
+    process.platform === "win32" ||
+    !runningChild.pid ||
+    !serviceTreeIsRunning(runningChild.pid)
+  ) {
+    return;
+  }
+  signalServiceTree(runningChild, "SIGTERM");
+  await delay(250);
+  if (serviceTreeIsRunning(runningChild.pid)) {
+    signalServiceTree(runningChild, "SIGKILL");
+    await delay(50);
+  }
+}
+
+function signalServiceTree(runningChild, signal) {
+  if (process.platform !== "win32" && runningChild.pid) {
+    try {
+      process.kill(-runningChild.pid, signal);
+      return;
+    } catch (error) {
+      if (error?.code !== "ESRCH") {
+        throw error;
+      }
+    }
+  }
+  if (!runningChild.killed) {
+    runningChild.kill(signal);
+  }
+}
+
+function serviceTreeIsRunning(processGroupId) {
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
   }
 }
 

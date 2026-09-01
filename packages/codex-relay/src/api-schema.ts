@@ -72,12 +72,25 @@ export const ConnectionRouteKindSchema = z.enum([
   "public_https",
 ]);
 
-export const ConnectionPlanCandidateSchema = z.object({
+export const HttpConnectionPlanCandidateSchema = z.object({
   routeId: z.string().min(1),
   url: z.string().url(),
   kind: ConnectionRouteKindSchema,
   priority: z.number().int(),
 });
+
+export const TailcatConnectionPlanCandidateSchema = z.object({
+  routeId: z.string().min(1),
+  transport: z.literal("tailcat"),
+  token: z.string().min(1),
+  localTargetPort: z.number().int().min(1).max(65_535),
+  priority: z.number().int(),
+});
+
+export const ConnectionPlanCandidateSchema = z.union([
+  HttpConnectionPlanCandidateSchema,
+  TailcatConnectionPlanCandidateSchema,
+]);
 
 export const ConnectionPlanResponseSchema = z.object({
   relayId: z.string().min(1),
@@ -86,6 +99,41 @@ export const ConnectionPlanResponseSchema = z.object({
   refreshPath: z.string().min(1),
   candidates: z.array(ConnectionPlanCandidateSchema),
 });
+
+export const TransportBenchmarkRouteSchema = z.enum([
+  "lan",
+  "tailcat_direct",
+  "tailcat_derp",
+  "tailscale",
+  "cloudflare",
+]);
+
+export const TransportBenchmarkScenarioSchema = z.enum(["connect", "reconnect", "sse", "history"]);
+
+export const TransportBenchmarkSampleSchema = z
+  .object({
+    appVersion: z.string().min(1).max(64),
+    batteryEndPercent: z.number().min(0).max(100).optional(),
+    batteryStartPercent: z.number().min(0).max(100).optional(),
+    bytesTransferred: z.number().int().nonnegative().optional(),
+    durationMs: z.number().finite().nonnegative(),
+    eventsReceived: z.number().int().nonnegative().optional(),
+    recordedAt: z.string().datetime({ offset: true }),
+    route: TransportBenchmarkRouteSchema,
+    sampleId: z.string().uuid(),
+    scenario: TransportBenchmarkScenarioSchema,
+    success: z.boolean(),
+    version: z.literal(1),
+  })
+  .strict()
+  .superRefine((sample, context) => {
+    if ((sample.batteryStartPercent === undefined) !== (sample.batteryEndPercent === undefined)) {
+      context.addIssue({
+        code: "custom",
+        message: "Battery measurements must include both start and end values.",
+      });
+    }
+  });
 
 export const ThreadRunOptionsSchema = z.object({
   model: z.string().trim().min(1).optional(),
@@ -128,6 +176,15 @@ export const RuntimePreferencesResponseSchema = z.object({
 });
 
 export const PushNotificationIntentSchema = z.enum(["turn_terminal", "action_required"]);
+
+export const PushNotificationDataSchema = z.object({
+  intent: PushNotificationIntentSchema,
+  relayId: z.string().min(1).optional(),
+  semanticEventId: z.string().min(1).optional(),
+  threadId: z.string().min(1),
+  turnId: z.string().min(1).optional(),
+  workspaceId: z.string().min(1).optional(),
+});
 
 export const PushNotificationPreferencesSchema = z.object({
   actionRequired: z.boolean(),
@@ -332,6 +389,7 @@ export const ChatMessageSchema = z.object({
   kind: ChatMessageKindSchema.default("chat"),
   content: z.string(),
   details: z.record(z.string(), z.unknown()).optional(),
+  semanticEventId: z.string().min(1).optional(),
   createdAt: IsoDateTimeSchema,
   updatedAt: IsoDateTimeSchema.optional(),
   turnId: z.string().optional(),
@@ -805,10 +863,14 @@ export const ThreadDetailResponseSchema = z.object({
   messages: z.array(ChatMessageSchema),
   pendingInputRequests: z.array(PendingInputRequestSchema).default([]),
   hasOlderMessages: z.boolean().default(false),
+  hasMoreMessages: z.boolean().optional(),
+  messageCursor: z.string().min(1).optional(),
+  messageCursorReset: z.boolean().optional(),
   olderMessagesCursor: z.string().min(1).optional(),
 });
 
 export const ThreadDetailQuerySchema = z.object({
+  afterMessageId: z.string().min(1).optional(),
   beforeMessageId: z.string().min(1).optional(),
   limit: z.coerce.number().int().min(1).max(300).optional(),
   refresh: z.enum(["true", "false"]).optional(),
@@ -938,6 +1000,7 @@ export type RuntimePreferencesByWorkspacePath = z.infer<
 >;
 export type RuntimePreferencesResponse = z.infer<typeof RuntimePreferencesResponseSchema>;
 export type PushNotificationIntent = z.infer<typeof PushNotificationIntentSchema>;
+export type PushNotificationData = z.infer<typeof PushNotificationDataSchema>;
 export type PushNotificationPreferences = z.infer<typeof PushNotificationPreferencesSchema>;
 export type RegisterPushNotificationRequest = z.infer<typeof RegisterPushNotificationRequestSchema>;
 export type PushNotificationSettingsResponse = z.infer<
@@ -1012,7 +1075,12 @@ export type VersionResponse = z.infer<typeof VersionResponseSchema>;
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
 export type ConnectionRouteKind = z.infer<typeof ConnectionRouteKindSchema>;
 export type ConnectionPlanCandidate = z.infer<typeof ConnectionPlanCandidateSchema>;
+export type HttpConnectionPlanCandidate = z.infer<typeof HttpConnectionPlanCandidateSchema>;
+export type TailcatConnectionPlanCandidate = z.infer<typeof TailcatConnectionPlanCandidateSchema>;
 export type ConnectionPlanResponse = z.infer<typeof ConnectionPlanResponseSchema>;
+export type TransportBenchmarkRoute = z.infer<typeof TransportBenchmarkRouteSchema>;
+export type TransportBenchmarkScenario = z.infer<typeof TransportBenchmarkScenarioSchema>;
+export type TransportBenchmarkSample = z.infer<typeof TransportBenchmarkSampleSchema>;
 export type ListThreadsResponse = z.infer<typeof ListThreadsResponseSchema>;
 export type ArchiveThreadResponse = z.infer<typeof ArchiveThreadResponseSchema>;
 export type RenameThreadRequest = z.infer<typeof RenameThreadRequestSchema>;
@@ -1421,6 +1489,11 @@ export function createOpenApiDocument() {
               schema: { type: "boolean" },
             },
             {
+              name: "afterMessageId",
+              in: "query",
+              schema: { type: "string" },
+            },
+            {
               name: "beforeMessageId",
               in: "query",
               schema: { type: "string" },
@@ -1728,6 +1801,7 @@ export function createOpenApiDocument() {
             kind: { type: "string", enum: ChatMessageKindSchema.options },
             content: { type: "string" },
             details: { type: "object", additionalProperties: true },
+            semanticEventId: { type: "string" },
             createdAt: { type: "string", format: "date-time" },
             updatedAt: { type: "string", format: "date-time" },
             turnId: { type: "string" },
@@ -1943,14 +2017,29 @@ export function createOpenApiDocument() {
           },
         },
         ConnectionPlanCandidate: {
-          type: "object",
-          required: ["routeId", "url", "kind", "priority"],
-          properties: {
-            routeId: { type: "string" },
-            url: { type: "string", format: "uri" },
-            kind: { type: "string", enum: ConnectionRouteKindSchema.options },
-            priority: { type: "integer" },
-          },
+          oneOf: [
+            {
+              type: "object",
+              required: ["routeId", "url", "kind", "priority"],
+              properties: {
+                routeId: { type: "string" },
+                url: { type: "string", format: "uri" },
+                kind: { type: "string", enum: ConnectionRouteKindSchema.options },
+                priority: { type: "integer" },
+              },
+            },
+            {
+              type: "object",
+              required: ["routeId", "transport", "token", "localTargetPort", "priority"],
+              properties: {
+                routeId: { type: "string" },
+                transport: { const: "tailcat" },
+                token: { type: "string" },
+                localTargetPort: { type: "integer", minimum: 1, maximum: 65_535 },
+                priority: { type: "integer" },
+              },
+            },
+          ],
         },
         ConnectionPlanResponse: {
           type: "object",
@@ -2361,7 +2450,10 @@ export function createOpenApiDocument() {
               type: "array",
               items: { $ref: "#/components/schemas/PendingInputRequest" },
             },
+            hasMoreMessages: { type: "boolean" },
             hasOlderMessages: { type: "boolean" },
+            messageCursor: { type: "string" },
+            messageCursorReset: { type: "boolean" },
             olderMessagesCursor: { type: "string" },
           },
         },

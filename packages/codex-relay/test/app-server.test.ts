@@ -9,7 +9,11 @@ vi.mock("../src/debug-log.js", () => ({
   relayDebugLog: vi.fn<(event: string, fields?: Record<string, unknown>) => void>(),
 }));
 
-import { CodexAppServerClient, type AppServerConnectionStateEvent } from "../src/app-server.js";
+import {
+  AppServerRequestTimeoutError,
+  CodexAppServerClient,
+  type AppServerConnectionStateEvent,
+} from "../src/app-server.js";
 import { relayDebugLog } from "../src/debug-log.js";
 
 type JsonRpcRequest = {
@@ -30,6 +34,39 @@ describe("CodexAppServerClient shared socket mode", () => {
   afterEach(() => {
     vi.clearAllMocks();
     vi.unstubAllEnvs();
+  });
+
+  it("initializes without overriding the Codex app-server originator or user agent", async () => {
+    const codexHome = await mkdtemp(join(socketTempRoot, "codex-relay-app-server-identity-"));
+    const socketPath = join(codexHome, "app-server-control", "app-server-control.sock");
+    const server = await startSharedSocketServer(socketPath);
+    vi.stubEnv("CODEX_HOME", codexHome);
+    vi.stubEnv("CODEX_RELAY_APP_SERVER_MODE", "socket");
+    const client = new CodexAppServerClient({
+      startSharedServer: async () => {
+        throw new Error("Expected the client to attach to the existing shared app-server.");
+      },
+    });
+
+    try {
+      await client.initialize();
+
+      expect(server.requests.find((request) => request.method === "initialize")?.params).toEqual({
+        capabilities: {
+          experimentalApi: true,
+          requestAttestation: false,
+        },
+        clientInfo: {
+          name: "codex_app_server_daemon",
+          title: null,
+          version: "",
+        },
+      });
+    } finally {
+      client.close();
+      await server.close();
+      await rm(codexHome, { force: true, recursive: true });
+    }
   });
 
   it("reconnects after its shared socket resets without starting another app-server", async () => {
@@ -258,6 +295,94 @@ describe("CodexAppServerClient shared socket mode", () => {
     }
   });
 
+  it("loads a full-detail page of recent thread turns", async () => {
+    const codexHome = await mkdtemp(join(socketTempRoot, "codex-relay-app-server-turn-pages-"));
+    const socketPath = join(codexHome, "app-server-control", "app-server-control.sock");
+    const server = await startSharedSocketServer(socketPath, (request) =>
+      request.method === "thread/turns/list"
+        ? { data: [{ id: "turn-recent", items: [] }], nextCursor: "older" }
+        : {},
+    );
+    vi.stubEnv("CODEX_HOME", codexHome);
+    vi.stubEnv("CODEX_RELAY_APP_SERVER_MODE", "socket");
+    const client = new CodexAppServerClient({
+      startSharedServer: async () => {
+        throw new Error("Expected the client to attach to the existing shared app-server.");
+      },
+    });
+
+    try {
+      const options = {
+        cursor: "cursor-1",
+        itemsView: "full" as const,
+        limit: 12,
+        sortDirection: "desc" as const,
+      };
+      const [page, duplicatePage] = await Promise.all([
+        client.listThreadTurns("thread-1", options),
+        client.listThreadTurns("thread-1", options),
+      ]);
+      const requests = server.requests.filter(
+        (candidate) => candidate.method === "thread/turns/list",
+      );
+      const request = requests[0];
+
+      expect(page).toMatchObject({ data: [{ id: "turn-recent" }], nextCursor: "older" });
+      expect(duplicatePage).toEqual(page);
+      expect(requests).toHaveLength(1);
+      expect(request?.params).toEqual({
+        cursor: "cursor-1",
+        itemsView: "full",
+        limit: 12,
+        sortDirection: "desc",
+        threadId: "thread-1",
+      });
+    } finally {
+      client.close();
+      await server.close();
+      await rm(codexHome, { force: true, recursive: true });
+    }
+  });
+
+  it("classifies a late turn/start response as an ambiguous timeout", async () => {
+    const codexHome = await mkdtemp(join(socketTempRoot, "codex-relay-app-server-timeout-"));
+    const socketPath = join(codexHome, "app-server-control", "app-server-control.sock");
+    const server = await startSharedSocketServer(socketPath, async (request) => {
+      if (request.method === "turn/start") {
+        await new Promise((resolve) => globalThis.setTimeout(resolve, 50));
+        return { turn: { id: "turn-late", items: [], status: "running" } };
+      }
+      return request.method === "model/list" ? { data: [] } : {};
+    });
+    vi.stubEnv("CODEX_HOME", codexHome);
+    vi.stubEnv("CODEX_RELAY_APP_SERVER_MODE", "socket");
+    const client = new CodexAppServerClient({
+      startSharedServer: async () => {
+        throw new Error("Expected the client to attach to the existing shared app-server.");
+      },
+      turnStartTimeoutMs: 10,
+    });
+
+    try {
+      await client.initialize();
+      await expect(
+        client.startTurn({
+          approvalPolicy: "never",
+          input: [{ type: "text", text: "Run once", text_elements: [] }],
+          sandboxPolicy: { type: "dangerFullAccess" },
+          threadId: "thread-timeout",
+        }),
+      ).rejects.toEqual(expect.any(AppServerRequestTimeoutError));
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 60));
+      await expect(client.listModels()).resolves.toEqual([]);
+      expect(server.requests.filter((request) => request.method === "turn/start")).toHaveLength(1);
+    } finally {
+      client.close();
+      await server.close();
+      await rm(codexHome, { force: true, recursive: true });
+    }
+  });
+
   it.skipIf(process.platform === "win32")(
     "replaces a stale Unix socket after a slow shared app-server startup",
     async () => {
@@ -324,7 +449,7 @@ process.stdin.resume();
 
 async function startSharedSocketServer(
   socketPath: string,
-  responseForRequest: (request: JsonRpcRequest) => unknown = (request) =>
+  responseForRequest: (request: JsonRpcRequest) => unknown | Promise<unknown> = (request) =>
     request.method === "model/list"
       ? { data: [] }
       : request.method === "thread/resume"
@@ -344,12 +469,9 @@ async function startSharedSocketServer(
       if (typeof request.id !== "number") {
         return;
       }
-      socket.send(
-        JSON.stringify({
-          id: request.id,
-          result: responseForRequest(request),
-        }),
-      );
+      void Promise.resolve(responseForRequest(request)).then((result) => {
+        socket.send(JSON.stringify({ id: request.id, result }));
+      });
     });
   });
   await listen(server, socketPath);

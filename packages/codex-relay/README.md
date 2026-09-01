@@ -62,6 +62,19 @@ Shared mode uses Codex's experimental app-server transport. A directly connected
 
 Shared mode requires a recent Codex CLI with app-server and `resume --remote` support. It uses a Unix socket on macOS, Linux, and WSL, or a loopback-only WebSocket on Windows. If explicit shared mode is unavailable, update Codex or omit `--shared-app-server`. On macOS, set `CODEX_RELAY_APP_SERVER_MODE=stdio` to force private mode instead of using the shared-first default.
 
+On macOS, Linux, and WSL, Relay starts the shared app-server as a detached local daemon before attaching. Restarting or stopping Relay does not terminate that daemon or an active terminal turn. Reconnect a disconnected TUI with `codex resume --remote unix:// THREAD_ID`.
+
+## Optional Codex Desktop Sharing
+
+TUI users do not need this step. On macOS, compatible Codex Desktop builds can connect to the same detached daemon:
+
+```sh
+npx codex-relay@latest desktop
+npx codex-relay@latest desktop --launch
+```
+
+Fully quit an already-running Desktop app before `--launch`. The launcher verifies app support and the app-server handshake, then waits for an observable connection to the expected Unix socket before reporting success.
+
 ## Background Mode
 
 To keep the relay running after the command returns:
@@ -135,12 +148,15 @@ Start the relay and automatically approve mobile pairing requests. Use this only
 
 ```sh
 npx codex-relay@latest diagnostics
+npx codex-relay@latest compatibility
 npx codex-relay@latest backup
 npx codex-relay@latest compact THREAD_ID --through 2000
 npx codex-relay@latest repair-owner THREAD_ID
+npx codex-relay@latest tailcat-key rotate --region derp.example.com
+npx codex-relay@latest transport-benchmark transport-samples.jsonl
 ```
 
-Inspect content-safe state counts, create online-consistent database backups, compact one thread at an explicit durable sequence, or repair an expired owner lease. `repair-owner` refuses active and non-expiring owners.
+Inspect content-safe state and compatibility counts, create online-consistent database backups, compact one thread at an explicit durable sequence, repair an expired owner lease, rotate the optional Tailcat server key, or summarize strict content-safe transport benchmark JSONL. `repair-owner` refuses active and non-expiring owners. Tailcat key rotation discards connection-token output, validates the generated key, atomically replaces it, preserves one mode-0600 `.previous` rollback copy, and requires a Relay restart before old tokens become invalid; pairing sessions and durable state are unchanged. Transport benchmark input rejects URLs, credentials, Relay/thread/workspace identity, conversation content, and free-form notes; output contains grouped success rates and P50/P95 metrics only.
 
 ## Configuration
 
@@ -159,8 +175,17 @@ The relay listens on `0.0.0.0:8787` by default. Configure it with environment va
 | `CODEX_RELAY_THREAD_LIST_CACHE_TTL_MS` | Short server-side cache for app-server thread list reads. Defaults to `3000`; set to `0` to disable.                                                            |
 | `CODEX_RELAY_DANGEROUSLY_AUTO_APPROVE` | Set to `1` to auto-approve mobile pairing requests. Prefer the CLI flag for local use.                                                                          |
 | `CODEX_RELAY_APP_SERVER_MODE`          | Set to `socket` to require shared mode or `stdio` to require private mode. Unset prefers shared mode with startup fallback on macOS and private mode elsewhere. |
+| `CODEX_RELAY_DESKTOP_APP_PATH`         | Optional macOS Codex Desktop or ChatGPT application bundle path.                                                                                                |
+| `CODEX_RELAY_TAILCAT_TRANSPORT`        | Experimental. Set to `1` to start an owned Tailcat sidecar; disabled by default.                                                                                |
+| `CODEX_RELAY_TAILCAT_BINARY`           | Optional Tailcat executable path. Defaults to `tailcat` on `PATH`.                                                                                              |
+| `CODEX_RELAY_TAILCAT_KEY_PATH`         | Persistent Tailcat server key path. Defaults under the Relay data directory and must already exist.                                                             |
+| `CODEX_RELAY_TAILCAT_ADDRESS_PATH`     | Private address-token output path. Defaults under the Relay data directory.                                                                                     |
+| `CODEX_RELAY_TAILCAT_PID_PATH`         | Mode-0600 sidecar PID file used to validate and clean stale Relay-owned processes. Defaults beside the address file.                                            |
+| `CODEX_RELAY_TAILCAT_START_TIMEOUT_MS` | Optional positive sidecar startup timeout in milliseconds. Defaults to `10000`.                                                                                 |
 | `CODEX_HOME`                           | Codex home directory, used when reading Codex session metadata.                                                                                                 |
 | `CODEX_BIN`                            | Codex CLI executable path.                                                                                                                                      |
+
+Tailcat remains capability-gated. The server returns its token only from the authenticated Connection Plan endpoint when the client declares `tailcat` support and the owned sidecar is healthy. Expo Go and older installed builds do not declare this capability and continue using ordinary HTTP candidates. A new native iOS build is required; OTA updates cannot add the embedded framework. Do not run a separate `tailcat --serve` LaunchAgent for the same port while `CODEX_RELAY_TAILCAT_TRANSPORT=1`; Relay owns, records, and cleans that process itself.
 
 Examples:
 

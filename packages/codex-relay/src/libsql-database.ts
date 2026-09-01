@@ -18,6 +18,7 @@ type QueryableDatabase = {
 };
 
 type Database = QueryableDatabase & {
+  close(): void;
   exec(sql: string): Promise<void>;
   transaction<T>(callback: (database: QueryableDatabase) => Promise<T>): () => Promise<T>;
 };
@@ -27,6 +28,7 @@ export function connect(path: string): Database {
     intMode: "number",
     url: databaseUrl(path),
   });
+  let closed = false;
   const lock = createExclusiveLock();
   const executor =
     path === ":memory:"
@@ -40,6 +42,13 @@ export function connect(path: string): Database {
 
   return {
     ...database,
+    close() {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      client.close();
+    },
     exec(sql) {
       return path === ":memory:"
         ? lock(() => client.executeMultiple(sql))

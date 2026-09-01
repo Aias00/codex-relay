@@ -50,7 +50,13 @@ import {
   updateThreadGoal,
   updateRuntimePreferences,
 } from "@/lib/codex-relay-api";
-import { chatStore$, setWorkspaceSelection } from "@/state/chat-store";
+import { getStoredConnectionPlan } from "@/lib/codex-relay-connection-plan";
+import {
+  chatStore$,
+  initializeThreadSeenBaseline,
+  markThreadSeenIfActive,
+  setWorkspaceSelection,
+} from "@/state/chat-store";
 import {
   cacheWorkspaceRuntimePreferences,
   cacheWorkspaceRuntimePreferencesFromStatus,
@@ -62,28 +68,45 @@ import {
   type WorkspaceCacheSelection,
 } from "./server-state-workspace-cache";
 import { serverStateRootKey } from "./server-state-persistence";
+import {
+  legacyServerStateRoot,
+  relayScopedServerStateQueryKey,
+  serverStateRootForRelay,
+} from "./server-state-relay-scope";
 import { replayThreadEventPages } from "./thread-event-client";
 import {
   applyOrderedThreadEvent,
+  isAuthoritativeTerminalThreadEvent,
   ThreadEventSequenceGapError,
   threadIdFromStreamEvent,
   type ThreadEventApplyResult,
   type ThreadEventCursor,
 } from "./thread-event-reducer";
-import { threadDetailSwitchStaleTimeMs } from "./thread-activation";
+import { runThreadRecoveryLadder } from "./thread-recovery-ladder";
+import { isAuthoritativeThreadSnapshot, threadDetailSwitchStaleTimeMs } from "./thread-activation";
+import { createThreadHydrationGenerationGate } from "./thread-hydration-generation";
 import {
+  appendOptimisticRunMessageToDetail,
   appendOptimisticSteeringMessageToDetail,
   mergeThreadDetailState,
   preferredThreadSnapshot,
   upsertMessage,
 } from "./server-state-messages";
-import { prioritizeThreadPrefetch, runBoundedThreadPrefetch } from "./thread-prefetch";
+import {
+  prioritizeThreadPrefetch,
+  runBoundedThreadPrefetch,
+  runCoalescedRequest,
+} from "./thread-prefetch";
 
 export const threadListStaleTimeMs = 30_000;
 export const workspaceDirectoryStaleTimeMs = 5 * 60_000;
+const threadRefreshRequests = new WeakMap<
+  QueryClient,
+  Map<string, Promise<ThreadDetailResponse>>
+>();
 
 export const serverStateKeys = {
-  all: () => [serverStateRootKey, getCodexRelayServerUrl()] as const,
+  all: () => serverStateRootForRelay(getCodexRelayServerUrl(), getStoredConnectionPlan()?.relayId),
   contextWindow: (threadId: string, selection?: WorkspaceCacheSelection | string) =>
     [...serverStateKeys.threadScope(threadId, selection), "context-window"] as const,
   models: () => [...serverStateKeys.all(), "models"] as const,
@@ -120,6 +143,22 @@ export const serverStateKeys = {
   workspaceDirectories: (path: string | undefined) =>
     [...serverStateKeys.all(), "workspace-directories", path ?? null] as const,
 };
+
+export function promoteLegacyRelayServerState(queryClient: QueryClient) {
+  const relayId = getStoredConnectionPlan()?.relayId;
+  const serverUrl = getCodexRelayServerUrl();
+  if (!relayId) {
+    return;
+  }
+  for (const [queryKey, cached] of queryClient.getQueriesData({
+    queryKey: legacyServerStateRoot(serverUrl),
+  })) {
+    const targetKey = relayScopedServerStateQueryKey(queryKey, serverUrl, relayId);
+    if (targetKey && cached !== undefined && queryClient.getQueryData(targetKey) === undefined) {
+      queryClient.setQueryData(targetKey, cached);
+    }
+  }
+}
 
 export function fetchStatusState(
   queryClient: QueryClient,
@@ -178,29 +217,69 @@ export async function fetchThreadState(
   threadId: string,
   options: { refresh?: boolean; staleTime?: number } = {},
 ) {
+  const stateKey = threadStateKey(queryClient, threadId);
+  const cached = queryClient.getQueryData<ThreadDetailResponse>(stateKey);
+  const afterMessageId = options.refresh ? cached?.messageCursor : undefined;
   const response = options.refresh
-    ? await getThread(threadId, { refresh: true })
+    ? await runCoalescedRequest(
+        refreshRequestsForQueryClient(queryClient),
+        JSON.stringify(stateKey),
+        () => fetchNewerThreadMessages(threadId, afterMessageId),
+      )
     : await queryClient.fetchQuery({
         queryKey: threadStateKey(queryClient, threadId),
         queryFn: () => getThread(threadId),
         staleTime: options.staleTime,
       });
+  if (response.messageCursorReset) {
+    invalidateOlderThreadMessagesHydration(queryClient, threadId);
+  }
+  const authoritativeThreadState = isAuthoritativeThreadSnapshot(
+    response.thread.state,
+    options.refresh,
+  );
   setThreadDetailState(
     queryClient,
     response.thread,
     response.messages,
     response.pendingInputRequests,
     {
+      authoritativeThreadState,
       hasOlderMessages: response.hasOlderMessages,
+      hasMoreMessages: response.hasMoreMessages,
+      messageCursor: response.messageCursor,
+      messageCursorReset: response.messageCursorReset,
       olderMessagesCursor: response.olderMessagesCursor,
-      replaceMessages: options.refresh,
+      replaceMessages: response.messageCursorReset || (options.refresh && !afterMessageId),
     },
   );
   const merged =
     queryClient.getQueryData<ThreadDetailResponse>(threadStateKey(queryClient, threadId)) ??
     response;
-  upsertThreadState(queryClient, merged.thread);
+  upsertThreadState(queryClient, merged.thread, {
+    authoritativeThreadState,
+  });
   return merged;
+}
+
+async function fetchNewerThreadMessages(threadId: string, afterMessageId?: string) {
+  let response = await getThread(threadId, { afterMessageId, refresh: true });
+  if (!afterMessageId || response.messageCursorReset) {
+    return response;
+  }
+  const messages = [...response.messages];
+  while (response.hasMoreMessages && response.messageCursor) {
+    const next = await getThread(threadId, {
+      afterMessageId: response.messageCursor,
+      refresh: true,
+    });
+    if (next.messageCursorReset) {
+      return next;
+    }
+    messages.push(...next.messages);
+    response = next;
+  }
+  return { ...response, messages };
 }
 
 export async function prefetchThreadDetailsState(
@@ -210,25 +289,38 @@ export async function prefetchThreadDetailsState(
   activeThreadId?: string,
 ) {
   const normalized = normalizeWorkspaceCacheSelection(selection);
-  const candidates = prioritizeThreadPrefetch(threads, activeThreadId, 4);
-  await runBoundedThreadPrefetch(candidates, async (candidate) => {
-    const threadSelection = selectionForThread(candidate, normalized);
-    const response = await queryClient.fetchQuery({
-      queryKey: serverStateKeys.thread(candidate.id, threadSelection),
-      queryFn: () => getThread(candidate.id),
-      staleTime: threadDetailSwitchStaleTimeMs,
-    });
-    setThreadDetailState(
-      queryClient,
-      response.thread,
-      response.messages,
-      response.pendingInputRequests,
-      {
-        hasOlderMessages: response.hasOlderMessages,
-        olderMessagesCursor: response.olderMessagesCursor,
-      },
-    );
-  });
+  const candidates = prioritizeThreadPrefetch(threads, activeThreadId, 2);
+  await runBoundedThreadPrefetch(
+    candidates,
+    async (candidate) => {
+      const threadSelection = selectionForThread(candidate, normalized);
+      const response = await queryClient.fetchQuery({
+        queryKey: serverStateKeys.thread(candidate.id, threadSelection),
+        queryFn: () => getThread(candidate.id),
+        staleTime: threadDetailSwitchStaleTimeMs,
+      });
+      setThreadDetailState(
+        queryClient,
+        response.thread,
+        response.messages,
+        response.pendingInputRequests,
+        {
+          hasOlderMessages: response.hasOlderMessages,
+          olderMessagesCursor: response.olderMessagesCursor,
+        },
+      );
+    },
+    1,
+  );
+}
+
+function refreshRequestsForQueryClient(queryClient: QueryClient) {
+  let requests = threadRefreshRequests.get(queryClient);
+  if (!requests) {
+    requests = new Map();
+    threadRefreshRequests.set(queryClient, requests);
+  }
+  return requests;
 }
 
 export function fetchQueuedInputsState(queryClient: QueryClient, threadId: string) {
@@ -428,13 +520,20 @@ function queuedInputsStateKey(queryClient: QueryClient, threadId: string) {
 }
 
 const olderMessageHydrations = new Map<string, Promise<void>>();
+const olderMessageHydrationGenerations = createThreadHydrationGenerationGate();
 
-function olderMessageHydrationKey(queryClient: QueryClient, threadId: string) {
+function olderMessageHydrationBaseKey(queryClient: QueryClient, threadId: string) {
   return JSON.stringify(threadStateKey(queryClient, threadId));
 }
 
+function invalidateOlderThreadMessagesHydration(queryClient: QueryClient, threadId: string) {
+  olderMessageHydrationGenerations.invalidate(olderMessageHydrationBaseKey(queryClient, threadId));
+}
+
 export function hydrateOlderThreadMessagesState(queryClient: QueryClient, threadId: string) {
-  const key = olderMessageHydrationKey(queryClient, threadId);
+  const baseKey = olderMessageHydrationBaseKey(queryClient, threadId);
+  const generation = olderMessageHydrationGenerations.current(baseKey);
+  const key = `${baseKey}:${generation}`;
   const active = olderMessageHydrations.get(key);
   if (active) {
     return active;
@@ -446,6 +545,9 @@ export function hydrateOlderThreadMessagesState(queryClient: QueryClient, thread
     )?.olderMessagesCursor;
     while (cursor) {
       const response = await getThread(threadId, { beforeMessageId: cursor });
+      if (!olderMessageHydrationGenerations.isCurrent(baseKey, generation)) {
+        return;
+      }
       if (response.thread.id !== threadId || response.messages.length === 0) {
         return;
       }
@@ -625,6 +727,7 @@ export function setStatusState(queryClient: QueryClient, status: StatusResponse)
     workspaceId: status.workspaceId,
     workspacePath: status.workspacePath,
   };
+  promoteLegacyRelayServerState(queryClient);
   promoteWorkspaceCache(queryClient, nextSelection);
   setWorkspaceSelection(nextSelection);
   cacheWorkspaceRuntimePreferencesFromStatus(getCodexRelayServerUrl(), status);
@@ -740,12 +843,40 @@ export function setThreadRunningState(
   });
 }
 
+export function appendOptimisticRunMessageState(
+  queryClient: QueryClient,
+  threadId: string,
+  input: QueuedThreadInput,
+) {
+  queryClient.setQueryData<ThreadDetailResponse>(threadStateKey(queryClient, threadId), (current) =>
+    appendOptimisticRunMessageToDetail(current, {
+      input,
+      nowIso: new Date().toISOString(),
+      thread: optimisticSteeringThread(queryClient, threadId),
+      threadId,
+    }),
+  );
+}
+
+export function removeThreadMessageState(
+  queryClient: QueryClient,
+  threadId: string,
+  messageId: string,
+) {
+  queryClient.setQueryData<ThreadDetailResponse>(threadStateKey(queryClient, threadId), (current) =>
+    current
+      ? { ...current, messages: current.messages.filter((message) => message.id !== messageId) }
+      : current,
+  );
+}
+
 export function setThreadsState(
   queryClient: QueryClient,
   threads: ThreadSummary[],
   source: ListThreadsResponse["source"] = "memory",
   selection?: WorkspaceCacheSelection | string,
 ) {
+  initializeThreadSeenBaseline(threads);
   for (const thread of threads) {
     promoteThreadCache(queryClient, thread);
   }
@@ -757,7 +888,12 @@ export function setThreadsState(
   });
 }
 
-export function upsertThreadState(queryClient: QueryClient, thread: ThreadSummary) {
+export function upsertThreadState(
+  queryClient: QueryClient,
+  thread: ThreadSummary,
+  options: { authoritativeThreadState?: boolean } = {},
+) {
+  markThreadSeenIfActive(thread);
   promoteThreadCache(queryClient, thread);
   queryClient.setQueryData<ListThreadsResponse>(currentThreadsKey(), (current) => {
     const threads = current?.threads ?? [];
@@ -765,14 +901,26 @@ export function upsertThreadState(queryClient: QueryClient, thread: ThreadSummar
     return {
       source: current?.source ?? "memory",
       threads: sortThreads(
-        upsertById(threads, existing ? preferredThreadSnapshot(existing, thread) : thread),
+        upsertById(
+          threads,
+          existing && !options.authoritativeThreadState
+            ? preferredThreadSnapshot(existing, thread)
+            : thread,
+        ),
       ),
     };
   });
   queryClient.setQueryData<ThreadDetailResponse>(
     serverStateKeys.thread(thread.id, selectionForThread(thread)),
     (current) =>
-      current ? { ...current, thread: preferredThreadSnapshot(current.thread, thread) } : current,
+      current
+        ? {
+            ...current,
+            thread: options.authoritativeThreadState
+              ? thread
+              : preferredThreadSnapshot(current.thread, thread),
+          }
+        : current,
   );
 }
 
@@ -782,22 +930,34 @@ export function setThreadDetailState(
   messages: ChatMessage[],
   pendingInputRequests: ThreadDetailResponse["pendingInputRequests"] = [],
   options: {
+    authoritativeThreadState?: boolean;
+    hasMoreMessages?: boolean;
     hasOlderMessages?: boolean;
+    messageCursor?: string;
+    messageCursorReset?: boolean;
     olderMessagesCursor?: string;
     replaceMessages?: boolean;
   } = {},
 ) {
-  upsertThreadState(queryClient, thread);
+  upsertThreadState(queryClient, thread, {
+    authoritativeThreadState: options.authoritativeThreadState,
+  });
   const response: ThreadDetailResponse = {
     thread,
     messages,
     pendingInputRequests,
+    hasMoreMessages: options.hasMoreMessages ?? false,
     hasOlderMessages: options.hasOlderMessages ?? false,
+    ...(options.messageCursor ? { messageCursor: options.messageCursor } : {}),
+    messageCursorReset: options.messageCursorReset ?? false,
     ...(options.olderMessagesCursor ? { olderMessagesCursor: options.olderMessagesCursor } : {}),
   };
   queryClient.setQueryData<ThreadDetailResponse>(
     serverStateKeys.thread(thread.id, selectionForThread(thread)),
-    (current) => (options.replaceMessages ? response : mergeThreadDetailState(current, response)),
+    (current) =>
+      options.replaceMessages
+        ? response
+        : mergeThreadDetailState(current, response, options.authoritativeThreadState),
   );
 }
 
@@ -992,7 +1152,9 @@ export function applyStreamEventToServerState(
       upsertMessageState(queryClient, event.thread, event.message);
       return;
     case "thread.state.changed":
-      upsertThreadState(queryClient, event.thread);
+      upsertThreadState(queryClient, event.thread, {
+        authoritativeThreadState: isAuthoritativeTerminalThreadEvent(event),
+      });
       return;
     case "thread.goal.updated":
       upsertThreadState(queryClient, event.thread);
@@ -1050,12 +1212,52 @@ export async function replayThreadEventsState(queryClient: QueryClient, threadId
     isReplayUnavailable: isThreadEventReplayUnavailable,
     threadId,
   });
-  if (result.resetRequired) {
-    queryClient.setQueryData(threadEventCursorKey(queryClient, threadId), {
-      sequence: result.lastSequence,
-    });
-  }
   return result;
+}
+
+export function recoverThreadTimelineState(
+  queryClient: QueryClient,
+  threadId: string,
+  baselineSnapshot?: ThreadDetailResponse,
+) {
+  return runThreadRecoveryLadder({
+    baselineSnapshot,
+    hydrateOlderHistory: () => hydrateOlderThreadMessagesState(queryClient, threadId),
+    isSequenceGap: (error) => error instanceof ThreadEventSequenceGapError,
+    refreshFromMessageCursor: () => fetchThreadState(queryClient, threadId, { refresh: true }),
+    refreshRecentSnapshot: () => fetchRecentAuthoritativeThreadSnapshotState(queryClient, threadId),
+    replayEvents: () => replayThreadEventsState(queryClient, threadId),
+    setEventCursor(sequence) {
+      queryClient.setQueryData(threadEventCursorKey(queryClient, threadId), { sequence });
+    },
+  });
+}
+
+async function fetchRecentAuthoritativeThreadSnapshotState(
+  queryClient: QueryClient,
+  threadId: string,
+) {
+  const response = await getThread(threadId, { refresh: true });
+  invalidateOlderThreadMessagesHydration(queryClient, threadId);
+  setThreadDetailState(
+    queryClient,
+    response.thread,
+    response.messages,
+    response.pendingInputRequests,
+    {
+      authoritativeThreadState: true,
+      hasMoreMessages: response.hasMoreMessages,
+      hasOlderMessages: response.hasOlderMessages,
+      messageCursor: response.messageCursor,
+      messageCursorReset: response.messageCursorReset,
+      olderMessagesCursor: response.olderMessagesCursor,
+      replaceMessages: true,
+    },
+  );
+  return (
+    queryClient.getQueryData<ThreadDetailResponse>(threadStateKey(queryClient, threadId)) ??
+    response
+  );
 }
 
 export function removePendingInputRequestState(

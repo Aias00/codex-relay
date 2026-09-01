@@ -16,9 +16,19 @@ import type {
 
 import {
   cacheChatNavigation,
+  cachedChatNavigationForRelay,
   clearCachedChatNavigation,
   readCachedChatNavigation,
 } from "../lib/chat-navigation-cache";
+import { getStoredConnectionPlan } from "../lib/codex-relay-connection-plan";
+import {
+  initializeThreadSeenBaselineState,
+  isThreadCompletionUnseen,
+  markThreadSeenState,
+  persistThreadSeenState,
+  readThreadSeenState,
+  type ThreadSeenState,
+} from "../lib/thread-seen-store";
 import { resetWorkspacePreviewState } from "./workspace-preview-store";
 
 type ConnectionState = "checking" | "connected" | "offline";
@@ -50,6 +60,7 @@ type ChatState = {
   error?: string;
   hasPairedSession: boolean;
   threadMessagesLoadingByThreadId: Record<string, boolean>;
+  threadSeenState: ThreadSeenState;
   threadSyncStateByThreadId: Record<string, ThreadSyncState>;
   threadStreamReconnectRequest?: {
     requestId: number;
@@ -71,7 +82,10 @@ type ChatState = {
   workspacePath?: string;
 };
 
-const cachedChatNavigation = readCachedChatNavigation();
+const cachedChatNavigation = cachedChatNavigationForRelay(
+  readCachedChatNavigation(),
+  getStoredConnectionPlan()?.relayId,
+);
 
 export const chatStore$ = observable<ChatState>({
   activeThreadId: cachedChatNavigation.activeThreadId,
@@ -84,6 +98,7 @@ export const chatStore$ = observable<ChatState>({
   error: undefined,
   hasPairedSession: false,
   threadMessagesLoadingByThreadId: {},
+  threadSeenState: readThreadSeenState(),
   threadSyncStateByThreadId: {},
   threadStreamReconnectRequest: undefined,
   machineName: undefined,
@@ -281,6 +296,7 @@ export function activateWorkspaceThread(
     chatStore$.workspacePath.set(selection.workspacePath);
     chatStore$.activeThreadId.set(threadId);
   });
+  markKnownThreadSeen(threadId);
   persistChatNavigation();
 }
 
@@ -467,6 +483,7 @@ export function replaceWorkspaceRuntimePreferences(
 
 export function setActiveThread(threadId: string | undefined) {
   chatStore$.activeThreadId.set(threadId);
+  markKnownThreadSeen(threadId);
   persistChatNavigation();
 }
 
@@ -508,6 +525,7 @@ export function resetChatSessionState() {
 }
 
 export function replaceThreads(threads: ThreadSummary[]) {
+  initializeThreadSeenBaseline(threads);
   const threadsById: Record<string, ThreadSummary> = {};
   for (const thread of threads) {
     threadsById[thread.id] = thread;
@@ -521,11 +539,41 @@ export function replaceThreads(threads: ThreadSummary[]) {
     setActiveThread(nextActiveThreadId);
     return;
   }
+  markThreadSeen(threadsById[activeThreadId]);
+}
+
+export function initializeThreadSeenBaseline(threads: ThreadSummary[]) {
+  updateThreadSeenState((current) =>
+    initializeThreadSeenBaselineState(current, currentThreadSeenRelayId(), threads),
+  );
+}
+
+export function markThreadSeen(thread: ThreadSummary | undefined) {
+  if (!thread) {
+    return;
+  }
+  updateThreadSeenState((current) =>
+    markThreadSeenState(current, currentThreadSeenRelayId(), thread),
+  );
+}
+
+export function markThreadSeenIfActive(thread: ThreadSummary) {
+  if (chatStore$.activeThreadId.peek() === thread.id) {
+    markThreadSeen(thread);
+  }
+}
+
+export function threadHasUnseenCompletion(
+  thread: ThreadSummary,
+  state = chatStore$.threadSeenState.peek(),
+) {
+  return isThreadCompletionUnseen(state, currentThreadSeenRelayId(), thread);
 }
 
 function persistChatNavigation() {
   cacheChatNavigation({
     activeThreadId: chatStore$.activeThreadId.peek(),
+    relayId: getStoredConnectionPlan()?.relayId,
     workspaceId: chatStore$.workspaceId.peek(),
     workspacePath: chatStore$.workspacePath.peek(),
   });
@@ -544,6 +592,28 @@ export function upsertThread(thread: ThreadSummary) {
       }),
     );
   });
+  markThreadSeenIfActive(thread);
+}
+
+function markKnownThreadSeen(threadId: string | undefined) {
+  const thread = threadId ? chatStore$.threadsById[threadId].peek() : undefined;
+  if (thread) {
+    markThreadSeen(thread);
+  }
+}
+
+function currentThreadSeenRelayId() {
+  return getStoredConnectionPlan()?.relayId ?? "legacy";
+}
+
+function updateThreadSeenState(update: (state: ThreadSeenState) => ThreadSeenState) {
+  const current = chatStore$.threadSeenState.peek();
+  const next = update(current);
+  if (next === current) {
+    return;
+  }
+  chatStore$.threadSeenState.set(next);
+  persistThreadSeenState(next);
 }
 
 export function mergeActiveThreadInto(thread: ThreadSummary) {

@@ -56,7 +56,11 @@ import { ThemedText } from "@/components/themed-text";
 import { CopyableCommand } from "@/components/ui/copyable-command";
 import { AppToast } from "@/components/ui/toast";
 import { Colors, Fonts, Spacing } from "@/constants/theme";
-import { activeThreadAfterRefresh } from "@/lib/active-thread-selection";
+import {
+  activeThreadAfterRefresh,
+  isMissingThreadSnapshotError,
+  shouldPreferHydratedDefaultThread,
+} from "@/lib/active-thread-selection";
 import { consumeHydratedDefaultThread } from "@/lib/server-state-hydration";
 import {
   createClientEventId,
@@ -73,6 +77,7 @@ import {
   streamThreadRun,
   uploadImageAttachments,
 } from "@/lib/codex-relay-api";
+import { getStoredConnectionPlan } from "@/lib/codex-relay-connection-plan";
 import {
   claimInputIdentity,
   clearInputIdentity,
@@ -87,9 +92,18 @@ import {
   hapticWarning,
 } from "@/lib/haptics";
 import { withTimeout } from "@/lib/network-timeout";
+import { materializePushActivation } from "@/lib/push-activation";
+import {
+  claimPushNotificationEvent,
+  clearPendingPushNotificationTarget,
+  isPushNotificationEventProcessed,
+  readPendingPushNotificationTarget,
+  subscribePendingPushNotificationTarget,
+} from "@/lib/push-notifications";
 import { runtimePreferencesForWorkspace } from "@/lib/runtime-preferences";
 import {
   applyOrderedThreadEventToServerState,
+  appendOptimisticRunMessageState,
   checkoutWorkspaceBranchServerState,
   clearThreadGoalServerState,
   clearServerState,
@@ -109,9 +123,10 @@ import {
   prefetchAllThreadsState,
   prefetchWorkspaceSummariesState,
   prefetchThreadDetailsState,
+  recoverThreadTimelineState,
   removePendingInputRequestState,
+  removeThreadMessageState,
   removeQueuedThreadInputServerState,
-  replayThreadEventsState,
   rewindThreadServerState,
   restoreOptimisticSteerQueuedInputState,
   serverStateKeys,
@@ -127,25 +142,32 @@ import {
   updateThreadGoalServerState,
   updateRuntimePreferencesServerState,
 } from "@/lib/server-state";
+import { optimisticRunMessageId } from "@/lib/server-state-messages";
 import { recordSuccessfulAiConversationForReviewPrompt } from "@/lib/store-review-prompt";
 import {
   markThreadEventStreamUnavailable,
   shouldUseThreadEventStream,
 } from "@/lib/thread-event-stream-capability";
 import {
+  runningThreadRecoveryMode,
   shouldBlockThreadActivation,
+  shouldAttachRunningThreadStream,
+  threadActivationTiming,
   threadDetailSwitchStaleTimeMs,
   threadSnapshotFetchOptions,
 } from "@/lib/thread-activation";
 import {
   completeThreadRunSession,
+  durableStreamCheckpointAction,
   handleThreadRunStreamEvent,
   isThreadActiveWriterStreamEvent,
   isThreadMessageStreamEvent,
   reconcileThreadRunEventAfterTerminal,
+  streamTerminalSettlementTiming,
 } from "@/lib/thread-run-stream";
 import { readCachedWorkspaceRuntimePreferences } from "@/lib/workspace-runtime-preferences-cache";
 import {
+  activateWorkspaceThread,
   appendComposerAttachments,
   chatStore$,
   clearComposerDraft,
@@ -156,6 +178,7 @@ import {
   getComposerDraft,
   getComposerSkills,
   moveNewThreadCollaborationMode,
+  markThreadSeen,
   requestThreadStreamReconnect,
   resetChatSessionState,
   setActiveThread,
@@ -174,7 +197,11 @@ import {
 import { addWorkspacePreviewTab } from "@/state/workspace-preview-store";
 
 import { ChatControls } from "./ChatControls";
-import { runConnectionRefresh, shouldStartForegroundRefresh } from "./connection-refresh";
+import {
+  connectionRefreshActionPresentation,
+  runConnectionRefresh,
+  shouldStartForegroundRefresh,
+} from "./connection-refresh";
 import {
   modelForSelection,
   normalizeRuntimePreferencesForModels,
@@ -498,7 +525,6 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   const threadMessagesLoadingByThreadId = useSelector(() =>
     chatStore$.threadMessagesLoadingByThreadId.get(),
   );
-  const threadSyncStateByThreadId = useSelector(() => chatStore$.threadSyncStateByThreadId.get());
   const threadStreamReconnectRequest = useSelector(() =>
     chatStore$.threadStreamReconnectRequest.get(),
   );
@@ -564,7 +590,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     statusQuery.data?.appServerAvailable === true &&
     threadsQuery.data?.source === "app-server" &&
     Boolean(activeThreadId && threadsById[activeThreadId]);
-  const isRunningAppThread = activeThread?.source === "app" && activeThread.state === "running";
+  const isRunningThread = shouldAttachRunningThreadStream(activeThread);
   const activeWorkspaceId = activeThread?.workspaceId ?? statusQuery.data?.workspaceId;
   const activeWorkspacePath = activeThread?.cwd ?? workspacePath;
   const skillsQuery = useQuery({
@@ -619,7 +645,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   const isLoadingMessages =
     !!activeThreadId &&
     !activeThreadDetailQuery.data &&
-    !isRunningAppThread &&
+    !isRunningThread &&
     (isLoadingSelectedThreadMessages || (activeThread?.messageCount ?? 0) > 0);
   const contextWindowUsage = contextWindowQuery.data?.usage ?? undefined;
   const queuedPrompts = useMemo(
@@ -690,6 +716,36 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     return hasSession;
   }, [queryClient]);
 
+  const materializePendingPushTarget = useCallback(async () => {
+    const target = readPendingPushNotificationTarget();
+    if (!target) {
+      return undefined;
+    }
+    if (isPushNotificationEventProcessed(target)) {
+      clearPendingPushNotificationTarget();
+      return undefined;
+    }
+    const result = await materializePushActivation({
+      activate(detail) {
+        activateWorkspaceThread(detail.thread.id, {
+          workspaceId: detail.thread.workspaceId ?? target.workspaceId,
+          workspacePath: detail.thread.cwd,
+        });
+        markThreadSeen(detail.thread);
+      },
+      currentRelayId: getStoredConnectionPlan()?.relayId,
+      isMissingThread: isMissingThreadSnapshotError,
+      loadThread: (threadId) => fetchThreadState(queryClient, threadId, { refresh: true }),
+      target,
+    });
+    if (result.status === "deferred") {
+      return result.status;
+    }
+    clearPendingPushNotificationTarget();
+    claimPushNotificationEvent(target);
+    return result.status;
+  }, [queryClient]);
+
   const clearThreadStatusPoll = useCallback(() => {
     if (!threadStatusPollRef.current) {
       return;
@@ -709,24 +765,45 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   }, []);
 
   const syncThreadSnapshot = useCallback(
-    async (threadId: string, options: { refresh?: boolean; setOfflineOnError?: boolean } = {}) => {
+    async (
+      threadId: string,
+      options: {
+        activateAfterSnapshot?: { expectedActiveThreadId: string | undefined };
+        blockCachedMessages?: boolean;
+        onError?: (error: unknown) => void;
+        refresh?: boolean;
+        setOfflineOnError?: boolean;
+      } = {},
+    ) => {
       const setOfflineOnError = options.setOfflineOnError ?? true;
       const cachedDetail = queryClient.getQueryData<ThreadDetailResponse>(
         serverStateKeys.thread(threadId, selectedWorkspaceSelection),
       );
+      const refresh = options.refresh ?? false;
+      const isCachedRunning = cachedDetail?.thread.state === "running";
       const hasCachedMessages = Boolean(cachedDetail?.messages.length);
       setThreadSyncState(threadId, hasCachedMessages ? "cached" : "syncing");
-      setThreadMessagesLoading(threadId, shouldBlockThreadActivation(cachedDetail));
+      setThreadMessagesLoading(
+        threadId,
+        shouldBlockThreadActivation(cachedDetail) || options.blockCachedMessages === true,
+      );
       try {
         setThreadSyncState(threadId, "syncing");
         const response = await fetchThreadState(
           queryClient,
           threadId,
-          threadSnapshotFetchOptions(options.refresh),
+          threadSnapshotFetchOptions(refresh, isCachedRunning),
         );
         syncPairedSessionState();
         if (chatStore$.activeThreadId.peek() !== threadId) {
-          return response.thread.state;
+          const expectedActiveThreadId = options.activateAfterSnapshot?.expectedActiveThreadId;
+          if (
+            !options.activateAfterSnapshot ||
+            chatStore$.activeThreadId.peek() !== expectedActiveThreadId
+          ) {
+            return response.thread.state;
+          }
+          setActiveThread(threadId);
         }
         setThreadDetailState(
           queryClient,
@@ -746,7 +823,10 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         void olderHistoryHydration
           .then(() => setThreadSyncState(threadId, "synced"))
           .catch(() => setThreadSyncState(threadId, "stale"));
-        await replayThreadEventsState(queryClient, threadId).catch(() => undefined);
+        const recovery = await recoverThreadTimelineState(queryClient, threadId, response).catch(
+          () => undefined,
+        );
+        void recovery?.olderHistory?.catch(() => setThreadSyncState(threadId, "stale"));
         const synchronizedThread =
           queryClient.getQueryData<Awaited<ReturnType<typeof serverStateQueryFns.thread>>>(
             serverStateKeys.thread(threadId, selectedWorkspaceSelection),
@@ -763,9 +843,16 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         setConnection("connected");
         return synchronizedThread.state;
       } catch (caught) {
+        options.onError?.(caught);
         setThreadSyncState(threadId, "stale");
         syncPairedSessionState();
-        if (setOfflineOnError && chatStore$.activeThreadId.peek() === threadId) {
+        const activeThreadId = chatStore$.activeThreadId.peek();
+        if (
+          setOfflineOnError &&
+          (activeThreadId === threadId ||
+            (options.activateAfterSnapshot &&
+              activeThreadId === options.activateAfterSnapshot.expectedActiveThreadId))
+        ) {
           setConnection("offline", errorMessage(caught));
         }
         return undefined;
@@ -795,9 +882,31 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   );
 
   const loadThread = useCallback(
-    async (threadId: string, options: { refresh?: boolean } = {}) => {
-      setActiveThread(threadId);
-      const state = await syncThreadSnapshot(threadId, { refresh: options.refresh });
+    async (
+      threadId: string,
+      options: { blockCachedMessages?: boolean; refresh?: boolean } = {},
+    ) => {
+      const currentActiveThreadId = chatStore$.activeThreadId.peek();
+      const hasTargetDetail =
+        queryClient.getQueryData(serverStateKeys.thread(threadId, selectedWorkspaceSelection)) !==
+        undefined;
+      const activationTiming = threadActivationTiming({
+        currentThreadId: currentActiveThreadId,
+        hasTargetDetail,
+        targetThreadId: threadId,
+      });
+      if (activationTiming === "before-snapshot") {
+        setActiveThread(threadId);
+      }
+      const state = await syncThreadSnapshot(threadId, {
+        ...options,
+        ...(activationTiming === "after-snapshot"
+          ? { activateAfterSnapshot: { expectedActiveThreadId: currentActiveThreadId } }
+          : {}),
+      });
+      if (chatStore$.activeThreadId.peek() !== threadId) {
+        return;
+      }
       if (state === "running") {
         requestThreadStreamReconnect(threadId);
         return;
@@ -807,7 +916,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         setThreadRunningState(queryClient, threadId, false);
       }
     },
-    [clearThreadStatusPoll, queryClient, syncThreadSnapshot],
+    [clearThreadStatusPoll, queryClient, selectedWorkspaceSelection, syncThreadSnapshot],
   );
 
   const refreshUsageStatus = useCallback(
@@ -857,6 +966,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
           },
         );
         setThreadsState(queryClient, response.threads, response.source);
+        const pushActivationStatus = await materializePendingPushTarget();
         queryClient.setQueryData(serverStateKeys.models(), modelsResponse);
         if (rateLimitsResponse) {
           queryClient.setQueryData(serverStateKeys.rateLimits(), rateLimitsResponse);
@@ -873,13 +983,20 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
           },
           currentActiveThreadId,
         ).catch(() => undefined);
-        const preferFirstThread = consumeHydratedDefaultThread(currentActiveThreadId);
+        const preferFirstThread = shouldPreferHydratedDefaultThread(
+          consumeHydratedDefaultThread(currentActiveThreadId),
+          pushActivationStatus,
+        );
         const hasCurrentActiveThread =
           !!currentActiveThreadId &&
           response.threads.some((thread) => thread.id === currentActiveThreadId);
+        let missingActiveThreadError: unknown;
         const missingActiveThreadState =
           currentActiveThreadId && !hasCurrentActiveThread
             ? await syncThreadSnapshot(currentActiveThreadId, {
+                onError(error) {
+                  missingActiveThreadError = error;
+                },
                 setOfflineOnError: false,
               })
             : undefined;
@@ -888,17 +1005,27 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         }
         const missingActiveThreadRestored = Boolean(missingActiveThreadState);
         const nextActiveThreadId = activeThreadAfterRefresh({
+          canReplaceMissingActiveThread:
+            !currentActiveThreadId ||
+            hasCurrentActiveThread ||
+            isMissingThreadSnapshotError(missingActiveThreadError),
           currentActiveThreadId,
           missingActiveThreadRestored,
           preferFirstThread,
           threads: response.threads,
         });
 
-        if (nextActiveThreadId !== currentActiveThreadId) {
-          setActiveThread(nextActiveThreadId);
-        }
-        if (nextActiveThreadId && !missingActiveThreadRestored) {
-          await loadThread(nextActiveThreadId);
+        if (!nextActiveThreadId) {
+          setActiveThread(undefined);
+        } else if (!missingActiveThreadRestored) {
+          const nextActiveThread = response.threads.find(
+            (thread) => thread.id === nextActiveThreadId,
+          );
+          const isRunningThread = nextActiveThread?.state === "running";
+          await loadThread(nextActiveThreadId, {
+            blockCachedMessages: isRunningThread,
+            refresh: isRunningThread,
+          });
         } else if (nextActiveThreadId && missingActiveThreadState === "running") {
           requestThreadStreamReconnect(nextActiveThreadId);
         }
@@ -918,12 +1045,20 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     applyStatusFromServer,
     fetchCurrentStatus,
     loadThread,
+    materializePendingPushTarget,
     queryClient,
     syncPairedSessionState,
     syncThreadSnapshot,
   ]);
   const refreshRef = useRef(refresh);
   refreshRef.current = refresh;
+  useEffect(
+    () =>
+      subscribePendingPushNotificationTarget(() => {
+        void refreshRef.current();
+      }),
+    [],
+  );
   const lastForegroundRefreshAtRef = useRef<number | undefined>(undefined);
   const requestForegroundRefresh = useCallback(() => {
     const now = Date.now();
@@ -962,7 +1097,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         const thread = queryClient.getQueryData<
           Awaited<ReturnType<typeof serverStateQueryFns.thread>>
         >(serverStateKeys.thread(threadId, selectedWorkspaceSelection))?.thread;
-        if (thread?.source === "app") {
+        if (runningThreadRecoveryMode(thread, true) === "stream") {
           requestThreadStreamReconnect(threadId);
           return;
         }
@@ -1037,6 +1172,76 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         )?.sequence ?? 0;
       let fallbackStarted = false;
 
+      const settleTerminalStream = (
+        settledThreadId: string,
+        settledEvent: StreamThreadRunEvent | undefined,
+      ) => {
+        completeThreadRunSession({
+          threadId: settledThreadId,
+          clearQueuedPrompts,
+          onSuccessfulCompletion: recordSuccessfulAiConversationForReviewPrompt,
+          setQueuedInputs: (queuedThreadId, inputs) =>
+            setQueuedInputsState(queryClient, queuedThreadId, inputs),
+          setRunning: (isRunning) => setThreadRunningState(queryClient, settledThreadId, isRunning),
+          terminalEvent: settledEvent,
+          refreshUsageStatus,
+        });
+      };
+
+      const recoverDurableCheckpoint = async (fallbackError: string) => {
+        let recoveredState: ThreadSummary["state"] | undefined;
+        try {
+          await withTimeout(
+            recoverThreadTimelineState(queryClient, terminalStreamThreadId),
+            15_000,
+          );
+          recoveredState = queryClient.getQueryData<ThreadDetailResponse>(
+            serverStateKeys.thread(terminalStreamThreadId, selectedWorkspaceSelection),
+          )?.thread.state;
+        } catch {}
+
+        if (!recoveredState) {
+          recoveredState = await withTimeout(
+            syncThreadSnapshot(terminalStreamThreadId, {
+              refresh: true,
+              setOfflineOnError: false,
+            }),
+            15_000,
+          ).catch(() => undefined);
+        }
+        if (!recoveredState) {
+          await recoverThreadAfterStreamLoss(terminalStreamThreadId, fallbackError);
+          return;
+        }
+        if (streamGeneration !== streamGenerationRef.current) {
+          return;
+        }
+
+        const action = durableStreamCheckpointAction({
+          activeThreadId: chatStore$.activeThreadId.peek(),
+          recoveredState,
+          threadId: terminalStreamThreadId,
+        });
+        if (action === "reconnect") {
+          setThreadRunningState(queryClient, terminalStreamThreadId, true);
+          requestThreadStreamReconnect(terminalStreamThreadId);
+          return;
+        }
+        if (action === "ignore") {
+          return;
+        }
+
+        const recoveredThread = queryClient.getQueryData<ThreadDetailResponse>(
+          serverStateKeys.thread(terminalStreamThreadId, selectedWorkspaceSelection),
+        )?.thread;
+        settleTerminalStream(
+          terminalStreamThreadId,
+          recoveredThread
+            ? { type: "thread.state.changed", thread: recoveredThread }
+            : terminalStreamEvent,
+        );
+      };
+
       const startAttachment: (transport: "durable" | "legacy") => void = (transport) => {
         let closeStream = () => {};
         let attachmentSettled = false;
@@ -1091,17 +1296,9 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
                 sawTerminalStreamEvent = true;
                 terminalStreamEvent = terminalEvent;
                 terminalStreamThreadId = terminalThreadId;
-                completeThreadRunSession({
-                  threadId: terminalThreadId,
-                  clearQueuedPrompts,
-                  onSuccessfulCompletion: recordSuccessfulAiConversationForReviewPrompt,
-                  setQueuedInputs: (queuedThreadId, inputs) =>
-                    setQueuedInputsState(queryClient, queuedThreadId, inputs),
-                  setRunning: (isRunning) =>
-                    setThreadRunningState(queryClient, terminalThreadId, isRunning),
-                  terminalEvent,
-                  refreshUsageStatus,
-                });
+                if (streamTerminalSettlementTiming(transport) === "immediate") {
+                  settleTerminalStream(terminalThreadId, terminalEvent);
+                }
               },
             });
           },
@@ -1129,6 +1326,10 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             closeStream();
             if (closeStreamRef.current === closeStream) {
               closeStreamRef.current = undefined;
+            }
+            if (transport === "durable" && sawTerminalStreamEvent) {
+              void recoverDurableCheckpoint(caught.message);
+              return;
             }
             if (receivedStreamEvent) {
               void recoverThreadAfterStreamLoss(threadId, caught.message);
@@ -1170,6 +1371,12 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
               );
               return;
             }
+            if (transport === "durable") {
+              void recoverDurableCheckpoint(
+                "Codex Relay stream closed before the latest thread state was confirmed.",
+              );
+              return;
+            }
             if (!sawMessageStreamEvent) {
               void withTimeout(
                 syncThreadSnapshot(terminalStreamThreadId, {
@@ -1184,7 +1391,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
                 });
               return;
             }
-            void replayThreadEventsState(queryClient, terminalStreamThreadId)
+            void recoverThreadTimelineState(queryClient, terminalStreamThreadId)
               .catch(() => undefined)
               .then(() => refreshUsageStatus(terminalStreamThreadId))
               .catch(() => undefined);
@@ -1223,8 +1430,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   useEffect(() => {
     if (
       !activeThreadId ||
-      activeThread?.state !== "running" ||
-      activeThread.source !== "app" ||
+      !isRunningThread ||
       closeStreamRef.current ||
       threadStreamReconnectRequest
     ) {
@@ -1232,7 +1438,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     }
 
     requestThreadStreamReconnect(activeThreadId);
-  }, [activeThread?.source, activeThread?.state, activeThreadId, threadStreamReconnectRequest]);
+  }, [activeThreadId, isRunningThread, threadStreamReconnectRequest]);
 
   const loadWorkspaceChanges = useCallback(
     async (options: { staleTime?: number } = {}) => {
@@ -1711,7 +1917,6 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     const runPreferences = currentRuntimePreferences();
     const requestBody = {
       attachments: requestAttachments,
-      expectedOwnerEpoch: activeThread?.ownerEpoch,
       prompt,
       skills: requestSkills,
       model: runPreferences.model,
@@ -1773,7 +1978,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
           setQueuedInputsState(queryClient, activeThreadId, visibleQueue, response.queueLength);
         }
         setConnection("connected");
-        if (!closeStreamRef.current && activeThread?.source === "app") {
+        if (!closeStreamRef.current && shouldAttachRunningThreadStream(activeThread)) {
           requestThreadStreamReconnect(activeThreadId);
         }
       } catch (caught) {
@@ -1850,6 +2055,13 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       }
 
       const runThreadId = threadId;
+      const optimisticMessageId = optimisticRunMessageId(input.clientEventId);
+      appendOptimisticRunMessageState(queryClient, runThreadId, {
+        attachments: input.requestBody.attachments ?? [],
+        id: input.clientEventId,
+        prompt: input.prompt,
+        skills: input.requestBody.skills ?? [],
+      });
       setThreadCollaborationMode(runThreadId, input.collaborationMode);
       detachCurrentStream();
       const streamGeneration = streamGenerationRef.current + 1;
@@ -1860,6 +2072,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       let terminalStreamEvent: StreamThreadRunEvent | undefined;
       markStreamActivity();
       const restorePrompt = () => {
+        removeThreadMessageState(queryClient, runThreadId, optimisticMessageId);
         if (!input.restoreDraftOnFailure) {
           return;
         }
@@ -2582,11 +2795,12 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   const isWorkspacePreviewVisible = usesWideLayout
     ? showsWidePreviewPane
     : hasPairedSession && activePagerPage === 1;
+  const connectionRefreshAction = connectionRefreshActionPresentation(connection);
   const chatTrailingActions: ChatShellAction[] = hasPairedSession
     ? [
         {
-          icon: "refresh",
-          label: "Refresh chat",
+          icon: connectionRefreshAction.icon,
+          label: connectionRefreshAction.label,
           onPress: refresh,
         },
         {
@@ -2617,8 +2831,6 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             hasPairedSession={hasPairedSession}
             serverUrl={serverUrl}
             workspacePath={workspacePath}
-            syncState={activeThreadId ? threadSyncStateByThreadId[activeThreadId] : undefined}
-            onRefresh={refresh}
             onScanConnect={openScanner}
           />
         </Animated.View>

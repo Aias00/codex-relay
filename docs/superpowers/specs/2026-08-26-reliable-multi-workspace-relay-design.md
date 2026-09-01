@@ -183,6 +183,139 @@ Checkpoint 22 improves mobile conversation responsiveness without changing serve
 - Thread hydration exposes cache, latest-sync, older-history hydration, synced, and stale states. Cached messages remain visible while network work continues, and older pagination runs in the background.
 - The conversation list continues using the existing virtualized `LegendList` and memoized message bubbles; no new list dependency or risky recycling behavior is introduced.
 
+Checkpoint 23 begins the Phase 9 semantic identity migration without removing compatibility paths:
+
+- Chat messages expose an optional `semanticEventId`; mobile optimistic run and steering messages derive it from the stable `clientEventId` accepted by Relay.
+- Relay passes that identity to app-server as `clientUserMessageId`, preserves it on canonical user items, and emits one canonical replacement when item lifecycle notifications repeat.
+- Mobile message merging prefers canonical messages sharing the same semantic identity even when attachment or skill normalization changes the rendered content.
+- Startup refresh keeps a cached active thread when its detail snapshot fails transiently; only an authoritative missing-thread response may replace that navigation with a list fallback.
+- Push payloads add Relay, workspace, turn, and deterministic semantic notification identities. Mobile rejects identified notifications from another Relay, activates the exact workspace/thread, and keeps a bounded processed-event history while accepting legacy thread-only payloads.
+- Persisted navigation records the Relay identity. Cold start preserves matching and legacy selections but discards workspace/thread selection when the stored plan identifies a different Relay.
+- React Query server-state keys include the stable Relay identity in addition to URL, workspace, and thread. URL-only persisted keys are promoted once into the current Relay scope, while keys for another URL or an already identified Relay are never reused.
+- One shared attention function defines and applies `blocked > failed > completed-unseen > paused > working > idle > unknown` to background catch-up and conversation-list status.
+- A Relay/workspace/thread-scoped seen ledger baselines existing history on first upgrade, records active-thread snapshot and stream activity, and marks only newer background completions unseen. Opening a conversation clears its unseen completion without affecting another Relay or workspace.
+- Seen baselines are tracked per Relay plus workspace identity rather than per Relay alone. Introducing a second workspace therefore baselines its existing completed threads without misclassifying them as new completions; the v2 store intentionally rebaselines v1 data.
+- Older Relays and mobile bundles continue using message IDs, replacement metadata, bounded content heuristics, legacy notification routing, and URL-only cache keys through compatibility readers.
+
+Checkpoint 24 expands the Phase 8 content-safe operator surface:
+
+- `status` summarizes recorded listen/connect configuration, database schema and counts, paired clients, owners, claims, approvals, and events without printing pairing payloads or credentials.
+- `connections`, `workspaces`, `owners`, and `events <thread-id>` expose route candidates and durable coordination metadata while omitting event payload JSON, prompts, file content, tokens, and approval codes.
+- `doctor` checks server metadata, schema migration level, authentication storage, route candidates, workspace availability, expired owners, and managed shared app-server socket configuration with JSON and human-readable output.
+- The existing atomic `repair-owner` command closes the diagnostic loop. Local validation detected and repaired one expired owner with no active claim, after which every doctor check passed.
+- Three-phase quiesce, drain, and close remains the next Phase 8 lifecycle increment.
+
+Checkpoint 25 implements the Phase 8 shutdown lifecycle:
+
+- One idempotent lifecycle coordinator runs `quiesce -> drain -> close`, reuses the same shutdown Promise across repeated signals, records hook failures, and always closes after a bounded drain timeout.
+- Quiescing stops the HTTP listener from accepting new connections and returns retryable `503 service_shutdown` responses for mutation and new stream requests that arrive on existing connections, while ordinary reads remain available during drain.
+- Draining waits for serialized thread operations, app-server mutations, workspace registration, and durable event publisher flushes.
+- Closing terminates active SSE readers and workspace PTYs before closing HTTP connections, the Relay app-server client, pairing storage, and durable Relay state storage. SQLite close is idempotent for the process-exit fallback.
+- Shutdown debug writes are serialized and explicitly flushed before process exit, preserving terminal lifecycle evidence.
+- An isolated runtime smoke test returned `/version` successfully, exited with the expected SIGTERM code, released its ephemeral port, wrote both shutdown phases, and reopened schema-v8 state after close.
+
+Checkpoint 26 advances Phase 9 durable semantic identity and recovery:
+
+- Prompt-stream user events derive deterministic durable IDs from the stable `clientEventId`, thread identity, user-message role, and explicit accepted-versus-canonical lifecycle stage.
+- The accepted Relay user message and canonical app-server replacement remain distinct durable events, while repeated canonical notifications converge on one event ID. Delta and thread-state events remain sequence-ordered and intentionally do not use semantic deduplication.
+- Structured input request creation and resolution receive separate deterministic identities from the durable request ID.
+- App-server integration coverage confirms the derived IDs commit through the publisher into SQLite and replay metadata, not only in a pure helper.
+- One mobile recovery ladder now chooses event replay, message cursor refresh, or a recent authoritative snapshot. Cursor reset and sequence gap require the authoritative snapshot, and the event cursor advances only after that snapshot materializes successfully.
+- Older history hydration remains a returned background promise, preserving immediate recent-message rendering while pagination continues.
+- Older-history requests carry a Relay-scoped thread generation. An authoritative reset invalidates the prior generation, so an already in-flight old page is discarded on return instead of merging incompatible history into the new snapshot.
+
+Checkpoint 27 completes the push activation materialization gate:
+
+- Notification response handling persists an exact pending target and returns to the chat surface without mutating workspace or thread navigation.
+- The mounted chat screen receives an in-process staging signal; cold starts recover the same target from MMKV after persisted query hydration.
+- Activation waits for the current Relay identity and an authoritative thread detail snapshot, then validates the optional workspace identity before changing navigation.
+- Relay or workspace mismatch and authoritative missing-thread responses clear and deduplicate the target. Unknown Relay identity and transient thread fetch failures remain pending for the next refresh.
+- Processed push identities are scoped by Relay plus semantic event ID, so identical thread/turn identifiers from different Relays cannot suppress one another.
+- The event is marked processed only after successful activation or explicit rejection, avoiding notification loss if the app exits during materialization.
+- The processed claim key includes Relay, workspace, thread, turn, and semantic event identity. A successfully materialized push target consumes but cannot be replaced by the older hydrated-default fallback.
+- Durable input coverage now exercises ten concurrent retries with one `clientEventId`, proving one created input and one shared durable identity.
+
+Checkpoint 28 closes a shared-TUI terminal-state mismatch:
+
+- App-server `TurnStatus` values now classify `interrupted` as terminal even when its optional `completedAt` remains null, matching the generated protocol schema and the state observed after a TUI turn ends.
+- Authoritative thread refresh can therefore clear Relay and mobile `Working` state instead of treating an interrupted final turn as an unknown running state.
+- Common cancellation aliases remain terminal for rolling protocol compatibility, while unknown future turn states retain the conservative running fallback.
+- Route coverage reproduces the live `thread.status=notLoaded`, `turn.status=interrupted`, and `completedAt=null` shape. This is a server-only correction and requires no mobile bundle update.
+
+Checkpoint 29 adds content-safe compatibility telemetry and an explicit retirement gate:
+
+- `relay-state.db` schema v9 aggregates only fixed compatibility feature names, counts, and first/last timestamps. Prompt text, event payload JSON, tokens, pairing data, file content, thread IDs, and workspace paths are never recorded.
+- Relay observes legacy prompt streams, attach streams, mutations without `clientEventId`, and `workspacePath` selections without `workspaceId`. Observation writes are asynchronous and fail-open, so storage failure cannot change request status or mobile/server interaction.
+- `codex-relay compatibility [--json]` reports only the content-safe aggregate, observation start, quiet-window cutoff, and blocking feature names. `doctor` exposes the same retirement gate as a warning rather than a service error.
+- Compatibility readers cannot be retired until schema-v9 observation has run for 30 days and no `legacy.*` feature was observed inside that entire quiet window. A missing database, pre-v9 database, or incomplete window remains explicitly not ready.
+- Persistence/restart, route classification, fail-open behavior, quiet-window assessment, operator privacy, and real CLI JSON output have regression coverage.
+
+Checkpoint 30 establishes the optional Tailcat server foundation without changing current mobile routing:
+
+- The authenticated Connection Plan accepts an additive Tailcat candidate union containing an opaque token and Relay target port. HTTP candidate shapes and ordering remain backward compatible.
+- Tailcat candidates are returned only when the request declares `tailcat` capability and the owned sidecar still reports healthy. Mobile builds without the native module declare no capability, ignore unsupported transport entries if encountered, and continue probing HTTP candidates within the existing bounded failover budget.
+- `CODEX_RELAY_TAILCAT_TRANSPORT=1` starts one Relay-owned sidecar against only the configured Relay port using an existing persistent key. Startup failure is fail-open, and the existing lifecycle close phase terminates the owned process.
+- The sidecar receives its token through a mode-0600 address file. Child stdout/stderr are drained but never logged, thrown startup errors are generic, and server-state/CLI diagnostics expose only enabled state, health, PID, target port, timestamps, and exit code.
+- Schema, capability gate, unhealthy-sidecar omission, unsupported-mobile fallback, token privacy, startup failure, and sidecar lifecycle have regression coverage. A real Tailcat 0.3.0 smoke run produced a healthy candidate and reached `stopped` after close without printing the token.
+- The embedded iOS loopback proxy and native capability declaration are delivered in Checkpoint 31. Device benchmarks and staged rollout remain subsequent Phase 10 increments.
+
+Checkpoint 31 embeds Tailcat beneath the existing iOS HTTP/SSE client:
+
+- A private Expo module binds a scalar-only Go facade around Tailcat v0.3.0. It listens on one ephemeral IPv4 loopback port and forwards each connection through `Client.DialTCPPort` to the Relay target; it does not install routes, DNS, a VPN profile, or a NetworkExtension.
+- The pinned Go module, `go.sum`, reproducible gomobile build script, arm64 device plus universal arm64/x86_64 simulator XCFramework, Tailcat BSD license, and third-party notice live together. Rebuilding the framework requires Go 1.26.5+, Xcode, and the pinned `x/mobile` tool version.
+- Mobile declares `x-codex-relay-capabilities: tailcat` only when Expo autolinking finds the native module and the internal-build flag `EXPO_PUBLIC_CODEX_RELAY_TAILCAT_TRANSPORT=1` is set. That flag also changes the iOS non-exempt-encryption declaration; ordinary distribution builds remain disabled pending export-compliance and App Store review. A Tailcat plan candidate is materialized into a loopback HTTP candidate, validated through the existing encrypted `/v1/health` probe, and cleaned up before bounded fallback when materialization or health fails.
+- Starting the same token/port is idempotent, so plan refresh cannot tear down active SSE streams. Switching back to HTTP, replacing the paired session, a stale refresh generation, or signing out closes the native listener and client.
+- Tailcat tokens remain memory-only: persisted Connection Plans retain HTTP candidates only, diagnostics and errors omit the token, and the ephemeral loopback URL never replaces the persisted reconnectable server URL. A JS runtime restart therefore returns to HTTP bootstrap before rematerializing Tailcat.
+- Route diagnostics use Tailcat's `Client.DiscoPing` only after the loopback health probe has selected the Tailcat route. The post-selection probe is asynchronous and cannot consume the connection-plan fallback budget. The native facade returns only `direct`, `derp`, `unknown`, or `stopped`; IP endpoints, DERP region identity, tokens, and loopback URLs never enter diagnostic state. Older binaries without the optional native `path` method remain compatible and report `unknown`.
+- The native client persists Tailcat's public DERP map response, ETag, and storage time under the iOS app `Caches` directory so reconnect after an App process restart can use Tailcat's one-hour fresh-cache and stale-on-fetch-failure behavior. Cache files use hashed URL names, atomic replacement, `0600` permissions, and an 8 MiB raw-map limit. Corrupt, oversized, missing, or system-evicted entries fail open to Tailcat's normal map fetch; tokens and Relay payloads are never written to this cache.
+- Go unit tests, JS materialization/fallback/privacy/path tests, Expo autolinking, CocoaPods integration, standalone simulator/device pod builds, and a full generic-device Release App build pass. A full Debug App link remains blocked by the repository's existing prebuilt-React Debug symbol mismatch, which contains no Tailcat/Go missing symbols. Fresh repository verification also passes the Relay test suite, workspace typecheck, production build, oxlint, and scoped formatting checks; the full formatter still reports only excluded generated evidence under `.playwright-mcp/` and `work/`.
+- Because the framework is native, existing binaries and OTA-only updates do not activate this checkpoint. A signed internal iOS 1.4.0 build with the Tailcat JS capability, Swift/Go start-stop-path symbols, and non-exempt-encryption declaration enabled has been installed on a physical device. Launch, direct/DERP routing, SSE, and bounded HTTP fallback acceptance remain pending until that device is unlocked for runtime verification.
+
+Checkpoint 32 adds explicit Tailcat server-key rotation without changing Relay identity or pairing state:
+
+- `tailcat-key rotate` requires an explicit DERP region ID, code, or custom hostname. It generates into a sibling temporary file, discards all Tailcat stdout/stderr so the new connection token cannot reach logs, validates the bounded JSON file with Tailcat's own `printpub` command, and atomically replaces the configured key.
+- The previous key is retained as one mode-0600 `.previous` rollback file. The command reports only local paths plus `restartRequired`; it never touches `auth.db`, `relay-state.db`, paired sessions, workspaces, threads, or event cursors.
+- Rotation does not pretend to be active immediately: the running sidecar continues using its in-memory key until Relay restarts. Only that restart invalidates old Tailcat tokens, while ordinary HTTP candidates remain available throughout.
+- Unit tests cover successful replacement, rollback preservation, permissions, and content-safe failure. A real Tailcat 0.3.0 smoke rotation in a temporary directory produced different old/new key hashes with mode-0600 files and no token output. Rotation of the live key remains an explicit destructive acceptance step and has not been run automatically.
+
+Checkpoint 33 establishes a reproducible, content-safe transport benchmark artifact before device sampling:
+
+- A strict versioned JSONL schema covers LAN, direct Tailcat, DERP Tailcat, Tailnet, and Cloudflare across connect, reconnect, sustained SSE, and large-history scenarios. Samples contain only an opaque UUID, timestamp, app version, success, duration, and optional byte, event-count, and battery measurements.
+- Unknown fields are rejected, so URLs, connection tokens, Relay/workspace/thread/turn/message identity, prompts, responses, file paths, and free-form notes cannot enter the artifact. Parse failures report only a line number and never echo the rejected sample.
+- `transport-benchmark FILE` groups by route and scenario and reports only sample/success counts, success rate, and nearest-rank P50/P95 latency, throughput, event count, and battery use. Raw sample IDs are not retained in output.
+- Parser, privacy rejection, deterministic grouping, percentile, throughput, and battery aggregation have regression coverage. This checkpoint defines the measurement contract; collection of real samples and pass/fail thresholds still requires the unlocked physical device.
+
+Checkpoint 34 closes the iOS Release simulator packaging and visual-verification gap:
+
+- The default gomobile build now targets the complete iOS and iOS Simulator platforms. Its generated simulator framework contains both arm64 and x86_64, matching the architectures requested by a Release simulator build; a post-build guard fails immediately if either architecture is missing.
+- CocoaPods integration was regenerated from the universal XCFramework, and a full Release build for `RemoteForge Picker iPhone 17` completed with the embedded Tailcat module and production JS bundle.
+- The built app installed and launched in the simulator without a native-module crash. The 1206x2622 Settings capture shows the compact Diagnostics row, sample count, export action, and clear action without overlap, truncation, or viewport overflow.
+- The simulator downloaded and cryptographically verified production OTA deployment `01a059be-7add-74ad-bd37-c6d604f08b85`, then restarted onto visible bundle `04f08b85`. This provides runtime evidence for the same mobile state fix delivered to iOS 1.4.0. Physical-device direct/DERP, SSE, and bounded HTTP-fallback acceptance remain pending.
+
+Checkpoint 35 makes Tailcat activation OTA-stable and closes simulator direct/fallback acceptance:
+
+- Internal native builds write `CodexRelayTailcatTransportEnabled=true` into Info.plist. The Swift Expo module exposes that immutable native value, and JavaScript declares Tailcat capability only when both the native gate and module are present. OTA manifests can no longer accidentally enable an ordinary distribution build or disable an enabled internal binary.
+- A higher-priority transport candidate may supersede a lower-priority fresh HTTP route; fresh-success remains authoritative for equal or higher-priority HTTP candidates. This allows the intended Tailcat priority 550 experiment to run for upgraded clients instead of being perpetually hidden behind a renewed 24-hour Tailscale success.
+- Release simulator deployment `01a059fa-1fe3-71f2-b1dc-4a5459143a92` loaded against the native-gated binary. Relay content-safe diagnostics confirmed capability requested and Tailcat candidate included; the mobile benchmark recorded `tailcat_direct`, and process inspection showed one loopback listener, bidirectional loopback traffic, UDP sockets, and a DERP 8443 connection.
+- With Relay Tailcat disabled at configuration and the App cold-started, the same authenticated client requested capability but received four HTTP candidates with no Tailcat candidate. Cached conversation content stayed visible and the client continued through Tailscale. The original Relay configuration and one healthy sidecar were restored afterward without restarting the shared app-server.
+- Sidecar ownership now uses a mode-0600 PID file with command validation before stale-process termination. The watchdog owns a dedicated process group and terminates the entire pnpm/tsx/Relay/Tailcat tree on stop or unhealthy exit. Two consecutive LaunchAgent SIGTERM restarts retained exactly one PID-file-matched sidecar and preserved the shared app-server PID. A conflicting standalone Tailcat LaunchAgent was disabled locally; the Relay-owned and standalone modes must not run together.
+- The simulator also completed a secure deep-link pairing without exposing the QR payload or approval code, rendered the same cached history at 3 and 9 seconds while Relay was completely offline, recovered after Relay restart, and isolated four stable workspace cache identities for `/Users/aias`, `competition`, `Chat2DB`, and `iggy`.
+
+Checkpoint 36 closes external-TUI terminal convergence and the large-thread foreground refresh loop:
+
+- Global app-server terminal notifications for TUI-owned turns now persist completed canonical items followed by one authoritative `thread.state.changed` event. A cold Relay with no in-memory thread snapshot reads the exact thread with turns before publishing, so mobile terminal convergence no longer depends on the phone having opened that thread since the last Relay restart.
+- A real isolated `codex --remote unix://` smoke turn confirmed that the shared app-server does not broadcast unknown thread notifications to clients that never subscribed. Shared-socket startup, workspace-summary warmup, and `/v1/threads` listing now schedule an idempotent `thread/resume` with `excludeTurns=true` for active external threads only. Subagents, idle threads, current Relay claims/runtime turns, active durable streams, and already subscribed threads are skipped; subscription failure cannot delay startup or a list response. A second production smoke held a turn active with a bounded shell sleep, restarted Relay, observed `subscribed_from_list`, and then persisted one gap-free external sequence: reasoning item, tool item, completed assistant item, and one final completed thread state.
+- Stable external event IDs deduplicate repeated terminal callbacks. Active turn claims, runtime turn IDs, current durable SSE contexts, and recently terminal Relay-owned turn IDs prevent prompt streams and restart recovery from being republished as external work. Regression coverage includes a cold external TUI completion, a duplicate recovered completion, and a normal mobile durable prompt stream.
+- A running mobile snapshot now performs a zero-stale-time lightweight detail read instead of forcing recent history reconstruction. A non-running server detail is authoritative at the fetch boundary, so an `idle`, `completed`, or `failed` response clears stale local `Working` state without scanning old turns.
+- Recovery after a successful detail read carries that fresh baseline into the event recovery ladder. Event replay still wins when available; replay unavailability or reset reuses the baseline and continues older-history hydration in the background. Full recent-history refresh remains reserved for explicit refresh, stream loss, cursor failure, or a sequence gap with no baseline.
+- Physical iOS 1.4.0 validation recorded three successful `tailcat_direct/connect` samples at 403-598 ms. Stopping the Relay-owned Tailcat sidecar removed the Tailcat candidate, left four HTTP candidates, and the same phone completed an authoritative large-thread read before Relay restored one healthy sidecar.
+- Production OTA `01a05a3f-3fa2-7842-bcf4-e93a524c85e0` is downloaded and active on the physical device. After activation, foreground large-thread reads used `forceRefresh=false`; normal detail responses were typically 2-26 ms and no automatic `forceRefresh=true` occurred after the final cold start.
+- HTTP probe benchmarks now classify `public_https` as `cloudflare` while preserving the content-safe duration/route/success-only payload. Regression coverage confirms that URL, route ID, token, and Relay identity remain absent. OTA `01a05a47-6408-788a-9530-4adbfb400fb3` contains this classification, but the physical device locked before launch; activation and the first real `cloudflare/connect` sample remain pending.
+- Manual exact-route benchmark collection is published in OTA `01a05a65-8140-76e8-9806-64274ac2bc3a`. A subsequent stale-`Working` reproduction proved that Relay had already persisted the external TUI terminal sequence and returned a non-running detail snapshot while mobile still displayed the cached running state. Mobile had only auto-attached the durable terminal stream for `source=app` threads; OTA `01a05a6c-1c2a-7533-8202-36543989c660` removes that source gate for every running thread and retains the 1.5-second detail polling fallback after a stream failure. The later aggregate production OTA `01a05bd0-4e1c-7a2f-a6c4-94da20602298` includes that work plus durable checkpoint settlement and Relay-scoped cache hydration. An iOS 1.4.0 Release simulator downloaded and verified the update, and the physical device now reports active bundle suffix `20602298`. Relay subsequently observed terminal convergence and non-running lightweight detail reads for both active Codex Relay workspace threads.
+- The content-safe compatibility report currently contains no legacy observations, and Relay doctor passes server state, schema v9, auth, routes, all 36 registered workspaces, active owners, shared app-server, and Tailcat checks. Phase 8 retirement remains correctly gated because the 30-day observation window started on 2026-08-31 and does not complete until 2026-09-30; legacy paths must remain enabled until that window closes without usage.
+- Mobile recovery policy now has focused regression coverage proving that every running source initially attaches the durable stream, while only an external thread whose stream actually failed falls back to bounded polling. The opt-in live app-server suite also passes all five real scenarios: independent shared-socket clients, a mobile turn after TUI attachment, server SSE through the mobile reducer, continuation of a not-yet-loaded thread, and real delegation surfaced as mobile subagent activity. Full verification passes all 568 tests, all workspace typechecks, all builds, oxlint, repository formatting, and diff whitespace checks.
+- Forced physical DERP remains pending. The upstream Tailscale DERP-only debug knobs are compiled out on iOS, and closing sidecar UDP descriptors is self-healed by magicsock. Live Tailcat key rotation, DERP-path sampling, and complete LAN/Tailnet/Cloudflare benchmark matrices remain explicit subsequent acceptance steps.
+
 Prompt-stream token deltas are persisted before delivery through the durable publisher. Attach streams intentionally do not republish deltas because multiple subscribers would create duplicate durable events; recovered turns persist completed canonical items and terminal snapshots.
 
 ## Summary
@@ -265,6 +398,7 @@ The remaining reliability gaps are:
 7. **Reject unsupported ownership explicitly.** External desktop occupation never appears as mobile success.
 8. **Keep local filesystem authority local.** Workspace registration does not copy or upload project content.
 9. **Roll out additively.** New storage and APIs coexist with the current paths until both clients are migrated.
+10. **Keep transport below protocol.** LAN, Tailnet, Cloudflare, and optional Tailcat routes carry the same authenticated Relay HTTP/SSE protocol; no transport owns thread semantics.
 
 ## Workspace Model
 
@@ -298,6 +432,19 @@ Every thread, event, runtime snapshot, terminal session, file operation, and Git
 
 Mobile requests cannot register arbitrary directories. New paths enter the registry only through Relay startup configuration, an existing Codex thread `cwd`, or an explicit local operator command.
 
+### Working Directory Semantics
+
+Relay process cwd, package-manager cwd, shared app-server daemon cwd, workspace selection, and thread cwd are distinct values. They must never be inferred from one another after startup.
+
+- `CODEX_RELAY_WORKSPACE_PATH` selects the Relay's default workspace and startup registration path.
+- `CODEX_RELAY_APP_SERVER_CWD` selects only the detached shared app-server daemon's fallback cwd. It defaults to the configured Relay workspace, then the user home directory, never `packages/codex-relay` merely because pnpm launched the server there.
+- A new terminal session must explicitly carry the operator's current directory: `codex --remote unix:// -C "$PWD"`.
+- A resumed thread keeps its persisted original cwd. `-C`, Relay restart, LaunchAgent changes, and mobile workspace selection do not rewrite an existing thread's execution root.
+- Mobile new-thread requests carry the selected stable workspace identity and resolved canonical path to `thread/start`; they never inherit daemon process cwd.
+- `resume --all` is discovery across workspaces, not permission to migrate a thread between workspaces.
+
+Startup diagnostics report all four values separately: Relay process cwd, configured default workspace, daemon cwd, and selected thread cwd. A mismatch is informational unless a new thread omitted explicit workspace metadata, in which case creation fails rather than silently using a package directory.
+
 ## Connection Plan
 
 Pairing bootstrap data includes enough candidates to reach the Relay once. After authentication, the mobile client obtains a server-issued connection plan:
@@ -308,12 +455,22 @@ type ConnectionPlan = {
   serverEpoch: string;
   expiresAt: string;
   refreshPath: string;
-  candidates: Array<{
-    routeId: string;
-    url: string;
-    kind: "last_success" | "tailscale" | "lan" | "link_local" | "public_https";
-    priority: number;
-  }>;
+  candidates: Array<
+    | {
+        routeId: string;
+        transport: "http";
+        url: string;
+        kind: "last_success" | "tailscale" | "lan" | "link_local" | "public_https";
+        priority: number;
+      }
+    | {
+        routeId: string;
+        transport: "tailcat";
+        token: string;
+        localTargetPort: number;
+        priority: number;
+      }
+  >;
 };
 ```
 
@@ -329,6 +486,29 @@ Candidate policy:
 - Persist success and failure observations by `relayId + routeId`, not as one global server URL.
 
 Changing routes does not invalidate pairing, thread cursors, workspace caches, or pending input identities.
+
+### Optional Tailcat Transport
+
+Tailcat is an optional userspace transport adapter built from Tailscale's open-source data plane without the Tailscale control plane. It uses WireGuard encryption, DERP bootstrap and fallback, and magicsock NAT traversal. It does not require a Tailnet account, root privileges, route-table changes, or DNS ownership.
+
+The integration keeps Relay HTTP and SSE unchanged:
+
+```text
+Relay 127.0.0.1:8788
+  -> Mac Tailcat sidecar
+  -> WireGuard over direct UDP or DERP
+  -> embedded iOS Tailcat transport
+  -> app-local loopback proxy
+  -> existing Codex Relay API client
+```
+
+The Mac sidecar exposes only the configured Relay loopback port. The mobile native transport binds an ephemeral loopback port inside the App process; React Native continues using ordinary HTTP/SSE against that local endpoint. Route selection observes one logical Tailcat route while diagnostics may report its current path as `direct` or `derp`.
+
+Tailcat bootstrap metadata is distributed through the existing authenticated pairing and connection-plan flow. A short token may reference a DERP region; a resolved self-contained token may embed DERP nodes to remove the initial map fetch. Persistent server keys provide a stable route across Relay restarts, while explicit rotation invalidates previously distributed tokens. Ephemeral keys are reserved for one-time diagnostics and pairing experiments.
+
+Tailcat is not an authentication replacement. Possession of a persistent Tailcat token grants network reachability, but every Relay request still requires the existing paired session and encrypted payload contract. Tokens are treated as secrets, omitted from logs and diagnostics, and scoped to the Relay port. Production use requires an explicit decision between the rate-limited public DERP map and an operator-controlled DERP deployment.
+
+The first implementation is an experiment behind `CODEX_RELAY_TAILCAT_TRANSPORT`. It is not advertised unless the sidecar is healthy and the mobile bundle declares Tailcat capability. Older mobile clients ignore the additive route. Failure immediately returns control to the ordinary connection-plan candidate budget; it never blocks LAN, Tailnet, or Cloudflare fallback.
 
 ## Durable Storage
 
@@ -520,6 +700,12 @@ The Thread Coordinator must treat the app-server as the execution authority even
 
 Capabilities are discovered from the connected app-server version and observed thread state. Relay must not assume that a turn initiated by another remote client is steerable. When the app-server cannot confirm control, mobile submission returns an explicit external-writer result or remains in a Relay-owned queue according to product policy.
 
+Relay starts the shared app-server as a detached process before attaching, so Relay restarts do not own or terminate the execution authority. A terminal TUI attaches through `codex resume --remote unix://`; after a terminal disconnect it resumes the same thread ID against the surviving daemon.
+
+### Optional Codex Desktop Adapter
+
+On macOS, compatible Codex Desktop builds may connect to the same daemon through an explicit Relay launcher. This is an optional adapter, not the primary workflow. The launcher verifies bundle support and the app-server handshake, refuses to reuse an already-running stdio App process, and waits for the new Desktop PID to connect to the expected Unix socket before reporting success.
+
 ### Compatibility: Desktop Bridge
 
 A bridge remains optional for desktop runtimes that cannot expose their active session through the shared app-server transport. A bridge-enabled process registers itself, receives a lease, publishes events, and injects accepted input into its own command queue.
@@ -695,6 +881,7 @@ CODEX_RELAY_CONNECTION_PLAN_V2
 CODEX_RELAY_WORKSPACE_REGISTRY_V2
 CODEX_RELAY_OWNER_LEASES
 CODEX_RELAY_DESKTOP_BRIDGE
+CODEX_RELAY_TAILCAT_TRANSPORT
 ```
 
 Flags select the internal implementation without changing persisted identifiers. Each phase has a tested rollback to the prior read path until the migration is declared stable.
@@ -792,6 +979,8 @@ Existing server state modules adopt these boundaries incrementally rather than b
 
 **Rollback:** Return explicit writer conflicts and require a new mobile thread.
 
+**Current delivery:** Relay supports terminal attachment through the shared remote transport, optional verified Codex Desktop launch on macOS, and keeps the shared app-server alive independently across Relay restarts. Existing standalone stdio turns retain explicit writer-conflict behavior until they finish and are reopened on the shared app-server.
+
 ### Phase 6: Runtime Controls and Permissions
 
 - Add versioned runtime snapshots, control requests, acknowledgements, interrupt identity, and durable permission requests.
@@ -821,6 +1010,32 @@ Existing server state modules adopt these boundaries incrementally rather than b
 - Remove legacy paths only after compatibility telemetry and release notes confirm migration.
 
 **Rollback:** Retain the last compatibility reader for one additional release.
+
+### Phase 9: Semantic Event Identity and Restoration Hardening
+
+- Promote `clientEventId` into one end-to-end semantic event identity spanning optimistic mobile state, durable input, canonical app-server user items, SSE, message cursors, and push routing.
+- Keep a bounded processed-event history in every consumer and use the same identity as the idempotency key; replacement metadata remains a compatibility bridge, not the primary dedupe mechanism.
+- Add a restoration materialization gate: startup may replace persisted navigation or thread state only after a valid Relay, workspace, and thread snapshot has materialized. Transient empty startup state cannot erase a recoverable cache.
+- Implement one recovery ladder: event cursor, message cursor, recent authoritative snapshot, then bounded older-history hydration. Cursor reset is explicit and never merges incompatible histories.
+- Define one attention priority function for thread and turn rollups: blocked, failed, completed-unseen, paused, working, idle, unknown.
+- Route push notifications with opaque `relayId`, `workspaceId`, `threadId`, `turnId`, and semantic event ID so activation opens the exact conversation without consulting stale navigation state.
+
+**Primary result:** Remove the remaining duplicate bubble, missing optimistic message, stale restoration, and wrong-thread notification classes with one identity and recovery model.
+
+**Rollback:** Continue accepting legacy message IDs and replacement metadata while disabling semantic-ID-only optimizations.
+
+### Phase 10: Optional Tailcat Transport Experiment
+
+- Build a Mac sidecar that exposes only Relay loopback TCP through a persistent Tailcat server key.
+- Add an iOS native Tailcat transport with an App-local loopback proxy so the React Native API client remains unchanged.
+- Extend pairing and Connection Plan with a capability-gated Tailcat route and content-safe direct-versus-DERP diagnostics.
+- Benchmark LAN, direct Tailcat, public DERP, Tailnet, and Cloudflare for connect latency, sustained SSE delivery, reconnect time, battery use, and large-history transfer.
+- Verify token rotation, sidecar restart, DERP-map cache fallback, public DERP rate limits, and optional self-hosted DERP operation.
+- Complete App Store review analysis before shipping the embedded userspace WireGuard transport outside internal builds.
+
+**Primary result:** Provide account-free encrypted reachability when LAN, Tailnet, or public HTTPS routes are unavailable, without changing Relay's message protocol.
+
+**Rollback:** Disable the Tailcat capability and continue with existing HTTP candidates; no thread, cursor, pairing, or workspace migration is required.
 
 ## Verification Strategy
 
@@ -855,6 +1070,8 @@ Existing server state modules adopt these boundaries incrementally rather than b
 - Restart Relay after accepting a queued input and verify one resulting turn.
 - Switch among at least three workspaces with active and completed threads.
 - Disable the active Tailscale/LAN route and verify bounded failover to another candidate.
+- Exercise Tailcat through both a direct UDP path and DERP fallback, then terminate the sidecar and verify bounded failover to HTTP routes.
+- Rotate the Tailcat server key and confirm old tokens lose reachability while Relay pairing credentials remain otherwise valid.
 - Exercise `169.254.*` as a retained but low-priority candidate.
 - Share a thread through `--shared-app-server`, run from terminal and mobile, and verify writer classification.
 - Reset the Relay socket while the shared app-server remains alive and verify recovery.
@@ -869,6 +1086,7 @@ Existing server state modules adopt these boundaries incrementally rather than b
 - Ten retries with one `clientEventId` produce one accepted input and at most one turn.
 - Three workspaces can be switched repeatedly without thread, event, or runtime-state leakage.
 - Route failure triggers bounded candidate failover and plan refresh.
+- Optional Tailcat failure cannot block or invalidate LAN, Tailnet, or Cloudflare candidates.
 - External standalone CLI occupation produces a visible rejection, not apparent success.
 - Shared app-server sessions recover Relay connectivity without stopping the shared runtime.
 - Stale owners, claims, approvals, interrupts, and control requests cannot affect a replacement runtime.
@@ -883,6 +1101,8 @@ The design combines patterns from these references without treating any one impl
 - **Local `claude-code` reconstruction:** desktop worker registration, lease/heartbeat/epoch, event delivery acknowledgement, runtime controls, bridge pointer recovery, and ordered initial-history flushing. This is a reconstructed/custom repository with sparse bridge tests and no configured Git remote, so it is an architectural reference only.
 - **free-claude-code at `821941785496d2f9ccdaf47494c09a2c79d188dd`:** managed CLI lifecycle, temporary-to-real session registration, FIFO claim ownership, cancellation tombstones, outbound deduplication, atomic generation-based persistence, stream cleanup, and two-phase runtime shutdown.
 - **Lody at `d5639f2515c9a1f983f05385356f5304735697e3`:** ACP-owned machine sessions, local-first workspace replicas, workspace-scoped stream and cursor identities, durable CRDT input plus Machine RPC fast-path acknowledgement, idempotent turn reconciliation, acknowledged active-turn steering, bounded room recovery, and activity-driven background session catch-up.
+- **rootshell:** stable semantic attention-event IDs with bounded dedupe history, one shared attention-priority ladder, restoration guarded against transient empty startup state, credential-first session resume with explicit fallback, and end-to-end encrypted push routing keyed by one event ID. Its terminal screen classification, Metal renderer, and mosh/tssh transport are out of scope for Relay.
+- **Tailcat:** control-plane-free Tailscale data-plane transport using compact out-of-band connection tokens, WireGuard encryption, DERP bootstrap/fallback, magicsock direct-path upgrade, optional persistent server keys, DERP-map caching, and userspace TCP forwarding. Its unstable wire/API contract and public DERP limits require capability gating and an experimental rollout.
 
 Important adaptations:
 
@@ -895,6 +1115,9 @@ Important adaptations:
 - Do not copy Lody's hosted Loro Streams dependency into the direct local Relay architecture. Cross-device Lody collaboration still depends on its hosted sync plane and does not provide a self-contained mobile transport implementation in the open-source repository.
 - Adopt Lody's two-path delivery semantics, not two independent dispatchers: durable input remains canonical, the app-server RPC is an acknowledgement fast path, and both converge through one idempotent coordinator.
 - Adopt its `accepted` versus `applied` steer distinction and high-water background catch-up as protocol and scheduling patterns over the existing Relay event APIs.
+- Adopt rootshell's identity and restoration invariants, not its screen-scraping detector: Relay has structured app-server events and must not infer canonical Codex state from rendered terminal text.
+- Bind push dedupe, durable event dedupe, optimistic replacement, and activation routing to one semantic event ID. Do not run independent app and notification-extension consumers against the same event without an atomic dedupe claim.
+- Adopt Tailcat only as a transport adapter beneath Relay HTTP/SSE. Do not let connection tokens replace pairing authentication, expose arbitrary host ports, or make Tailcat availability a prerequisite for startup.
 
 ## Final Decision
 
@@ -908,6 +1131,8 @@ durable events/replay
   -> shared app-server hardening
   -> runtime and permission controls
   -> optional desktop bridge
+  -> semantic identity/restoration hardening
+  -> optional Tailcat transport experiment
 ```
 
 This order addresses the current missing-message and loading failures first, preserves the existing shared app-server investment, and postpones the highest-complexity desktop bridge until the official app-server path and durable coordination model are proven.

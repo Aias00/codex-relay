@@ -96,6 +96,7 @@ import {
   type StatusResponse,
   type StreamThreadRunEvent,
   type SubmitThreadInputResponse,
+  type TailcatConnectionPlanCandidate,
   type ThreadCollaborationMode,
   type ThreadGoal,
   type ThreadMessageDetailField,
@@ -146,6 +147,7 @@ import qrcode from "qrcode-terminal";
 import { z } from "zod";
 
 import {
+  AppServerRequestTimeoutError,
   CodexAppServerClient,
   type AppServerModel,
   type AppServerNotification,
@@ -160,6 +162,7 @@ import {
 } from "./app-server.js";
 import {
   appServerRecoveredTurnState,
+  dispatchedTurnCandidates,
   type RecoveredActiveTurnClaim,
 } from "./app-server-turn-recovery.js";
 import {
@@ -175,6 +178,7 @@ import { readLatestContextWindowUsage } from "./context-window.js";
 import { codexRelayDataPath } from "./paths.js";
 import { relayDebugLog } from "./debug-log.js";
 import type {
+  CompatibilityObservationStore,
   PendingApprovalStore,
   ThreadEventStore,
   ThreadCoordinatorStore,
@@ -189,6 +193,7 @@ import {
   createDurableThreadEventPublisher,
   type DurableThreadEventPublisher,
 } from "./thread-event-publisher.js";
+import { semanticThreadEventId } from "./thread-event-identity.js";
 import { permanentClientSessionExpiresAt, type PairingSessionStore } from "./pairing-store.js";
 import {
   createExpoPushNotificationSender,
@@ -201,6 +206,7 @@ import {
   createMemoryRuntimePreferencesStore,
   type RuntimePreferencesStore,
 } from "./preferences-store.js";
+import type { RelayLifecycle } from "./relay-lifecycle.js";
 import {
   createSecurePairing,
   decryptFromMobile,
@@ -249,7 +255,9 @@ type AppOptions = {
   approvalStore?: PendingApprovalStore;
   appServer?: CodexAppServerClient | null;
   codex?: CodexClient;
+  compatibilityObservations?: CompatibilityObservationStore;
   connectionPlan?: ConnectionPlanOptions;
+  lifecycle?: RelayLifecycle;
   management?: ManagementOptions;
   maxThreadEventRetention?: number;
   pairing?: PairingOptions;
@@ -270,6 +278,7 @@ type AppOptions = {
 type ConnectionPlanOptions = {
   relayId: string;
   serverEpoch: string;
+  tailcatCandidate?: () => TailcatConnectionPlanCandidate | undefined;
 };
 
 type ManagementOptions = {
@@ -306,6 +315,12 @@ type RuntimeOptionSubset = {
   runtimeMode?: RuntimeMode;
   sandboxMode?: string;
 };
+
+type CompatibilityFeature =
+  | "legacy.input_without_client_event_id"
+  | "legacy.run_stream_attach"
+  | "legacy.run_stream_prompt"
+  | "legacy.workspace_path_without_id";
 
 const PairApproveRequestSchema = z.object({
   approvalCode: z.string().trim().min(1),
@@ -439,6 +454,19 @@ const maxWorkspaceTerminalOutputChunks = 2000;
 
 export function createApp(options: AppOptions = {}) {
   const app = new Hono();
+  app.use("*", async (c, next) => {
+    if (options.lifecycle?.isQuiescing() && shutdownBlocksRequest(c.req.method, c.req.path)) {
+      c.header("retry-after", "1");
+      return c.json(
+        apiError(
+          "service_shutdown",
+          "Codex Relay is shutting down. Retry after the server restarts.",
+        ),
+        503,
+      );
+    }
+    await next();
+  });
   const appServer =
     options.appServer === undefined
       ? process.env.VITEST
@@ -456,6 +484,26 @@ export function createApp(options: AppOptions = {}) {
   }
   const relayId = options.connectionPlan?.relayId ?? `relay_${randomUUID()}`;
   const serverEpoch = options.connectionPlan?.serverEpoch ?? randomUUID();
+  const recordCompatibilityObservation = (feature: CompatibilityFeature) => {
+    try {
+      const observation = options.compatibilityObservations?.recordCompatibilityObservation({
+        feature,
+      });
+      if (observation) {
+        void observation.catch((error) => {
+          relayDebugLog("compatibility.observation_failed", {
+            error: errorMessage(error),
+            feature,
+          });
+        });
+      }
+    } catch (error) {
+      relayDebugLog("compatibility.observation_failed", {
+        error: errorMessage(error),
+        feature,
+      });
+    }
+  };
   const threads = new Map<string, ThreadMetadata>();
   const messagesByThreadId = new Map<string, ChatMessage[]>();
   const appServerThreadListCacheTtlMs = configuredThreadListCacheTtlMs();
@@ -479,11 +527,13 @@ export function createApp(options: AppOptions = {}) {
         : [],
     ),
   );
+  const relayManagedTerminalTurnIdsByThreadId = new Map<string, string>();
   const activeTurnClaimsByThreadId = new Map(
     recoveredTurnClaims.map((recovered) => [recovered.claim.threadId, recovered.claim]),
   );
   const appServerHistoryGenerationsByThreadId = new Map<string, number>();
   const appServerHistoryLoadsByThreadId = new Map<string, Promise<void>>();
+  const appServerOlderTurnCursorsByThreadId = new Map<string, string>();
   const appServerRolloutPathsByThreadId = new Map<string, string>();
   const steeringThreads = new Set(recoveredTurnClaims.map((recovered) => recovered.claim.threadId));
   const secureSessionsByTokenHash = new Map<string, SecureSession>();
@@ -501,6 +551,7 @@ export function createApp(options: AppOptions = {}) {
   const invalidateAppServerHistory = (threadId: string) => {
     advanceAppServerHistoryGeneration(threadId);
     appServerHistoryLoadsByThreadId.delete(threadId);
+    appServerOlderTurnCursorsByThreadId.delete(threadId);
     appServerRolloutPathsByThreadId.delete(threadId);
     messagesByThreadId.delete(threadId);
   };
@@ -540,6 +591,18 @@ export function createApp(options: AppOptions = {}) {
     }
     return appServerThreadListRequest;
   };
+  const durableThreadEventPublisher = options.threadEvents
+    ? createDurableThreadEventPublisher({
+        maxRetainedEvents: options.maxThreadEventRetention,
+        store: options.threadEvents,
+        onPersistenceError(error, context) {
+          relayDebugLog("thread.event.persistence_failed", {
+            ...context,
+            error: errorMessage(error),
+          });
+        },
+      })
+    : undefined;
   if (appServer && typeof appServer.onNotification === "function") {
     appServer.onNotification((notification) => {
       const params = recordParams(notification);
@@ -569,7 +632,11 @@ export function createApp(options: AppOptions = {}) {
         }
         return;
       }
-      if (notification.method === "turn/completed") {
+      if (
+        ["turn/aborted", "turn/cancelled", "turn/completed", "turn/failed"].includes(
+          notification.method,
+        )
+      ) {
         advanceAppServerHistoryGeneration(threadId);
         const turn = appServerTurnFromParams(params);
         if (turn) {
@@ -579,21 +646,33 @@ export function createApp(options: AppOptions = {}) {
             }
           }
         }
+        const turnId = turn?.id ?? firstString(params, ["turnId"]);
+        const relayManagedTurnId = activeAppServerTurnIdsByThreadId.get(threadId);
+        const isActiveRelayManagedTurn =
+          activeTurnClaimsByThreadId.has(threadId) ||
+          Boolean(turnId && relayManagedTurnId === turnId) ||
+          hasActiveDurableStream(threadId);
+        if (turnId && isActiveRelayManagedTurn) {
+          relayManagedTerminalTurnIdsByThreadId.set(threadId, turnId);
+        }
+        const isRelayManagedTurn =
+          isActiveRelayManagedTurn ||
+          Boolean(turnId && relayManagedTerminalTurnIdsByThreadId.get(threadId) === turnId);
+        if (!durableThreadEventPublisher || !turnId || isRelayManagedTurn) {
+          return;
+        }
+        void publishExternalAppServerTerminal(threadId, turnId, notification.method, params).catch(
+          (error) => {
+            relayDebugLog("thread.external_terminal.persistence_failed", {
+              error: errorMessage(error),
+              threadId,
+              turnId,
+            });
+          },
+        );
       }
     });
   }
-  const durableThreadEventPublisher = options.threadEvents
-    ? createDurableThreadEventPublisher({
-        maxRetainedEvents: options.maxThreadEventRetention,
-        store: options.threadEvents,
-        onPersistenceError(error, context) {
-          relayDebugLog("thread.event.persistence_failed", {
-            ...context,
-            error: errorMessage(error),
-          });
-        },
-      })
-    : undefined;
   let pendingApprovalsHydrationError: unknown;
   const pendingApprovalsHydration =
     appServer && options.approvalStore
@@ -813,6 +892,81 @@ export function createApp(options: AppOptions = {}) {
     });
     return result;
   }
+  function hasActiveDurableStream(threadId: string) {
+    for (const controller of activeStreamControllers.keys()) {
+      if (durableSseContexts.get(controller)?.threadIds.has(threadId)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  function publishExternalAppServerTerminal(
+    threadId: string,
+    turnId: string,
+    method: string,
+    params: Record<string, unknown> | undefined,
+  ) {
+    return runThreadOperation(threadId, async () => {
+      let knownThread = threads.get(threadId);
+      if (!knownThread) {
+        const appServerThread = await appServer!.readThread(threadId, { includeTurns: true });
+        if (isSubagentThread(appServerThread)) {
+          return;
+        }
+        const canonicalMessages = mapAppServerMessages(appServerThread);
+        messagesByThreadId.set(
+          threadId,
+          mergeAppServerMessagesWithLocalStatus(
+            canonicalMessages,
+            messagesByThreadId.get(threadId) ?? [],
+          ),
+        );
+        knownThread = rememberAppServerThread(threads, appServerThread, {
+          authoritativeMessageCount: true,
+        });
+      }
+      if (isSubagentThread(knownThread)) {
+        return;
+      }
+
+      const state = terminalTurnState(method, params);
+      const turnMessages = (messagesByThreadId.get(threadId) ?? []).filter(
+        (message) => message.turnId === turnId,
+      );
+      const lastAssistantMessage = [...turnMessages]
+        .reverse()
+        .find((message) => message.role === "assistant");
+      const threadSummary = updateThread(threads, messagesByThreadId, threadId, {
+        state,
+        lastResult: lastAssistantMessage?.content ?? knownThread.lastResult,
+        lastError: state === "failed" ? turnErrorMessage(params) : undefined,
+      });
+      const events = [
+        ...turnMessages.map((message) =>
+          StreamThreadRunEventSchema.parse({
+            type:
+              message.role === "assistant" ? "thread.message.completed" : "thread.message.created",
+            thread: threadSummary,
+            message,
+          }),
+        ),
+        StreamThreadRunEventSchema.parse({
+          type: "thread.state.changed",
+          thread: threadSummary,
+        }),
+      ];
+      for (const event of events) {
+        durableThreadEventPublisher!.publish({
+          deliver: () => undefined,
+          event,
+          eventId: externalAppServerThreadEventId(threadId, turnId, event),
+          threadId,
+          workspaceId: threadSummary.workspaceId,
+        });
+      }
+      await durableThreadEventPublisher!.flush(threadId);
+    });
+  }
   function runAppServerMutation<T>(threadId: string, operation: () => Promise<T>) {
     const previous = appServerMutationTails.get(threadId) ?? Promise.resolve();
     const result = previous.then(operation, operation);
@@ -827,6 +981,48 @@ export function createApp(options: AppOptions = {}) {
       }
     });
     return result;
+  }
+  function scheduleRunningAppServerThreadSubscriptions(appServerThreads: AppServerThread[]) {
+    if (!appServer || typeof appServer.resumeThread !== "function") {
+      return;
+    }
+    for (const thread of appServerThreads) {
+      if (
+        isSubagentThread(thread) ||
+        mapAppServerThreadState(thread.status, thread.turns) !== "running" ||
+        appServer.isThreadSubscribed?.(thread.id) === true ||
+        activeTurnClaimsByThreadId.has(thread.id) ||
+        activeAppServerTurnIdsByThreadId.has(thread.id) ||
+        hasActiveDurableStream(thread.id)
+      ) {
+        continue;
+      }
+      void runAppServerMutation(thread.id, async () => {
+        if (appServer.isThreadSubscribed?.(thread.id) === true) {
+          return;
+        }
+        const resumedThread = await appServer.resumeThread!({
+          excludeTurns: true,
+          threadId: thread.id,
+        });
+        rememberAppServerThread(threads, resumedThread);
+        relayDebugLog("app_server.thread.subscribed_from_list", { threadId: thread.id });
+      }).catch((error) => {
+        relayDebugLog("app_server.thread.list_subscription_failed", {
+          error: errorMessage(error),
+          threadId: thread.id,
+        });
+      });
+    }
+  }
+  if (appServer?.appServerMode === "socket" && typeof appServer.listThreads === "function") {
+    void readAppServerThreadList()
+      .then(scheduleRunningAppServerThreadSubscriptions)
+      .catch((error) => {
+        relayDebugLog("app_server.thread.startup_subscription_failed", {
+          error: errorMessage(error),
+        });
+      });
   }
   const recoveryCoordinator = options.threadCoordinator;
   if (appServer && recoveryCoordinator && recoveredTurnClaims.length > 0) {
@@ -960,6 +1156,14 @@ export function createApp(options: AppOptions = {}) {
             turnId: nextTurn.id,
           });
         } catch (error) {
+          if (error instanceof AppServerTurnDispatchAmbiguousError) {
+            relayDebugLog("thread.claim.recovery_dispatch_ambiguous", {
+              claimId: error.claimId,
+              inputId: nextInput.id,
+              threadId,
+            });
+            return;
+          }
           if (acceptedTurnId) {
             activeAppServerTurnIdsByThreadId.set(threadId, acceptedTurnId);
             if (recoveryManagedClaimIdsByThreadId.get(threadId) === nextClaimResult.claim.claimId) {
@@ -1119,7 +1323,18 @@ export function createApp(options: AppOptions = {}) {
       })
     : undefined;
   if (appServer && pushNotificationDispatcher) {
-    observeAppServerPushNotifications(appServer, pushNotificationDispatcher);
+    observeAppServerPushNotifications(appServer, pushNotificationDispatcher, {
+      relayId,
+      async workspaceIdForThread(threadId, threadWorkspacePath) {
+        const knownWorkspaceId = threads.get(threadId)?.workspaceId;
+        if (knownWorkspaceId) {
+          return knownWorkspaceId;
+        }
+        return threadWorkspacePath
+          ? (await options.workspaceRegistry?.resolveWorkspace(threadWorkspacePath))?.workspaceId
+          : undefined;
+      },
+    });
   }
   const scheduleAppServerHistoryLoad = (threadId: string, cachedMessages: ChatMessage[]) => {
     if (!appServer || appServerHistoryLoadsByThreadId.has(threadId)) {
@@ -1249,6 +1464,13 @@ export function createApp(options: AppOptions = {}) {
       }
     }
 
+    await next();
+  });
+
+  app.use("*", async (c, next) => {
+    if (c.req.query("workspacePath") && !c.req.query("workspaceId")) {
+      recordCompatibilityObservation("legacy.workspace_path_without_id");
+    }
     await next();
   });
 
@@ -1510,6 +1732,7 @@ export function createApp(options: AppOptions = {}) {
         const knownAppServerThreads = appServerThreads
           .filter((thread) => !isSubagentThread(thread))
           .map((thread) => rememberAppServerThread(threads, thread));
+        scheduleRunningAppServerThreadSubscriptions(appServerThreads);
         scheduleThreadWorkspaceRegistration(knownAppServerThreads);
         await threadWorkspaceRegistrationTail;
         workspaceRows = (await options.workspaceRegistry?.listWorkspaces()) ?? workspaceRows;
@@ -1574,9 +1797,26 @@ export function createApp(options: AppOptions = {}) {
       (options.management?.connectUrl
         ? [{ label: "Server", url: options.management.connectUrl }]
         : []);
-    const response: ConnectionPlanResponse = ConnectionPlanResponseSchema.parse(
-      createConnectionPlan({ candidates, relayId, serverEpoch }),
+    const tailcatRequested = requestCapabilities(c.req.header("x-codex-relay-capabilities")).has(
+      "tailcat",
     );
+    const tailcatCandidate =
+      tailcatRequested && options.connectionPlan?.tailcatCandidate
+        ? options.connectionPlan.tailcatCandidate()
+        : undefined;
+    const response: ConnectionPlanResponse = ConnectionPlanResponseSchema.parse(
+      createConnectionPlan({
+        candidates,
+        relayId,
+        serverEpoch,
+        tailcatCandidates: tailcatCandidate ? [tailcatCandidate] : [],
+      }),
+    );
+    relayDebugLog("connection_plan.responded", {
+      candidateCount: response.candidates.length,
+      tailcatCandidateIncluded: Boolean(tailcatCandidate),
+      tailcatRequested,
+    });
     c.header("cache-control", "no-store");
     return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
   });
@@ -2630,6 +2870,7 @@ export function createApp(options: AppOptions = {}) {
         const knownAppServerThreads = appServerThreads
           .filter((thread) => !isSubagentThread(thread))
           .map((thread) => rememberAppServerThread(threads, thread));
+        scheduleRunningAppServerThreadSubscriptions(appServerThreads);
         scheduleThreadWorkspaceRegistration(knownAppServerThreads);
         const visibleThreads = await identifyKnownThreadWorkspaces(
           knownAppServerThreads.filter((thread) =>
@@ -3233,6 +3474,7 @@ export function createApp(options: AppOptions = {}) {
       );
     }
     const forceRefresh = parsedQuery.data.refresh === "true";
+    const afterMessageId = parsedQuery.data.afterMessageId;
     const beforeMessageId = parsedQuery.data.beforeMessageId;
     const messageLimit = parsedQuery.data.limit;
     const detailStartedAt = Date.now();
@@ -3253,9 +3495,17 @@ export function createApp(options: AppOptions = {}) {
       knownThread?.state === "running" || activeAppServerTurnIdsByThreadId.has(threadId);
     if (appServer) {
       try {
-        const thread = await appServer.readThread(threadId, {
-          includeTurns: false,
-        });
+        const listedThread =
+          typeof appServer.listThreadTurns === "function" &&
+          typeof appServer.listThreads === "function"
+            ? (appServerThreadListCache?.threads.find((candidate) => candidate.id === threadId) ??
+              (await readAppServerThreadList()).find((candidate) => candidate.id === threadId))
+            : undefined;
+        const thread =
+          listedThread ??
+          (await appServer.readThread(threadId, {
+            includeTurns: false,
+          }));
         if (isSubagentThread(thread)) {
           return secureJson(
             c,
@@ -3278,11 +3528,22 @@ export function createApp(options: AppOptions = {}) {
         let loadedMessages = false;
         let messages = cachedMessages;
         let responseThread = preserveKnownRunningThreadState(mappedThread, wasKnownRunning);
+        const cursorCacheHit = Boolean(
+          afterMessageId && cachedMessages.some((message) => message.id === afterMessageId),
+        );
 
         if (forceRefresh) {
-          const threadWithTurns = await appServer.readThread(threadId, {
-            includeTurns: true,
-          });
+          const recentHistory = await readRecentAppServerThreadHistory(
+            appServer,
+            thread,
+            messageLimit,
+          );
+          rememberAppServerOlderTurnCursor(
+            appServerOlderTurnCursorsByThreadId,
+            threadId,
+            recentHistory.nextCursor,
+          );
+          const threadWithTurns = recentHistory.thread;
           const hasCompleteHistory = appServerThreadHasCompleteHistory(threadWithTurns);
           responseThread = rememberAppServerThread(threads, threadWithTurns, {
             authoritativeMessageCount: hasCompleteHistory,
@@ -3291,6 +3552,10 @@ export function createApp(options: AppOptions = {}) {
           messages = hasCompleteHistory
             ? mergeAppServerMessagesWithLocalStatus(appMessages, cachedMessages)
             : mergeThreadMessagePages(appMessages, cachedMessages);
+          messagesByThreadId.set(threadId, messages);
+          loadedMessages = true;
+        } else if (cursorCacheHit) {
+          messages = dedupeThreadMessages(cachedMessages);
           messagesByThreadId.set(threadId, messages);
           loadedMessages = true;
         } else {
@@ -3322,7 +3587,24 @@ export function createApp(options: AppOptions = {}) {
           }
         }
 
-        if (!loadedMessages && responseThread.state !== "running") {
+        if (!loadedMessages && typeof appServer.listThreadTurns === "function") {
+          const recentHistory = await readRecentAppServerThreadHistory(
+            appServer,
+            thread,
+            messageLimit,
+          );
+          rememberAppServerOlderTurnCursor(
+            appServerOlderTurnCursorsByThreadId,
+            threadId,
+            recentHistory.nextCursor,
+          );
+          const threadWithTurns = recentHistory.thread;
+          responseThread = rememberAppServerThread(threads, threadWithTurns);
+          const appMessages = mapAppServerMessages(threadWithTurns);
+          messages = mergeThreadMessagePages(appMessages, cachedMessages);
+          messagesByThreadId.set(threadId, messages);
+          loadedMessages = true;
+        } else if (!loadedMessages && responseThread.state !== "running") {
           const threadWithTurns = await appServer.readThread(threadId, {
             includeTurns: true,
           });
@@ -3340,12 +3622,38 @@ export function createApp(options: AppOptions = {}) {
           scheduleAppServerHistoryLoad(threadId, cachedMessages);
         }
 
+        const olderTurnCursor = appServerOlderTurnCursorsByThreadId.get(threadId);
+        if (
+          beforeMessageId &&
+          olderTurnCursor &&
+          messages[0]?.id === beforeMessageId &&
+          typeof appServer.listThreadTurns === "function"
+        ) {
+          const olderHistory = await readOlderAppServerThreadHistory(
+            appServer,
+            thread,
+            olderTurnCursor,
+            messageLimit,
+          );
+          rememberAppServerOlderTurnCursor(
+            appServerOlderTurnCursorsByThreadId,
+            threadId,
+            olderHistory.nextCursor,
+          );
+          const olderMessages = mapAppServerMessages(olderHistory.thread);
+          messages = mergeThreadMessagePages(olderMessages, messages);
+          messagesByThreadId.set(threadId, messages);
+          responseThread = rememberAppServerThread(threads, olderHistory.thread);
+        }
+
         const response = threadDetailResponse({
           messageLimit,
           thread: await withCurrentThreadOwnerEpoch(responseThread),
           messages: messagesWithPendingApprovals(messages, pendingApprovals, threadId),
           pendingInputRequests: pendingInputRequestsForThread(pendingApprovals, threadId),
+          afterMessageId,
           beforeMessageId,
+          hasOlderMessagesBeyondCache: appServerOlderTurnCursorsByThreadId.has(threadId),
         });
         relayDebugLog("thread.detail.responded", {
           durationMs: Date.now() - detailStartedAt,
@@ -3395,7 +3703,9 @@ export function createApp(options: AppOptions = {}) {
         thread: await withCurrentThreadOwnerEpoch(responseThread),
         messages: messagesWithPendingApprovals(messages, pendingApprovals, threadId),
         pendingInputRequests: pendingInputRequestsForThread(pendingApprovals, threadId),
+        afterMessageId,
         beforeMessageId,
+        hasOlderMessagesBeyondCache: appServerOlderTurnCursorsByThreadId.has(threadId),
       });
       relayDebugLog("thread.detail.responded", {
         durationMs: Date.now() - detailStartedAt,
@@ -3435,6 +3745,7 @@ export function createApp(options: AppOptions = {}) {
           threadId,
         ),
         pendingInputRequests: pendingInputRequestsForThread(pendingApprovals, threadId),
+        afterMessageId,
         beforeMessageId,
       }),
     );
@@ -4064,6 +4375,10 @@ export function createApp(options: AppOptions = {}) {
         );
       }
 
+      if (!parsed.data.clientEventId) {
+        recordCompatibilityObservation("legacy.input_without_client_event_id");
+      }
+
       const clientId =
         normalizeClientSessionId(c.req.header("x-codex-relay-client-session-id")) ??
         (await pairedClientSessionIdForAuthorization(
@@ -4440,26 +4755,34 @@ export function createApp(options: AppOptions = {}) {
         }
         activeThreadInputIdsByThreadId.set(threadId, inputId);
       } catch (error) {
-        if (
-          turnClaim &&
-          options.threadCoordinator &&
-          activeTurnClaimsByThreadId.get(threadId)?.claimId === turnClaim.claimId
-        ) {
-          await options.threadCoordinator.finalizeTurnClaim({
-            claimId: turnClaim.claimId,
-            ownerEpoch: turnClaim.ownerEpoch,
-            ownerId: turnClaim.ownerId,
-            state: "failed",
+        if (error instanceof AppServerTurnDispatchAmbiguousError) {
+          activeThreadInputIdsByThreadId.set(threadId, inputId);
+          relayDebugLog("app_server.turn_start.ambiguous", {
+            claimId: error.claimId,
+            threadId: error.threadId,
           });
-          activeTurnClaimsByThreadId.delete(threadId);
-        } else if (!turnClaim) {
-          const queuedInputs = queuedInputsByThreadId.get(threadId) ?? [];
-          queuedInputs.unshift(queuedInput);
-          queuedInputsByThreadId.set(threadId, queuedInputs);
-          await options.threadInputs?.updateThreadInputState(inputId, "queued");
+        } else {
+          if (
+            turnClaim &&
+            options.threadCoordinator &&
+            activeTurnClaimsByThreadId.get(threadId)?.claimId === turnClaim.claimId
+          ) {
+            await options.threadCoordinator.finalizeTurnClaim({
+              claimId: turnClaim.claimId,
+              ownerEpoch: turnClaim.ownerEpoch,
+              ownerId: turnClaim.ownerId,
+              state: "failed",
+            });
+            activeTurnClaimsByThreadId.delete(threadId);
+          } else if (!turnClaim) {
+            const queuedInputs = queuedInputsByThreadId.get(threadId) ?? [];
+            queuedInputs.unshift(queuedInput);
+            queuedInputsByThreadId.set(threadId, queuedInputs);
+            await options.threadInputs?.updateThreadInputState(inputId, "queued");
+          }
+          steeringThreads.delete(threadId);
+          throw error;
         }
-        steeringThreads.delete(threadId);
-        throw error;
       }
       const thread = updateThread(threads, messagesByThreadId, threadId, {
         state: "running",
@@ -4675,6 +4998,15 @@ export function createApp(options: AppOptions = {}) {
         400,
       );
     }
+    const clientEventId = "clientEventId" in parsed.data ? parsed.data.clientEventId : undefined;
+    if (parsed.data.prompt) {
+      recordCompatibilityObservation("legacy.run_stream_prompt");
+      if (!clientEventId) {
+        recordCompatibilityObservation("legacy.input_without_client_event_id");
+      }
+    } else {
+      recordCompatibilityObservation("legacy.run_stream_attach");
+    }
     if (!parsed.data.prompt && !appServer) {
       relayDebugLog("thread.stream.rejected", {
         reason: "attach_requires_app_server",
@@ -4689,7 +5021,6 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
-    const clientEventId = "clientEventId" in parsed.data ? parsed.data.clientEventId : undefined;
     const clientId =
       normalizeClientSessionId(c.req.header("x-codex-relay-client-session-id")) ??
       (await pairedClientSessionIdForAuthorization(
@@ -4958,6 +5289,7 @@ export function createApp(options: AppOptions = {}) {
           queuedInputsByThreadId,
           runAppServerMutation,
           runThreadOperation,
+          clientEventId,
           prompt,
           attachments: runOptions.attachments ?? [],
           secureSession,
@@ -5005,6 +5337,30 @@ export function createApp(options: AppOptions = {}) {
         "content-type": "text/event-stream; charset=utf-8",
       },
     });
+  });
+
+  options.lifecycle?.onDrain(async () => {
+    await drainOperationTails(threadOperationTails, appServerMutationTails);
+    await threadWorkspaceRegistrationTail;
+    if (durableThreadEventPublisher) {
+      const threadIds = new Set<string>();
+      for (const controller of activeStreamControllers.keys()) {
+        const context = durableSseContexts.get(controller);
+        for (const threadId of context?.threadIds ?? []) {
+          threadIds.add(threadId);
+        }
+      }
+      await Promise.all(
+        [...threadIds].map((threadId) => durableThreadEventPublisher.flush(threadId)),
+      );
+    }
+  });
+  options.lifecycle?.onClose(() => {
+    closeActiveStreamControllers(activeStreamControllers);
+    for (const session of workspaceTerminalSessions.values()) {
+      closeWorkspaceTerminalSession(session);
+    }
+    workspaceTerminalSessions.clear();
   });
 
   return app;
@@ -5830,6 +6186,7 @@ async function runPromptStreamed(input: {
   attachments: PromptAttachment[];
   controller: ReadableStreamDefaultController<Uint8Array>;
   codex: CodexClient;
+  clientEventId?: string;
   encoder: TextEncoder;
   ensureThreadOwner?: (threadId: string, workspaceId?: string) => Promise<ThreadOwner | undefined>;
   forgetThreadOwner?: (threadId: string) => void;
@@ -5880,6 +6237,7 @@ async function runPromptStreamed(input: {
       queuedInputsByThreadId: input.queuedInputsByThreadId,
       runAppServerMutation: input.runAppServerMutation,
       runThreadOperation: input.runThreadOperation,
+      clientEventId: input.clientEventId,
       prompt: input.prompt,
       runOptions: input.runOptions,
       secureSession: input.secureSession,
@@ -5911,6 +6269,7 @@ async function runPromptStreamed(input: {
       role: "user",
       content: displayPrompt,
       details: chatMessageDetailsFromPromptContext(input),
+      semanticEventId: input.clientEventId,
     });
     let threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
       state: "running",
@@ -6141,7 +6500,7 @@ async function startAppServerTurn(
   const runtime = resolveAppServerRuntime(input.runOptions, input.workspacePath);
   const params: AppServerTurnStartParams = {
     approvalPolicy: runtime.approvalPolicy,
-    clientUserMessageId: input.id,
+    clientUserMessageId: input.clientEventId ?? input.id,
     collaborationMode: appServerCollaborationMode(input.runOptions),
     cwd: input.workspacePath,
     effort: input.runOptions.reasoningEffort ?? null,
@@ -6165,7 +6524,31 @@ async function startAppServerTurn(
       dispatch.claim = marked.claim;
       dispatch.onMarked(marked.claim);
     }
-    return appServer.startTurn(params);
+    try {
+      return await appServer.startTurn(params);
+    } catch (error) {
+      if (
+        !(error instanceof AppServerRequestTimeoutError) ||
+        error.method !== "turn/start" ||
+        !dispatch?.claim.dispatchStartedAt
+      ) {
+        throw error;
+      }
+      const turn = await reconcileAmbiguousAppServerTurnStart(
+        appServer,
+        threadId,
+        dispatch.claim.dispatchStartedAt,
+      );
+      if (turn) {
+        relayDebugLog("app_server.turn_start.reconciled", {
+          claimId: dispatch.claim.claimId,
+          threadId,
+          turnId: turn.id,
+        });
+        return turn;
+      }
+      throw new AppServerTurnDispatchAmbiguousError(dispatch.claim.claimId, threadId, error);
+    }
   };
 
   await resumeAppServerThreadIfNeeded(appServer, threadId, input, runtime);
@@ -6178,6 +6561,49 @@ async function startAppServerTurn(
     await resumeAppServerThread(appServer, threadId, input, runtime);
     return dispatchTurn();
   }
+}
+
+class AppServerTurnDispatchAmbiguousError extends Error {
+  readonly claimId: string;
+  readonly threadId: string;
+
+  constructor(claimId: string, threadId: string, cause: Error) {
+    super("Codex may have accepted this message, but Relay could not confirm the turn yet.", {
+      cause,
+    });
+    this.name = "AppServerTurnDispatchAmbiguousError";
+    this.claimId = claimId;
+    this.threadId = threadId;
+  }
+}
+
+async function reconcileAmbiguousAppServerTurnStart(
+  appServer: CodexAppServerClient,
+  threadId: string,
+  dispatchStartedAt: string,
+) {
+  const retryDelaysMs = [0, 100, 250, 500, 1_000] as const;
+  for (const retryDelayMs of retryDelaysMs) {
+    if (retryDelayMs > 0) {
+      await new Promise((resolve) => globalThis.setTimeout(resolve, retryDelayMs));
+    }
+    try {
+      const thread = await appServer.readThread(threadId, { includeTurns: true });
+      const candidates = dispatchedTurnCandidates(thread.turns ?? [], dispatchStartedAt);
+      if (candidates.length === 1) {
+        return candidates[0];
+      }
+      if (candidates.length > 1) {
+        return undefined;
+      }
+    } catch (error) {
+      relayDebugLog("app_server.turn_start.reconcile_read_failed", {
+        error: errorMessage(error),
+        threadId,
+      });
+    }
+  }
+  return undefined;
 }
 
 type TurnClaimDispatchContext = {
@@ -6212,6 +6638,13 @@ async function resumeAppServerThreadIfNeeded(
   input: QueuedThreadInput,
   runtime: ReturnType<typeof resolveAppServerRuntime>,
 ) {
+  if (
+    typeof appServer.isThreadSubscribed === "function" &&
+    !appServer.isThreadSubscribed(threadId)
+  ) {
+    await resumeAppServerThread(appServer, threadId, input, runtime);
+    return;
+  }
   if (typeof appServer.readThread !== "function") {
     return;
   }
@@ -6922,6 +7355,21 @@ async function streamRunningAppServerThread(input: {
     if (input.signal.aborted) {
       return;
     }
+    if (isActiveThreadWriterError(error)) {
+      threadSummary = updateThread(input.threads, input.messagesByThreadId, input.threadId, {
+        state: "running",
+        lastError: undefined,
+      });
+      relayDebugLog("thread.stream.attach_external_writer", {
+        threadId: input.threadId,
+      });
+      sendSse(input.controller, input.encoder, input.secureSession, {
+        type: "thread.state.changed",
+        thread: threadSummary,
+      });
+      await Promise.race([completed, aborted]);
+      return;
+    }
     threadSummary = updateThread(input.threads, input.messagesByThreadId, input.threadId, {
       state: "failed",
       lastError: errorMessage(error),
@@ -6944,6 +7392,7 @@ async function runAppServerPromptStreamed(input: {
   activeTurnClaimsByThreadId: Map<string, TurnClaim>;
   appServer: CodexAppServerClient;
   attachments: PromptAttachment[];
+  clientEventId?: string;
   controller: ReadableStreamDefaultController<Uint8Array>;
   encoder: TextEncoder;
   ensureThreadOwner?: (threadId: string, workspaceId?: string) => Promise<ThreadOwner | undefined>;
@@ -6998,6 +7447,7 @@ async function runAppServerPromptStreamed(input: {
     role: "user",
     content: displayPrompt,
     details: chatMessageDetailsFromPromptContext(input),
+    semanticEventId: input.clientEventId ?? input.initialQueuedInput?.clientEventId,
   });
   let threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
     state: "running",
@@ -7304,6 +7754,9 @@ async function runAppServerPromptStreamed(input: {
         );
         await processReturnedTurn(nextTurn);
       } catch (error) {
+        if (error instanceof AppServerTurnDispatchAmbiguousError) {
+          throw error;
+        }
         if (nextTurnClaim && input.threadCoordinator) {
           const finalized = await input.threadCoordinator.finalizeTurnClaim({
             claimId: nextTurnClaim.claimId,
@@ -7809,6 +8262,7 @@ async function runAppServerPromptStreamed(input: {
       input.initialQueuedInput ??
       ({
         attachments: input.attachments,
+        clientEventId: input.clientEventId,
         id: userMessage.id,
         prompt,
         runOptions: input.runOptions,
@@ -7895,15 +8349,23 @@ async function runAppServerPromptStreamed(input: {
     debugStream("start turn complete", activeThreadId, turn.id);
     await completed;
   } catch (error) {
-    await finalizeActiveThreadInputState(
-      input.threadInputs,
-      input.threadCoordinator,
-      input.activeTurnClaimsByThreadId,
-      input.activeThreadInputIdsByThreadId,
-      activeThreadId,
-      "failed",
-      input.forgetThreadOwner,
-    );
+    const dispatchIsAmbiguous = error instanceof AppServerTurnDispatchAmbiguousError;
+    if (!dispatchIsAmbiguous) {
+      await finalizeActiveThreadInputState(
+        input.threadInputs,
+        input.threadCoordinator,
+        input.activeTurnClaimsByThreadId,
+        input.activeThreadInputIdsByThreadId,
+        activeThreadId,
+        "failed",
+        input.forgetThreadOwner,
+      );
+    } else {
+      relayDebugLog("app_server.turn_start.ambiguous", {
+        claimId: error.claimId,
+        threadId: error.threadId,
+      });
+    }
     debugStream(`failed ${errorMessage(error)}`, activeThreadId, activeTurnId);
     const threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
       state: "failed",
@@ -8268,7 +8730,7 @@ function appendMessage(
   messagesByThreadId: Map<string, ChatMessage[]>,
   threadId: string,
   input: Pick<ChatMessage, "role" | "content"> &
-    Partial<Pick<ChatMessage, "details" | "kind" | "state" | "turnId">>,
+    Partial<Pick<ChatMessage, "details" | "kind" | "semanticEventId" | "state" | "turnId">>,
 ) {
   const now = new Date().toISOString();
   const message = ChatMessageSchema.parse({
@@ -8278,6 +8740,7 @@ function appendMessage(
     kind: input.kind,
     content: input.content,
     details: input.details,
+    semanticEventId: input.semanticEventId,
     createdAt: now,
     updatedAt: now,
     state: input.state,
@@ -8294,7 +8757,7 @@ function appendMessageWithId(
   threadId: string,
   id: string,
   input: Pick<ChatMessage, "role" | "content"> &
-    Partial<Pick<ChatMessage, "details" | "kind" | "state" | "turnId">>,
+    Partial<Pick<ChatMessage, "details" | "kind" | "semanticEventId" | "state" | "turnId">>,
 ) {
   const now = new Date().toISOString();
   const message = ChatMessageSchema.parse({
@@ -8304,6 +8767,7 @@ function appendMessageWithId(
     kind: input.kind,
     content: input.content,
     details: input.details,
+    semanticEventId: input.semanticEventId,
     createdAt: now,
     updatedAt: now,
     state: input.state,
@@ -8331,6 +8795,7 @@ function upsertAppServerItemMessage(
     return updateMessage(messagesByThreadId, threadId, item.id, {
       ...message,
       createdAt: existing.createdAt,
+      details: message.details ?? existing.details,
     });
   }
 
@@ -8339,6 +8804,7 @@ function upsertAppServerItemMessage(
     kind: message.kind,
     content: message.content,
     details: message.details,
+    semanticEventId: message.semanticEventId,
     state: message.state,
     turnId: message.turnId,
   });
@@ -8378,13 +8844,12 @@ function isDuplicateInitialUserMessage(
     return false;
   }
 
-  if (item.clientId) {
-    return item.clientId === localMessageId;
-  }
-
   const localMessage = messagesByThreadId
     .get(threadId)
     ?.find((message) => message.id === localMessageId);
+  if (item.clientId) {
+    return item.clientId === (localMessage?.semanticEventId ?? localMessageId);
+  }
   const skills = appServerUserMessageSkills(item);
   const normalizeContent = (content: string) =>
     stripPromptSkillMentions(normalizeImageMessageContent(content), skills);
@@ -8977,6 +9442,7 @@ function sendSse(
         deliverSse(controller, encoder, secureSession, durableEvent);
       },
       event: parsed,
+      eventId: semanticThreadEventId(durableThreadId, parsed),
       threadId: durableThreadId,
       workspaceId: durableContext.workspaceId,
     });
@@ -9093,6 +9559,28 @@ function closeActiveStreamControllers(
     closeStream();
   }
   controllers.clear();
+}
+
+function shutdownBlocksRequest(method: string, path: string) {
+  const normalizedMethod = method.toUpperCase();
+  return (
+    !["GET", "HEAD", "OPTIONS"].includes(normalizedMethod) ||
+    path.endsWith("/stream") ||
+    path.includes("/stream/")
+  );
+}
+
+async function drainOperationTails(...maps: Array<Map<string, Promise<void>>>) {
+  while (true) {
+    const pending = maps.flatMap((map) => [...map.values()]);
+    if (pending.length === 0) {
+      return;
+    }
+    await Promise.allSettled(pending);
+    if (maps.every((map) => map.size === 0)) {
+      return;
+    }
+  }
 }
 
 function isClosedStreamControllerError(error: unknown) {
@@ -9640,6 +10128,22 @@ function recoveredThreadEventId(claimId: string, event: StreamThreadRunEvent) {
   return `recovery:${claimId}:${digest}`;
 }
 
+function externalAppServerThreadEventId(
+  threadId: string,
+  turnId: string,
+  event: StreamThreadRunEvent,
+) {
+  const identity =
+    "message" in event && event.message
+      ? { id: event.message.id, state: event.message.state, type: event.type }
+      : {
+          state: "thread" in event && event.thread ? event.thread.state : undefined,
+          type: event.type,
+        };
+  const digest = createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+  return `external:${encodeURIComponent(threadId)}:${encodeURIComponent(turnId)}:${digest}`;
+}
+
 function isSubagentThread(thread: { readonly parentThreadId?: string | null }) {
   return Boolean(thread.parentThreadId);
 }
@@ -9696,9 +10200,83 @@ function mapAppServerMessages(thread: AppServerThread): ChatMessage[] {
   return messages;
 }
 
+async function readRecentAppServerThreadHistory(
+  appServer: CodexAppServerClient,
+  thread: AppServerThread,
+  messageLimit: number | undefined,
+) {
+  if (typeof appServer.listThreadTurns !== "function") {
+    return {
+      nextCursor: undefined,
+      thread: await appServer.readThread(thread.id, { includeTurns: true }),
+    };
+  }
+
+  const targetMessageCount = Math.max(1, messageLimit ?? 100);
+  const pageLimit = Math.min(100, Math.max(20, targetMessageCount));
+  let cursor: string | undefined;
+  let nextCursor: string | null | undefined;
+  let turns: AppServerTurn[] = [];
+  do {
+    const page = await appServer.listThreadTurns(thread.id, {
+      cursor,
+      itemsView: "full",
+      limit: pageLimit,
+      sortDirection: "desc",
+    });
+    turns = [...page.data].reverse().concat(turns);
+    nextCursor = page.nextCursor;
+    cursor = nextCursor ?? undefined;
+  } while (cursor && mapAppServerMessages({ ...thread, turns }).length < targetMessageCount);
+
+  return {
+    nextCursor: nextCursor ?? undefined,
+    thread: {
+      ...thread,
+      historyMode: nextCursor ? ("paginated" as const) : ("legacy" as const),
+      turns,
+    },
+  };
+}
+
+async function readOlderAppServerThreadHistory(
+  appServer: CodexAppServerClient,
+  thread: AppServerThread,
+  cursor: string,
+  messageLimit: number | undefined,
+) {
+  const page = await appServer.listThreadTurns(thread.id, {
+    cursor,
+    itemsView: "full",
+    limit: Math.min(100, Math.max(20, messageLimit ?? 100)),
+    sortDirection: "desc",
+  });
+  return {
+    nextCursor: page.nextCursor ?? undefined,
+    thread: {
+      ...thread,
+      historyMode: page.nextCursor ? ("paginated" as const) : ("legacy" as const),
+      turns: [...page.data].reverse(),
+    },
+  };
+}
+
+function rememberAppServerOlderTurnCursor(
+  cursorsByThreadId: Map<string, string>,
+  threadId: string,
+  cursor: string | undefined,
+) {
+  if (cursor) {
+    cursorsByThreadId.set(threadId, cursor);
+  } else {
+    cursorsByThreadId.delete(threadId);
+  }
+}
+
 function appServerThreadHasCompleteHistory(thread: AppServerThread) {
-  return (thread.turns ?? []).every(
-    (turn) => turn.itemsView === undefined || turn.itemsView === "full",
+  return (
+    thread.historyMode !== "paginated" &&
+    (thread.turns ?? []).every((turn) => turn.itemsView === undefined || turn.itemsView === "full")
   );
 }
 
@@ -10513,13 +11091,21 @@ function isRolloutMessageLine(line: string) {
 }
 
 function threadDetailResponse(input: {
+  afterMessageId?: string;
   beforeMessageId?: string;
+  hasOlderMessagesBeyondCache?: boolean;
   messageLimit?: number;
   messages: ChatMessage[];
   pendingInputRequests: PendingInputRequest[];
   thread: ThreadMetadata;
 }) {
-  const page = threadDetailMessagePage(input.messages, input.beforeMessageId, input.messageLimit);
+  const page = threadDetailMessagePage(
+    input.messages,
+    input.beforeMessageId,
+    input.messageLimit,
+    input.afterMessageId,
+    input.hasOlderMessagesBeyondCache,
+  );
   return ThreadDetailResponseSchema.parse({
     thread: input.thread,
     ...page,
@@ -10534,6 +11120,8 @@ function threadDetailMessagePage(
   messages: ChatMessage[],
   beforeMessageId?: string,
   requestedLimit?: number,
+  afterMessageId?: string,
+  hasOlderMessagesBeyondCache = false,
 ) {
   const configuredLimit = configuredThreadDetailMessageLimit();
   const limit =
@@ -10542,8 +11130,29 @@ function threadDetailMessagePage(
       : configuredLimit > 0
         ? Math.min(requestedLimit, configuredLimit)
         : requestedLimit;
+  if (afterMessageId) {
+    const afterIndex = messages.findIndex((message) => message.id === afterMessageId);
+    if (afterIndex >= 0) {
+      const remainingMessages = messages.slice(afterIndex + 1);
+      const pageMessages = limit ? remainingMessages.slice(0, limit) : remainingMessages;
+      return {
+        hasMoreMessages: pageMessages.length < remainingMessages.length,
+        hasOlderMessages: afterIndex >= 0,
+        messageCursor: pageMessages.at(-1)?.id ?? afterMessageId,
+        messages: pageMessages,
+      };
+    }
+  }
   if (!limit || messages.length <= limit) {
-    return { hasOlderMessages: false, messages };
+    return {
+      hasOlderMessages: hasOlderMessagesBeyondCache,
+      ...(!beforeMessageId && messages.at(-1) ? { messageCursor: messages.at(-1)!.id } : {}),
+      ...(afterMessageId ? { messageCursorReset: true } : {}),
+      messages,
+      ...(hasOlderMessagesBeyondCache && messages[0]
+        ? { olderMessagesCursor: messages[0].id }
+        : {}),
+    };
   }
   const beforeIndex = beforeMessageId
     ? messages.findIndex((message) => message.id === beforeMessageId)
@@ -10551,9 +11160,11 @@ function threadDetailMessagePage(
   const end = beforeIndex >= 0 ? beforeIndex : messages.length;
   const start = Math.max(0, end - limit);
   const pageMessages = messages.slice(start, end);
-  const hasOlderMessages = start > 0;
+  const hasOlderMessages = start > 0 || hasOlderMessagesBeyondCache;
   return {
     hasOlderMessages,
+    ...(!beforeMessageId && pageMessages.at(-1) ? { messageCursor: pageMessages.at(-1)!.id } : {}),
+    ...(afterMessageId ? { messageCursorReset: true } : {}),
     messages: pageMessages,
     ...(hasOlderMessages && pageMessages[0] ? { olderMessagesCursor: pageMessages[0].id } : {}),
   };
@@ -10694,6 +11305,7 @@ function mapAppServerItem(threadId: string, turn: AppServerTurn, item: AppServer
         role: "user",
         content: appServerUserMessageText(userItem),
         details: appServerUserMessageDetails(userItem),
+        semanticEventId: userItem.clientId ?? undefined,
       });
     }
     case "agentMessage": {
@@ -11030,7 +11642,11 @@ function mapAppServerTurnStatusState(status: unknown) {
   if (!statusType) {
     return "idle";
   }
-  if (["failed", "systemerror", "error"].includes(statusType)) {
+  if (
+    ["aborted", "canceled", "cancelled", "failed", "interrupted", "systemerror", "error"].includes(
+      statusType,
+    )
+  ) {
     return "failed";
   }
   if (["completed", "complete", "done"].includes(statusType)) {
@@ -11054,6 +11670,15 @@ function appServerStatusType(status: unknown) {
 
 function normalizeAppServerStatus(status: string) {
   return status.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function requestCapabilities(header: string | undefined) {
+  return new Set(
+    (header ?? "")
+      .split(/[\s,]+/)
+      .map((capability) => capability.trim().toLowerCase())
+      .filter(Boolean),
+  );
 }
 
 function countThreadMessages(thread: AppServerThread) {
@@ -11231,6 +11856,10 @@ function isApprovalServerRequest(method: string) {
 function observeAppServerPushNotifications(
   appServer: CodexAppServerClient,
   dispatcher: PushNotificationDispatcher,
+  context: {
+    relayId: string;
+    workspaceIdForThread(threadId: string, workspacePath?: string): Promise<string | undefined>;
+  },
 ) {
   const dispatchedEventIds = new Set<string>();
   const rememberEventId = (eventId: string) => {
@@ -11244,11 +11873,20 @@ function observeAppServerPushNotifications(
       return;
     }
     rememberEventId(eventId);
+    const identifiedEvent = {
+      ...event,
+      relayId: context.relayId,
+      semanticEventId: eventId,
+    };
     void appServer
       .readThread(event.threadId, { includeTurns: false })
-      .then((thread) => {
+      .then(async (thread) => {
         if (!isSubagentThread(thread)) {
-          return dispatcher.dispatch(event);
+          const workspaceId = await context.workspaceIdForThread(event.threadId, thread.cwd);
+          return dispatcher.dispatch({
+            ...identifiedEvent,
+            ...(workspaceId ? { workspaceId } : {}),
+          });
         }
       })
       .catch((error) => {

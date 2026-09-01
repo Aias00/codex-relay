@@ -43,6 +43,21 @@ export type ThreadEventStore = {
   listThreadEvents(input: ListThreadEventsInput): Promise<ListThreadEventsResult>;
 };
 
+export type CompatibilityObservation = {
+  count: number;
+  feature: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+};
+
+export type CompatibilityObservationStore = {
+  listCompatibilityObservations(): Promise<CompatibilityObservation[]>;
+  recordCompatibilityObservation(input: {
+    feature: string;
+    observedAt?: string;
+  }): Promise<CompatibilityObservation>;
+};
+
 export const threadInputStates = [
   "created",
   "persisted",
@@ -347,12 +362,13 @@ export type WorkspaceRegistry = {
 };
 
 export type RelayStateStore = ThreadCoordinatorStore &
+  CompatibilityObservationStore &
   ThreadEventStore &
   ThreadInputStore &
   PendingApprovalStore &
-  WorkspaceRegistry;
+  WorkspaceRegistry & { close(): void };
 
-const currentSchemaVersion = 8;
+export const relayStateSchemaVersion = 9;
 const defaultPageLimit = 200;
 const maximumPageLimit = 500;
 
@@ -392,6 +408,13 @@ export async function createRelayStateStore(path: string): Promise<RelayStateSto
       thread_id TEXT PRIMARY KEY,
       compacted_through_sequence INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS compatibility_observations (
+      feature TEXT PRIMARY KEY,
+      observation_count INTEGER NOT NULL,
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS workspaces (
@@ -527,9 +550,60 @@ export async function createRelayStateStore(path: string): Promise<RelayStateSto
   `);
   await database
     .prepare("INSERT OR IGNORE INTO relay_state_schema (version, applied_at) VALUES (?, ?)")
-    .run(currentSchemaVersion, Date.now());
+    .run(relayStateSchemaVersion, Date.now());
 
   return {
+    close() {
+      database.close();
+    },
+    async listCompatibilityObservations() {
+      const rows = await database
+        .prepare(
+          `SELECT feature,
+                  observation_count AS observationCount,
+                  first_seen_at AS firstSeenAt,
+                  last_seen_at AS lastSeenAt
+             FROM compatibility_observations
+            ORDER BY last_seen_at DESC, feature ASC`,
+        )
+        .all();
+      return rows.map(compatibilityObservationFromRow);
+    },
+    async recordCompatibilityObservation(input) {
+      const feature = normalizeCompatibilityFeature(input.feature);
+      const observedAt = input.observedAt ?? new Date().toISOString();
+      const observedAtMs = parseTimestamp(observedAt, "observedAt");
+      return runWrite(async () => {
+        await database
+          .prepare(
+            `INSERT INTO compatibility_observations (
+               feature,
+               observation_count,
+               first_seen_at,
+               last_seen_at
+             ) VALUES (?, 1, ?, ?)
+             ON CONFLICT(feature) DO UPDATE SET
+               observation_count = observation_count + 1,
+               first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
+               last_seen_at = MAX(last_seen_at, excluded.last_seen_at)`,
+          )
+          .run(feature, observedAtMs, observedAtMs);
+        const row = await database
+          .prepare(
+            `SELECT feature,
+                    observation_count AS observationCount,
+                    first_seen_at AS firstSeenAt,
+                    last_seen_at AS lastSeenAt
+               FROM compatibility_observations
+              WHERE feature = ?`,
+          )
+          .get(feature);
+        if (!row) {
+          throw new Error(`Compatibility observation ${feature} was not persisted.`);
+        }
+        return compatibilityObservationFromRow(row);
+      });
+    },
     async compactThreadEvents(input) {
       const throughSequence = normalizeNonnegativeInteger(input.throughSequence, "throughSequence");
       const now = Date.now();
@@ -2307,6 +2381,23 @@ function parseTimestamp(value: string, field: string) {
     throw new Error(`Invalid ${field} timestamp: ${value}`);
   }
   return timestamp;
+}
+
+function normalizeCompatibilityFeature(value: string) {
+  const feature = value.trim();
+  if (!/^[a-z0-9][a-z0-9_.-]{0,127}$/.test(feature)) {
+    throw new Error(`Invalid compatibility feature: ${JSON.stringify(value)}`);
+  }
+  return feature;
+}
+
+function compatibilityObservationFromRow(row: Record<string, unknown>): CompatibilityObservation {
+  return {
+    count: Number(row.observationCount),
+    feature: String(row.feature),
+    firstSeenAt: new Date(Number(row.firstSeenAt)).toISOString(),
+    lastSeenAt: new Date(Number(row.lastSeenAt)).toISOString(),
+  };
 }
 
 function threadInputStateFromRow(value: unknown): ThreadInputState {

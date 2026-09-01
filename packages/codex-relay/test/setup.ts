@@ -24,3 +24,16 @@ vi.mock("react-native-mmkv", () => ({
     };
   },
 }));
+
+vi.mock("expo-tailcat-transport", () => ({
+  isTailcatTransportAvailable: () => false,
+  isTailcatTransportEnabled: () => true,
+  startTailcatTransport: async () => {
+    throw new Error("Tailcat transport is unavailable in this test build.");
+  },
+  stopTailcatTransport: async () => undefined,
+}));
+
+vi.mock("expo-modules-core", () => ({
+  requireOptionalNativeModule: () => null,
+}));

@@ -65,6 +65,77 @@ liveDescribe("live mobile stream contract", () => {
     }
   }, 30_000);
 
+  it("streams a mobile turn through a Relay client after TUI loaded the shared thread", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-shared-turn-"));
+    vi.stubEnv("CODEX_RELAY_APP_SERVER_MODE", "socket");
+    appServer = new CodexAppServerClient();
+    await appServer.initialize();
+    const notifications: string[] = [];
+    const unsubscribe = appServer.onNotification((notification) => {
+      notifications.push(notification.method);
+    });
+    const thread = await appServer.startThread({
+      approvalPolicy: "never",
+      cwd: workspacePath,
+      model: "gpt-5.5",
+      sandbox: "read-only",
+      serviceTier: null,
+      threadSource: "codex-relay-test",
+    });
+
+    try {
+      await appServer.startTurn({
+        approvalPolicy: "never",
+        cwd: workspacePath,
+        effort: "low",
+        input: [{ type: "text", text: "Reply with exactly: shared-initial-ok", text_elements: [] }],
+        model: "gpt-5.5",
+        sandboxPolicy: { access: { type: "fullAccess" }, networkAccess: false, type: "readOnly" },
+        serviceTier: null,
+        threadId: thread.id,
+      });
+      await vi.waitFor(() => expect(notifications).toContain("turn/completed"), {
+        timeout: 120_000,
+      });
+
+      notifications.length = 0;
+      secondAppServer = new CodexAppServerClient();
+      await secondAppServer.initialize();
+      const relayApp = createApp({ appServer: secondAppServer, workspacePath });
+      const response = await relayApp.request(`/v1/threads/${thread.id}/runs/stream`, {
+        method: "POST",
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          prompt: "Reply with exactly: shared-tui-ok",
+          reasoningEffort: "low",
+          runtimeMode: "full-access",
+        }),
+        headers: { "content-type": "application/json" },
+      });
+      const body = await response.text();
+
+      expect(response.status).toBe(200);
+      expect(body.toLowerCase()).toContain("shared-tui-ok");
+      expect(body).toContain('"state":"completed"');
+      await vi.waitFor(() => expect(notifications).toContain("turn/started"), { timeout: 10_000 });
+      await vi.waitFor(
+        () => {
+          expect(
+            notifications.some((method) =>
+              ["item/agentMessage/delta", "item/completed", "turn/completed"].includes(method),
+            ),
+          ).toBe(true);
+        },
+        { timeout: 120_000 },
+      );
+      await vi.waitFor(() => expect(notifications).toContain("turn/completed"), {
+        timeout: 120_000,
+      });
+    } finally {
+      unsubscribe();
+    }
+  }, 150_000);
+
   it("round-trips a real app-server turn through the server SSE and mobile stream reducer", async () => {
     const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-live-workspace-"));
     appServer = new CodexAppServerClient();

@@ -8,13 +8,17 @@ import qrcode from "qrcode-terminal";
 
 import { createApp, relayThreadOwnerCapabilities } from "./app.js";
 import { CodexAppServerClient } from "./app-server.js";
+import {
+  effectiveManagedSharedAppServerState,
+  ensureCodexSharedAppServerDaemon,
+} from "./app-server-daemon.js";
 import { recoverActiveAppServerTurnClaims } from "./app-server-turn-recovery.js";
 import {
   resolveCodexAppServerMode,
   resolveCodexSharedAppServerRemoteAddress,
 } from "./codex-binary.js";
 import { createServerEpoch, relayIdFromServerPublicKey } from "./connection-plan.js";
-import { isRelayDebugEnabled, relayDebugLog } from "./debug-log.js";
+import { flushRelayDebugLog, isRelayDebugEnabled, relayDebugLog } from "./debug-log.js";
 import {
   createPairingQrPayload,
   getConnectUrlCandidates,
@@ -24,18 +28,27 @@ import {
 import { createTursoPairingSessionStore } from "./pairing-store.js";
 import { codexRelayDataPath, legacyCodexRelayDataPath } from "./paths.js";
 import { createFileRuntimePreferencesStore } from "./preferences-store.js";
+import { createRelayLifecycle } from "./relay-lifecycle.js";
 import { createRelayStateStore } from "./relay-state-store.js";
 import {
   createServerIdentity,
   createServerIdentityFromPrivateKey,
   type ServerIdentity,
 } from "./secure-transport.js";
+import {
+  startTailcatSidecar,
+  stopStaleTailcatSidecar,
+  type TailcatSidecar,
+  type TailcatSidecarDiagnostics,
+} from "./tailcat-sidecar.js";
 
 const port = Number(process.env.PORT ?? 8787);
 const hostname = process.env.HOST ?? "0.0.0.0";
 const dangerouslyAutoApprove = process.env.CODEX_RELAY_DANGEROUSLY_AUTO_APPROVE === "1";
 const maxThreadEventRetention = parsePositiveIntegerEnv("CODEX_RELAY_MAX_THREAD_EVENTS");
 const threadOwnerLeaseMs = parseNonnegativeIntegerEnv("CODEX_RELAY_OWNER_LEASE_MS");
+const shutdownDrainMs = parseNonnegativeIntegerEnv("CODEX_RELAY_SHUTDOWN_DRAIN_MS") ?? 10_000;
+const relayLifecycle = createRelayLifecycle({ drainTimeoutMs: shutdownDrainMs });
 const serverIdentity = await getServerIdentity();
 const relayId = relayIdFromServerPublicKey(serverIdentity.publicKey);
 const serverEpoch = createServerEpoch();
@@ -47,6 +60,52 @@ if (debugLogPath) {
   process.env.CODEX_RELAY_DEBUG_LOG_PATH = debugLogPath;
   relayDebugLog("relay.debug.enabled", { debugLogPath, pid: process.pid });
 }
+const tailcatAddressPath =
+  process.env.CODEX_RELAY_TAILCAT_ADDRESS_PATH ?? codexRelayDataPath("tailcat/address.token");
+const tailcatBinaryPath = process.env.CODEX_RELAY_TAILCAT_BINARY ?? "tailcat";
+const tailcatKeyPath =
+  process.env.CODEX_RELAY_TAILCAT_KEY_PATH ?? codexRelayDataPath("tailcat/default.private.json");
+const tailcatPidPath = process.env.CODEX_RELAY_TAILCAT_PID_PATH ?? `${tailcatAddressPath}.pid`;
+await stopStaleTailcatSidecar({
+  binaryPath: tailcatBinaryPath,
+  keyPath: tailcatKeyPath,
+  localTargetPort: port,
+  pidPath: tailcatPidPath,
+})
+  .then((stopped) => {
+    if (stopped) {
+      relayDebugLog("tailcat.stale_sidecar_stopped");
+    }
+  })
+  .catch((error) => {
+    relayDebugLog("tailcat.stale_sidecar_cleanup_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
+const tailcatEnabled = process.env.CODEX_RELAY_TAILCAT_TRANSPORT === "1";
+const tailcatSidecar = tailcatEnabled
+  ? await startTailcatSidecar({
+      addressPath: tailcatAddressPath,
+      binaryPath: tailcatBinaryPath,
+      keyPath: tailcatKeyPath,
+      localTargetPort: port,
+      pidPath: tailcatPidPath,
+      startTimeoutMs: parsePositiveIntegerEnv("CODEX_RELAY_TAILCAT_START_TIMEOUT_MS") ?? 10_000,
+    })
+      .then((sidecar) => {
+        relayDebugLog("tailcat.started", sidecar.diagnostics());
+        return sidecar;
+      })
+      .catch((error) => {
+        relayDebugLog("tailcat.start_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        console.warn(
+          "Tailcat transport is unavailable; continuing with HTTP connection candidates.",
+        );
+        return undefined;
+      })
+  : undefined;
 const colors = pc.createColors(!process.env.NO_COLOR && process.env.TERM !== "dumb");
 const color = {
   brand: colors.cyan,
@@ -99,8 +158,24 @@ const managementState: {
   listenUrl?: string;
   pairingPayload?: string;
   port?: number;
+  tailcat?: TailcatRuntimeDiagnostics;
 } = {};
 const appServerMode = resolveCodexAppServerMode();
+let sharedAppServerManaged = false;
+let sharedAppServerSocketPath: string | undefined;
+if (appServerMode.mode === "socket" && process.platform !== "win32") {
+  await ensureCodexSharedAppServerDaemon()
+    .then((daemon) => {
+      sharedAppServerManaged = true;
+      sharedAppServerSocketPath = daemon.socketPath;
+    })
+    .catch((error) => {
+      logRuntimeEvent(
+        "Warning",
+        `Managed shared app-server unavailable; continuing with process-owned shared startup (${error instanceof Error ? error.message : String(error)}).`,
+      );
+    });
+}
 const relayAppServer =
   appServerMode.mode === "socket"
     ? new CodexAppServerClient({
@@ -115,9 +190,6 @@ const relayAppServer =
     : undefined;
 if (relayAppServer) {
   await relayAppServer.initialize();
-  process.once("SIGINT", () => stopRelayAppServer(130));
-  process.once("SIGTERM", () => stopRelayAppServer(143));
-  process.once("exit", () => relayAppServer.close());
 }
 const recoveredTurnClaims =
   relayAppServer && threadEvents
@@ -138,12 +210,18 @@ const recoveredTurnClaims =
         })
     : [];
 
-serve(
+const httpServer = serve(
   {
     fetch: createApp({
       approvalStore: relayAppServer ? threadEvents : undefined,
       appServer: relayAppServer,
-      connectionPlan: { relayId, serverEpoch },
+      compatibilityObservations: threadEvents,
+      connectionPlan: {
+        relayId,
+        serverEpoch,
+        tailcatCandidate: () => tailcatSidecar?.candidate(),
+      },
+      lifecycle: relayLifecycle,
       management: managementState,
       maxThreadEventRetention,
       pairing: {
@@ -219,6 +297,11 @@ serve(
       serverPublicKey: serverIdentity.publicKey,
       serverUrls: connectUrls.length > 0 ? connectUrls : [connectUrl],
     });
+    const effectiveSharedAppServerState = effectiveManagedSharedAppServerState({
+      appServerMode: relayAppServer?.appServerMode,
+      managed: sharedAppServerManaged,
+      socketPath: sharedAppServerSocketPath,
+    });
 
     void writeServerState({
       connectUrl,
@@ -227,6 +310,8 @@ serve(
       listenUrl,
       pairingPayload,
       port: info.port,
+      tailcat: tailcatRuntimeDiagnostics(tailcatEnabled, tailcatSidecar, port),
+      ...effectiveSharedAppServerState,
     });
     Object.assign(managementState, {
       connectUrl,
@@ -234,6 +319,7 @@ serve(
       listenUrl,
       pairingPayload,
       port: info.port,
+      tailcat: tailcatRuntimeDiagnostics(tailcatEnabled, tailcatSidecar, port),
     });
     void writeBackgroundPid();
     if (debugLogPath) {
@@ -267,10 +353,53 @@ serve(
   },
 );
 
-function stopRelayAppServer(exitCode: number) {
+relayLifecycle.onQuiesce(() => {
+  httpServer.close();
+  relayDebugLog("relay.shutdown.quiescing", { drainTimeoutMs: shutdownDrainMs });
+});
+relayLifecycle.onClose(async () => {
+  const connectionCloser = httpServer as typeof httpServer & {
+    closeAllConnections?: () => void;
+    closeIdleConnections?: () => void;
+  };
+  connectionCloser.closeIdleConnections?.();
+  connectionCloser.closeAllConnections?.();
   relayAppServer?.close();
-  process.exit(exitCode);
+  await tailcatSidecar?.close();
+  sessionStore.close();
+  threadEvents?.close();
+});
+
+let shutdownExitCode: number | undefined;
+function requestShutdown(exitCode: number) {
+  shutdownExitCode ??= exitCode;
+  void relayLifecycle
+    .shutdown()
+    .then(async (report) => {
+      relayDebugLog("relay.shutdown.completed", {
+        drainTimedOut: report.drainTimedOut,
+        errors: report.errors,
+      });
+      await flushRelayDebugLog();
+      process.exit(shutdownExitCode);
+    })
+    .catch(async (error) => {
+      relayDebugLog("relay.shutdown.failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await flushRelayDebugLog();
+      process.exit(1);
+    });
 }
+
+process.once("SIGINT", () => requestShutdown(130));
+process.once("SIGTERM", () => requestShutdown(143));
+process.once("exit", () => {
+  relayAppServer?.close();
+  void tailcatSidecar?.close();
+  sessionStore.close();
+  threadEvents?.close();
+});
 
 function formatStartupInstructions(details: {
   connectUrl: string;
@@ -293,8 +422,9 @@ function formatStartupInstructions(details: {
     ...(details.sharedAppServerRemoteAddress
       ? [
           "",
-          `${color.prompt("›")} Terminal: ${color.command(`codex resume --remote ${details.sharedAppServerRemoteAddress}`)}`,
-          `  ${color.muted("Connect through the shared Codex app-server to follow and steer the same live sessions.")}`,
+          `${color.prompt("›")} New terminal session: ${color.command(`codex --remote ${details.sharedAppServerRemoteAddress} -C "$PWD"`)}`,
+          `${color.prompt("›")} Resume terminal session: ${color.command(`codex resume --remote ${details.sharedAppServerRemoteAddress} -C "$PWD"`)}`,
+          `  ${color.muted("New sessions use the current terminal directory. Resumed sessions retain their original working directory.")}`,
         ]
       : []),
     "",
@@ -406,10 +536,31 @@ async function writeServerState(details: {
   listenUrl: string;
   pairingPayload: string;
   port: number;
+  sharedAppServerManaged: boolean;
+  sharedAppServerSocketPath?: string;
+  tailcat?: TailcatRuntimeDiagnostics;
 }) {
   const path = codexRelayDataPath("server-state.json");
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(details)}\n`, { mode: 0o600 });
+}
+
+type TailcatRuntimeDiagnostics =
+  | { enabled: false; status: "disabled" }
+  | ({ enabled: true } & TailcatSidecarDiagnostics)
+  | { enabled: true; localTargetPort: number; status: "failed" };
+
+function tailcatRuntimeDiagnostics(
+  enabled: boolean,
+  sidecar: TailcatSidecar | undefined,
+  localTargetPort: number,
+): TailcatRuntimeDiagnostics {
+  if (!enabled) {
+    return { enabled: false, status: "disabled" };
+  }
+  return sidecar
+    ? { enabled: true, ...sidecar.diagnostics() }
+    : { enabled: true, localTargetPort, status: "failed" };
 }
 
 async function prepareCodexRelayDataPath(fileName: string, companionFileNames: string[] = []) {

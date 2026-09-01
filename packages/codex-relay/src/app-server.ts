@@ -1,7 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { connect } from "node:net";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import { setTimeout } from "node:timers/promises";
 import WebSocket from "ws";
@@ -10,10 +8,12 @@ import {
   resolveCodexAppServerMode,
   resolveCodexAppServerSpawn,
   resolveCodexSharedAppServerRemoteAddress,
+  resolveCodexSharedAppServerSocketPath,
   resolveCodexSharedAppServerSpawn,
   type CodexAppServerMode,
   type CodexAppServerModeResolution,
 } from "./codex-binary.js";
+import { nonOriginatingCodexAppServerClientInfo } from "./app-server-client-info.js";
 import { relayDebugLog } from "./debug-log.js";
 
 type JsonRpcServerMessage = {
@@ -33,6 +33,18 @@ type PendingRequest = {
   resolve(value: unknown): void;
 };
 
+const defaultTurnStartTimeoutMs = 30_000;
+
+export class AppServerRequestTimeoutError extends Error {
+  readonly method: string;
+
+  constructor(method: string) {
+    super(`Codex app-server ${method} timed out.`);
+    this.name = "AppServerRequestTimeoutError";
+    this.method = method;
+  }
+}
+
 export type SharedAppServerOwnership = "attached" | "relay-owned";
 
 export type AppServerConnectionStateEvent = {
@@ -45,6 +57,7 @@ export type CodexAppServerClientOptions = {
   readonly mode?: CodexAppServerModeResolution;
   readonly onStartupFallback?: (error: Error) => void;
   readonly startSharedServer?: () => Promise<ChildProcessWithoutNullStreams>;
+  readonly turnStartTimeoutMs?: number;
 };
 
 const sharedSocketReconnectDelaysMs = [50, 100, 250, 500, 1_000, 2_000] as const;
@@ -78,6 +91,12 @@ export type AppServerTurn = {
   startedAt: number | null;
   completedAt: number | null;
   durationMs?: number | null;
+};
+
+export type AppServerThreadTurnsPage = {
+  backwardsCursor?: string | null;
+  data: AppServerTurn[];
+  nextCursor?: string | null;
 };
 
 export type AppServerTextElement = {
@@ -303,8 +322,10 @@ export class CodexAppServerClient {
   private activeTurnIdsByThreadId = new Map<string, string>();
   private terminalTurnIdsByThreadId = new Map<string, string>();
   private subscribedThreadIds = new Set<string>();
+  private threadTurnsPageRequests = new Map<string, Promise<AppServerThreadTurnsPage>>();
   private readonly onStartupFallback: ((error: Error) => void) | undefined;
   private readonly startSharedServer: () => Promise<ChildProcessWithoutNullStreams>;
+  private readonly turnStartTimeoutMs: number;
 
   constructor(options: CodexAppServerClientOptions = {}) {
     const mode = options.mode ?? resolveCodexAppServerMode();
@@ -312,10 +333,15 @@ export class CodexAppServerClient {
     this.fallbackToStdio = mode.fallbackToStdio;
     this.onStartupFallback = options.onStartupFallback;
     this.startSharedServer = options.startSharedServer ?? startSharedCodexAppServer;
+    this.turnStartTimeoutMs = options.turnStartTimeoutMs ?? defaultTurnStartTimeoutMs;
   }
 
   get appServerMode() {
     return this.activeMode;
+  }
+
+  isThreadSubscribed(threadId: string) {
+    return this.subscribedThreadIds.has(threadId);
   }
 
   initialize() {
@@ -355,6 +381,37 @@ export class CodexAppServerClient {
       includeTurns: options.includeTurns ?? true,
     });
     return response.thread;
+  }
+
+  async listThreadTurns(
+    threadId: string,
+    options: {
+      cursor?: string;
+      itemsView?: "notLoaded" | "summary" | "full";
+      limit?: number;
+      sortDirection?: "asc" | "desc";
+    } = {},
+  ) {
+    const params = {
+      threadId,
+      cursor: options.cursor,
+      itemsView: options.itemsView ?? "summary",
+      limit: options.limit,
+      sortDirection: options.sortDirection ?? "desc",
+    };
+    const key = JSON.stringify(params);
+    const existing = this.threadTurnsPageRequests.get(key);
+    if (existing) {
+      return existing;
+    }
+    const request = this.request<AppServerThreadTurnsPage>("thread/turns/list", params);
+    const tracked = request.finally(() => {
+      if (this.threadTurnsPageRequests.get(key) === tracked) {
+        this.threadTurnsPageRequests.delete(key);
+      }
+    });
+    this.threadTurnsPageRequests.set(key, tracked);
+    return tracked;
   }
 
   async listModels(limit = 80) {
@@ -397,7 +454,9 @@ export class CodexAppServerClient {
   }
 
   async startTurn(params: AppServerTurnStartParams) {
-    const response = await this.request<{ turn: AppServerTurn }>("turn/start", params);
+    const response = await this.request<{ turn: AppServerTurn }>("turn/start", params, {
+      timeoutMs: this.turnStartTimeoutMs,
+    });
     this.rememberTurn(params.threadId, response.turn);
     return response.turn;
   }
@@ -482,17 +541,46 @@ export class CodexAppServerClient {
     this.activeTurnIdsByThreadId.clear();
     this.terminalTurnIdsByThreadId.clear();
     this.subscribedThreadIds.clear();
+    this.threadTurnsPageRequests.clear();
   }
 
-  private async request<T>(method: string, params: unknown): Promise<T> {
+  private async request<T>(
+    method: string,
+    params: unknown,
+    options: { timeoutMs?: number } = {},
+  ): Promise<T> {
     await this.ensureInitialized();
     const id = this.nextId++;
     debugAppServer("request", method, id);
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { method, resolve: (value) => resolve(value as T), reject });
-      void this.writeJson({ id, method, params }).catch((error: Error) => {
-        if (this.pending.delete(id)) {
+      const timeout = options.timeoutMs
+        ? globalThis.setTimeout(() => {
+            if (this.pending.delete(id)) {
+              reject(new AppServerRequestTimeoutError(method));
+            }
+          }, options.timeoutMs)
+        : undefined;
+      const clearRequestTimeout = () => {
+        if (timeout) {
+          globalThis.clearTimeout(timeout);
+        }
+      };
+      this.pending.set(id, {
+        method,
+        resolve: (value) => {
+          clearRequestTimeout();
+          resolve(value as T);
+        },
+        reject: (error) => {
+          clearRequestTimeout();
           reject(error);
+        },
+      });
+      void this.writeJson({ id, method, params }).catch((error: Error) => {
+        const pending = this.pending.get(id);
+        if (pending) {
+          this.pending.delete(id);
+          pending.reject(error);
         }
       });
     });
@@ -552,11 +640,7 @@ export class CodexAppServerClient {
 
   private async initializeAppServer() {
     await this.requestRaw("initialize", {
-      clientInfo: {
-        name: "codex-relay",
-        title: "Codex Relay Mobile Server",
-        version: "1.2.0",
-      },
+      clientInfo: nonOriginatingCodexAppServerClientInfo,
       capabilities: {
         experimentalApi: true,
         requestAttestation: false,
@@ -711,14 +795,14 @@ export class CodexAppServerClient {
       await this.connectSharedCodexAppServer();
       relayDebugLog("app_server.shared_socket.attached", {
         ownership: "attached",
-        socketPath: sharedCodexAppServerSocketPath(),
+        socketPath: resolveCodexSharedAppServerSocketPath(),
       });
       return;
     } catch (error) {
       const attachError = error instanceof Error ? error : new Error(String(error));
       relayDebugLog("app_server.shared_socket.attach_failed", {
         message: attachError.message,
-        socketPath: sharedCodexAppServerSocketPath(),
+        socketPath: resolveCodexSharedAppServerSocketPath(),
       });
       if (this.sharedServer) {
         throw attachError;
@@ -730,7 +814,7 @@ export class CodexAppServerClient {
     this.observeSharedCodexAppServer(sharedServer);
     relayDebugLog("app_server.shared_process.started", {
       ownership: "relay-owned",
-      socketPath: sharedCodexAppServerSocketPath(),
+      socketPath: resolveCodexSharedAppServerSocketPath(),
     });
     try {
       await this.connectSharedCodexAppServer();
@@ -773,7 +857,7 @@ export class CodexAppServerClient {
     const remoteAddress = resolveCodexSharedAppServerRemoteAddress();
     const socket = new WebSocket(
       remoteAddress === "unix://"
-        ? `ws+unix://${sharedCodexAppServerSocketPath()}:/`
+        ? `ws+unix://${resolveCodexSharedAppServerSocketPath()}:/`
         : remoteAddress,
       {
         perMessageDeflate: false,
@@ -812,7 +896,7 @@ export class CodexAppServerClient {
     });
     relayDebugLog("app_server.shared_socket.connected", {
       ownership: this.sharedAppServerOwnership(),
-      socketPath: sharedCodexAppServerSocketPath(),
+      socketPath: resolveCodexSharedAppServerSocketPath(),
     });
   }
 
@@ -880,7 +964,7 @@ export class CodexAppServerClient {
         await this.initializeAppServer();
         relayDebugLog("app_server.shared_socket.reconnected", {
           ownership: this.sharedAppServerOwnership(),
-          socketPath: sharedCodexAppServerSocketPath(),
+          socketPath: resolveCodexSharedAppServerSocketPath(),
         });
         this.emitConnectionState("reconnected");
         return;
@@ -1073,7 +1157,7 @@ async function waitForSharedCodexAppServer(remoteAddress: string) {
   await new Promise<void>((resolve, reject) => {
     const socket =
       remoteAddress === "unix://"
-        ? connect({ path: sharedCodexAppServerSocketPath() })
+        ? connect({ path: resolveCodexSharedAppServerSocketPath() })
         : connectRemoteAddress(remoteAddress);
     const onError = (error: Error) => reject(error);
     socket.once("error", onError);
@@ -1088,14 +1172,6 @@ async function waitForSharedCodexAppServer(remoteAddress: string) {
 function connectRemoteAddress(remoteAddress: string) {
   const url = new URL(remoteAddress);
   return connect({ host: url.hostname, port: Number(url.port) });
-}
-
-function sharedCodexAppServerSocketPath() {
-  return join(
-    process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"),
-    "app-server-control",
-    "app-server-control.sock",
-  );
 }
 
 function isAppServerTurnInProgress(turn: AppServerTurn) {

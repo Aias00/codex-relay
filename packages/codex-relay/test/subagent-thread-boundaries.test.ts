@@ -244,20 +244,24 @@ describe("subagent thread boundaries", () => {
     expect(sent).toEqual([
       [
         expect.objectContaining({
-          data: {
+          data: expect.objectContaining({
             intent: "action_required",
+            relayId: expect.stringMatching(/^relay_/),
+            semanticEventId: "action_required:parent-thread:parent-turn:2",
             threadId: "parent-thread",
             turnId: "parent-turn",
-          },
+          }),
         }),
       ],
       [
         expect.objectContaining({
-          data: {
+          data: expect.objectContaining({
             intent: "turn_terminal",
+            relayId: expect.stringMatching(/^relay_/),
+            semanticEventId: "turn_terminal:parent-thread:parent-turn",
             threadId: "parent-thread",
             turnId: "parent-turn",
-          },
+          }),
         }),
       ],
     ]);

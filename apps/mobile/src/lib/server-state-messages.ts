@@ -10,6 +10,46 @@ import {
 } from "codex-relay/api-schema";
 
 const optimisticSteeringMessageIdPrefix = "optimistic-steering:";
+const optimisticRunMessageIdPrefix = "optimistic-run:";
+
+export function optimisticRunMessageId(clientEventId: string) {
+  return `${optimisticRunMessageIdPrefix}${clientEventId}`;
+}
+
+export function appendOptimisticRunMessageToDetail(
+  current: ThreadDetailResponse | undefined,
+  options: {
+    input: QueuedThreadInput;
+    nowIso: string;
+    thread: ThreadSummary | undefined;
+    threadId: string;
+  },
+): ThreadDetailResponse | undefined {
+  const thread = current?.thread ?? options.thread;
+  if (!thread) {
+    return current;
+  }
+  const message: ChatMessage = {
+    id: optimisticRunMessageId(options.input.id),
+    threadId: options.threadId,
+    role: "user",
+    kind: "chat",
+    content: promptMarkdownWithSkills(options.input.prompt, options.input.skills),
+    createdAt: options.nowIso,
+    details: chatMessageDetailsFromPromptContext(options.input),
+    semanticEventId: options.input.clientEventId ?? options.input.id,
+    state: "completed",
+  };
+  return {
+    ...(current ?? {
+      thread,
+      pendingInputRequests: [],
+      hasOlderMessages: false,
+    }),
+    thread,
+    messages: upsertMessage(current?.messages ?? [], message),
+  };
+}
 
 export function appendOptimisticSteeringMessageToDetail(
   current: ThreadDetailResponse | undefined,
@@ -34,13 +74,17 @@ export function appendOptimisticSteeringMessageToDetail(
     details: chatMessageDetailsFromPromptContext(options.input, {
       optimisticQueuedInputId: options.input.id,
     }),
+    semanticEventId: options.input.clientEventId ?? options.input.id,
     state: "completed",
   };
   return {
     thread,
     messages: upsertMessage(current?.messages ?? [], message),
     pendingInputRequests: current?.pendingInputRequests ?? [],
+    hasMoreMessages: current?.hasMoreMessages ?? false,
     hasOlderMessages: current?.hasOlderMessages ?? false,
+    ...(current?.messageCursor ? { messageCursor: current.messageCursor } : {}),
+    messageCursorReset: current?.messageCursorReset ?? false,
     ...(current?.olderMessagesCursor ? { olderMessagesCursor: current.olderMessagesCursor } : {}),
   };
 }
@@ -48,29 +92,61 @@ export function appendOptimisticSteeringMessageToDetail(
 export function mergeThreadDetailState(
   current: ThreadDetailResponse | undefined,
   response: ThreadDetailResponse,
+  authoritativeThreadState = false,
 ) {
   if (!current || current.thread.id !== response.thread.id) {
     return response;
   }
   const messages = mergeMessages(current.messages, response.messages);
+  const preservesOlderHistory =
+    !response.messageCursorReset &&
+    response.olderMessagesCursor === undefined &&
+    current.olderMessagesCursor !== undefined;
   return {
     ...response,
-    thread: preferredThreadSnapshot(current.thread, response.thread),
+    thread: authoritativeThreadState
+      ? response.thread
+      : preferredThreadSnapshot(current.thread, response.thread),
     messages,
+    ...(preservesOlderHistory
+      ? {
+          hasOlderMessages: current.hasOlderMessages,
+          olderMessagesCursor: current.olderMessagesCursor,
+        }
+      : {}),
+    ...(response.messageCursor
+      ? { messageCursor: response.messageCursor }
+      : current.messageCursor
+        ? { messageCursor: current.messageCursor }
+        : {}),
   };
 }
 
 export function upsertMessage(messages: ChatMessage[], message: ChatMessage) {
+  const replacementId = replacementMessageId(message);
   const existingIndex = messages.findIndex((candidate) => candidate.id === message.id);
   if (existingIndex !== -1) {
-    return messages.map((candidate) =>
-      candidate.id === message.id ? preferredMessageSnapshot(candidate, message) : candidate,
+    return messages.flatMap((candidate, index) => {
+      if (candidate.id === replacementId && candidate.id !== message.id) {
+        return [];
+      }
+      return [index === existingIndex ? preferredMessageSnapshot(candidate, message) : candidate];
+    });
+  }
+  const semanticIndex = message.semanticEventId
+    ? messages.findIndex(
+        (candidate) =>
+          candidate.id !== message.id && candidate.semanticEventId === message.semanticEventId,
+      )
+    : -1;
+  if (semanticIndex !== -1) {
+    return messages.map((candidate, index) =>
+      index === semanticIndex ? preferredSemanticMessage(candidate, message) : candidate,
     );
   }
   if (messages.some((candidate) => replacementMessageId(candidate) === message.id)) {
     return messages;
   }
-  const replacementId = replacementMessageId(message);
   const replacementIndex = replacementId
     ? messages.findIndex((candidate) => candidate.id === replacementId)
     : -1;
@@ -81,13 +157,24 @@ export function upsertMessage(messages: ChatMessage[], message: ChatMessage) {
     message.role === "user"
       ? messages.findIndex(
           (candidate) =>
-            candidate.id.startsWith(optimisticSteeringMessageIdPrefix) &&
+            isOptimisticUserMessage(candidate) &&
             candidate.role === "user" &&
             candidate.content === message.content,
         )
       : -1;
   if (optimisticIndex !== -1) {
     return messages.map((candidate, index) => (index === optimisticIndex ? message : candidate));
+  }
+  const transientDuplicateIndex = messages.findIndex((candidate) =>
+    isTransientCanonicalUserPair(candidate, message),
+  );
+  if (transientDuplicateIndex !== -1) {
+    if (isTransientRelayUserMessageId(message.id)) {
+      return messages;
+    }
+    return messages.map((candidate, index) =>
+      index === transientDuplicateIndex ? message : candidate,
+    );
   }
   const lastMessage = messages[messages.length - 1];
   if (isDuplicateOptimisticQueuedMessage(lastMessage, message)) {
@@ -100,6 +187,13 @@ export function upsertMessage(messages: ChatMessage[], message: ChatMessage) {
 
 function optimisticSteeringMessageId(inputId: string) {
   return `${optimisticSteeringMessageIdPrefix}${inputId}`;
+}
+
+function isOptimisticUserMessage(message: ChatMessage) {
+  return (
+    message.id.startsWith(optimisticSteeringMessageIdPrefix) ||
+    message.id.startsWith(optimisticRunMessageIdPrefix)
+  );
 }
 
 function mergeMessages(baseMessages: ChatMessage[], incomingMessages: ChatMessage[]) {
@@ -150,7 +244,64 @@ function mergeMessages(baseMessages: ChatMessage[], incomingMessages: ChatMessag
     indexesById.set(message.id, messages.length);
     messages.push(message);
   }
-  return sortMessagesByCreation(messages);
+  return dedupeTransientCanonicalUsers(dedupeSemanticMessages(sortMessagesByCreation(messages)));
+}
+
+function dedupeSemanticMessages(messages: ChatMessage[]) {
+  const deduped: ChatMessage[] = [];
+  const indexesBySemanticEventId = new Map<string, number>();
+  for (const message of messages) {
+    const semanticEventId = message.semanticEventId;
+    const existingIndex = semanticEventId
+      ? indexesBySemanticEventId.get(semanticEventId)
+      : undefined;
+    if (existingIndex === undefined) {
+      if (semanticEventId) {
+        indexesBySemanticEventId.set(semanticEventId, deduped.length);
+      }
+      deduped.push(message);
+      continue;
+    }
+    deduped[existingIndex] = preferredSemanticMessage(deduped[existingIndex]!, message);
+  }
+  return deduped;
+}
+
+function dedupeTransientCanonicalUsers(messages: ChatMessage[]) {
+  const deduped: ChatMessage[] = [];
+  for (const message of messages) {
+    const previous = deduped[deduped.length - 1];
+    if (!previous || !isTransientCanonicalUserPair(previous, message)) {
+      deduped.push(message);
+      continue;
+    }
+    if (isTransientRelayUserMessageId(previous.id)) {
+      deduped[deduped.length - 1] = message;
+    }
+  }
+  return deduped;
+}
+
+function isTransientCanonicalUserPair(left: ChatMessage, right: ChatMessage) {
+  const leftIsTransient = isTransientRelayUserMessageId(left.id);
+  const rightIsTransient = isTransientRelayUserMessageId(right.id);
+  if (
+    left.id === right.id ||
+    left.threadId !== right.threadId ||
+    left.role !== "user" ||
+    right.role !== "user" ||
+    left.kind !== right.kind ||
+    left.content !== right.content ||
+    leftIsTransient === rightIsTransient
+  ) {
+    return false;
+  }
+  const elapsedMs = Math.abs(Date.parse(left.createdAt) - Date.parse(right.createdAt));
+  return Number.isFinite(elapsedMs) && elapsedMs <= 10_000;
+}
+
+function isTransientRelayUserMessageId(id: string) {
+  return /^msg-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
 }
 
 function preferredMessageSnapshot(current: ChatMessage, incoming: ChatMessage) {
@@ -163,6 +314,21 @@ function preferredMessageSnapshot(current: ChatMessage, incoming: ChatMessage) {
     return current;
   }
   return incoming;
+}
+
+function preferredSemanticMessage(current: ChatMessage, incoming: ChatMessage) {
+  const currentIsOptimistic = isOptimisticUserMessage(current);
+  const incomingIsOptimistic = isOptimisticUserMessage(incoming);
+  if (currentIsOptimistic !== incomingIsOptimistic) {
+    return currentIsOptimistic ? incoming : current;
+  }
+  if (replacementMessageId(incoming) === current.id) {
+    return incoming;
+  }
+  if (replacementMessageId(current) === incoming.id) {
+    return current;
+  }
+  return preferredMessageSnapshot(current, incoming);
 }
 
 export function preferredThreadSnapshot(current: ThreadSummary, incoming: ThreadSummary) {
@@ -190,7 +356,8 @@ function isDuplicateOptimisticQueuedMessage(
   incoming: ChatMessage,
 ) {
   return (
-    previous?.id.startsWith(optimisticSteeringMessageIdPrefix) === true &&
+    previous !== undefined &&
+    isOptimisticUserMessage(previous) &&
     previous.threadId === incoming.threadId &&
     previous.role === incoming.role &&
     previous.content === incoming.content

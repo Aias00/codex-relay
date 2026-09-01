@@ -8,6 +8,57 @@ import { describe, expect, it } from "vitest";
 import { createRelayStateStore } from "../src/relay-state-store.js";
 
 describe("relay state store", () => {
+  it("persists aggregated content-safe compatibility observations", async () => {
+    const store = await createRelayStateStore(":memory:");
+
+    await store.recordCompatibilityObservation({
+      feature: "legacy.run_stream_prompt",
+      observedAt: "2026-08-31T00:00:00.000Z",
+    });
+    await store.recordCompatibilityObservation({
+      feature: "legacy.run_stream_prompt",
+      observedAt: "2026-08-31T00:01:00.000Z",
+    });
+
+    await expect(store.listCompatibilityObservations()).resolves.toEqual([
+      {
+        count: 2,
+        feature: "legacy.run_stream_prompt",
+        firstSeenAt: "2026-08-31T00:00:00.000Z",
+        lastSeenAt: "2026-08-31T00:01:00.000Z",
+      },
+    ]);
+    await expect(
+      store.recordCompatibilityObservation({ feature: "prompt content is invalid" }),
+    ).rejects.toThrow("Invalid compatibility feature");
+  });
+
+  it("keeps compatibility observations across store restarts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codex-relay-compatibility-"));
+    const databasePath = join(directory, "relay-state.db");
+    try {
+      const firstStore = await createRelayStateStore(databasePath);
+      await firstStore.recordCompatibilityObservation({
+        feature: "legacy.workspace_path_without_id",
+        observedAt: "2026-08-31T00:00:00.000Z",
+      });
+      firstStore.close();
+
+      const reopenedStore = await createRelayStateStore(databasePath);
+      await expect(reopenedStore.listCompatibilityObservations()).resolves.toEqual([
+        {
+          count: 1,
+          feature: "legacy.workspace_path_without_id",
+          firstSeenAt: "2026-08-31T00:00:00.000Z",
+          lastSeenAt: "2026-08-31T00:00:00.000Z",
+        },
+      ]);
+      reopenedStore.close();
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it("allocates a monotonic sequence per thread", async () => {
     const store = await createRelayStateStore(":memory:");
 
@@ -261,6 +312,26 @@ describe("relay state store", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
+  });
+
+  it("accepts ten concurrent retries as one durable input", async () => {
+    const store = await createRelayStateStore(":memory:");
+    const results = await Promise.all(
+      Array.from({ length: 10 }, (_, index) =>
+        store.createThreadInput({
+          clientEventId: "2ef23af2-1c7b-4c77-9961-bf560346b31e",
+          clientId: "retry-client",
+          inputId: `retry-input-${index}`,
+          payload: { prompt: "Run exactly once" },
+          state: "queued",
+          threadId: "retry-thread",
+        }),
+      ),
+    );
+
+    expect(results.filter((result) => result.created)).toHaveLength(1);
+    expect(new Set(results.map((result) => result.input.inputId))).toHaveLength(1);
+    await expect(store.listThreadInputs({ threadId: "retry-thread" })).resolves.toHaveLength(1);
   });
 
   it("guards turn claims with owner epochs and durable cancellation tombstones", async () => {
@@ -1141,7 +1212,7 @@ describe("relay state store", () => {
         .execute("SELECT version FROM relay_state_schema ORDER BY version")
         .then((result) => result.rows.map((row) => Number(row.version)));
       migratedClient.close();
-      expect(versions).toEqual([4, 8]);
+      expect(versions).toEqual([4, 9]);
     } finally {
       client.close();
       await rm(directory, { force: true, recursive: true });

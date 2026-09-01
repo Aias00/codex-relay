@@ -7,8 +7,6 @@ import { Button } from "@/components/ui/button";
 import { CopyableCommand } from "@/components/ui/copyable-command";
 import { Icon } from "@/components/ui/icon";
 import { workspaceName } from "@/lib/workspace-name";
-import { threadSyncLabel } from "@/lib/thread-sync-state";
-import type { ThreadSyncState } from "@/state/chat-store";
 
 import { relayStartCommand } from "./pairing-commands";
 
@@ -18,19 +16,15 @@ export function ConnectionBanner({
   connection,
   error,
   hasPairedSession,
-  onRefresh,
   onScanConnect,
   serverUrl,
-  syncState,
   workspacePath,
 }: {
   connection: "checking" | "connected" | "offline";
   error?: string;
   hasPairedSession: boolean;
-  onRefresh: () => void;
   onScanConnect: () => void;
   serverUrl: string;
-  syncState?: ThreadSyncState;
   workspacePath?: string;
 }) {
   const isConnected = connection === "connected";
@@ -40,61 +34,8 @@ export function ConnectionBanner({
       ? `Checking · ${compactServer(serverUrl)}`
       : (error ?? `Offline · ${compactServer(serverUrl)}`);
 
-  if (hasPairedSession && !isConnected) {
-    return (
-      <Animated.View
-        entering={connectionBannerEnterTransition}
-        exiting={connectionBannerExitTransition}
-        layout={connectionBannerLayoutTransition}
-        style={styles.container}
-      >
-        <Animated.View layout={connectionBannerLayoutTransition} style={styles.pairPanel}>
-          <View style={styles.pairHeader}>
-            <View
-              style={[
-                styles.pairStatusDot,
-                connection === "checking" && styles.pairStatusDotChecking,
-              ]}
-            />
-            <View style={styles.pairCopy}>
-              <ThemedText type="smallBold" style={styles.pairTitle}>
-                {connection === "checking"
-                  ? "Connecting to your computer"
-                  : "Reconnecting to your computer"}
-              </ThemedText>
-              <ThemedText
-                type="small"
-                themeColor="textSecondary"
-                style={styles.pairSubtitle}
-                numberOfLines={2}
-              >
-                {connection === "checking"
-                  ? `Checking · ${compactServer(serverUrl)}`
-                  : (error ?? `Waiting for ${compactServer(serverUrl)}`)}
-              </ThemedText>
-            </View>
-          </View>
-        </Animated.View>
-      </Animated.View>
-    );
-  }
-
-  if (isConnected && syncState && syncState !== "synced") {
-    return (
-      <Animated.View
-        entering={connectionBannerEnterTransition}
-        exiting={connectionBannerExitTransition}
-        layout={connectionBannerLayoutTransition}
-        style={styles.container}
-      >
-        <View style={styles.syncStrip}>
-          <View style={styles.syncStatusDot} />
-          <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>
-            {threadSyncLabel(syncState)}
-          </ThemedText>
-        </View>
-      </Animated.View>
-    );
+  if (hasPairedSession) {
+    return null;
   }
 
   if (connection === "offline") {
@@ -170,18 +111,6 @@ export function ConnectionBanner({
                 Scan QR
               </ThemedText>
             </Button>
-            {hasPairedSession ? (
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Refresh connection"
-                onPress={onRefresh}
-                style={({ pressed }) => [styles.refreshAction, pressed && styles.pressed]}
-              >
-                <ThemedText type="smallBold" themeColor="textSecondary" style={styles.refreshText}>
-                  Refresh connection
-                </ThemedText>
-              </Pressable>
-            ) : null}
           </View>
         </Animated.View>
       </Animated.View>
@@ -305,20 +234,6 @@ const styles = StyleSheet.create({
     gap: 12,
     padding: 12,
     position: "relative",
-  },
-  syncStatusDot: {
-    backgroundColor: "#7CC7FF",
-    borderRadius: 4,
-    height: 7,
-    width: 7,
-  },
-  syncStrip: {
-    alignItems: "center",
-    flexDirection: "row",
-    gap: 7,
-    justifyContent: "center",
-    minHeight: 24,
-    paddingHorizontal: 18,
   },
   pairHeader: {
     minHeight: 37,

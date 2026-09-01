@@ -4,7 +4,7 @@ export type WorkspaceTerminalShell = {
 };
 
 export function resolveWorkspaceTerminalShell(input?: {
-  readonly env?: NodeJS.ProcessEnv;
+  readonly env?: Partial<NodeJS.ProcessEnv>;
   readonly platform?: NodeJS.Platform;
 }): WorkspaceTerminalShell {
   const env = input?.env ?? process.env;

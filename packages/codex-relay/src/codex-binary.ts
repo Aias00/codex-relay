@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { platform as currentPlatform } from "node:os";
+import { homedir, platform as currentPlatform } from "node:os";
 import { dirname, extname, join } from "node:path";
 
 const stdioAppServerArgs = ["app-server", "--listen", "stdio://"] as const;
@@ -17,7 +17,7 @@ export type CodexAppServerSpawn = {
 };
 
 export type CodexAppServerSpawnInput = {
-  readonly env?: NodeJS.ProcessEnv;
+  readonly env?: Partial<NodeJS.ProcessEnv>;
   readonly platform?: CodexSpawnPlatform;
 };
 
@@ -92,7 +92,17 @@ export function resolveCodexSharedAppServerRemoteAddress(
   return platform === "win32" ? sharedWindowsServerUrl : "unix://";
 }
 
-function resolveCodexExecutable(env: NodeJS.ProcessEnv) {
+export function resolveCodexSharedAppServerSocketPath(
+  env: Partial<NodeJS.ProcessEnv> = process.env,
+) {
+  return join(
+    env.CODEX_HOME?.trim() || join(homedir(), ".codex"),
+    "app-server-control",
+    "app-server-control.sock",
+  );
+}
+
+function resolveCodexExecutable(env: Partial<NodeJS.ProcessEnv>) {
   const configuredBinary = env.CODEX_BIN?.trim();
   if (configuredBinary) {
     return { args: [] as string[], command: configuredBinary, explicit: true };

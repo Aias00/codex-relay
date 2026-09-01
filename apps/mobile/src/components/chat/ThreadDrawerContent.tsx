@@ -50,7 +50,7 @@ import {
   fetchThreadsState,
   fetchWorkspaceDirectoriesState,
   optimisticallyArchiveThreadState,
-  replayThreadEventsState,
+  recoverThreadTimelineState,
   renameThreadServerState,
   restoreOptimisticArchiveThreadState,
   serverStateKeys,
@@ -62,19 +62,22 @@ import {
 } from "@/lib/server-state";
 import {
   shouldBlockThreadActivation,
-  threadDetailSwitchStaleTimeMs,
+  threadSnapshotFetchOptions,
   workspaceSelectionForThread,
 } from "@/lib/thread-activation";
+import { threadAttentionLabel, threadAttentionState } from "@/lib/thread-attention";
 import { evaluateRelayVersion, type RelayVersionCompatibility } from "@/lib/version-policy";
 import { workspaceName } from "@/lib/workspace-name";
 import {
   activateWorkspaceThread,
   chatStore$,
+  markThreadSeen,
   requestThreadStreamReconnect,
   setActiveThread,
   setConnection,
   setHasPairedSession,
   setThreadMessagesLoading,
+  threadHasUnseenCompletion,
 } from "@/state/chat-store";
 import { pinnedThreadStore$, togglePinnedThread, unpinThread } from "@/state/pinned-thread-store";
 import { buildDrawerRows, type DrawerRow } from "./thread-drawer-rows";
@@ -229,6 +232,7 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
       renameThreadServerState(queryClient, threadId, { title }),
   });
   const activeThreadId = useSelector(() => chatStore$.activeThreadId.get());
+  const threadSeenState = useSelector(() => chatStore$.threadSeenState.get());
   const pinnedThreadIds = useSelector(() => pinnedThreadStore$.threadIds.get());
   const statusQuery = useQuery({
     queryKey: serverStateKeys.status(selectedWorkspaceSelection),
@@ -450,6 +454,9 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
         canRenameThread={canMutateAppServerThreads}
         isCreatingThread={isCreatingThread}
         item={item}
+        hasUnseenCompletion={
+          item.kind === "thread" ? threadHasUnseenCompletion(item.thread, threadSeenState) : false
+        }
         onArchiveThread={confirmArchiveThread}
         onCreateThread={createNewThread}
         onOpenThreadActions={openThreadActions}
@@ -468,6 +475,7 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
       confirmArchiveThread,
       createNewThread,
       handleTogglePinnedThread,
+      threadSeenState,
       isCreatingThread,
       openThreadActions,
       pinnedThreadIds,
@@ -681,16 +689,23 @@ function useThreadDrawerActions({
         serverStateKeys.thread(threadId, targetSelection),
       );
       if (selectedThread) {
+        markThreadSeen(selectedThread);
         activateWorkspaceThread(threadId, targetSelection);
       } else {
         setActiveThread(threadId);
       }
-      setThreadMessagesLoading(threadId, shouldBlockThreadActivation(cachedDetail));
+      const isRunningThread = selectedThread?.state === "running";
+      setThreadMessagesLoading(
+        threadId,
+        shouldBlockThreadActivation(cachedDetail, isRunningThread),
+      );
       try {
         const [response, status] = await Promise.all([
-          fetchThreadState(queryClient, threadId, {
-            staleTime: threadDetailSwitchStaleTimeMs,
-          }),
+          fetchThreadState(
+            queryClient,
+            threadId,
+            threadSnapshotFetchOptions(false, isRunningThread),
+          ),
           fetchStatusState(queryClient, targetSelection),
         ]);
         if (selectionGeneration !== threadSelectionGenerationRef.current) {
@@ -702,8 +717,9 @@ function useThreadDrawerActions({
           response.messages,
           response.pendingInputRequests,
         );
+        markThreadSeen(response.thread);
         setStatusState(queryClient, status);
-        void replayThreadEventsState(queryClient, threadId).catch(() => undefined);
+        void recoverThreadTimelineState(queryClient, threadId, response).catch(() => undefined);
         setActiveThread(response.thread.id);
         if (response.thread.state === "running") {
           requestThreadStreamReconnect(threadId);
@@ -967,6 +983,7 @@ function DrawerFooter({
 type DrawerRowItemProps = {
   archiveThreadPending: boolean;
   canRenameThread: boolean;
+  hasUnseenCompletion: boolean;
   isCreatingThread: boolean;
   item: DrawerRow;
   onArchiveThread: (thread: ThreadSummary) => void;
@@ -983,6 +1000,7 @@ type DrawerRowItemProps = {
 const DrawerRowItem = memo(function DrawerRowItem({
   archiveThreadPending,
   canRenameThread,
+  hasUnseenCompletion,
   isCreatingThread,
   item,
   onArchiveThread,
@@ -1052,7 +1070,13 @@ const DrawerRowItem = memo(function DrawerRowItem({
     );
   }
 
-  const running = item.thread.state === "running";
+  const attention = threadAttentionState({
+    goalStatus: item.thread.goal?.status,
+    hasUnseenCompletion,
+    threadState: item.thread.state,
+  });
+  const attentionLabel = threadAttentionLabel(attention);
+  const running = attention === "working";
   const relativeTime = formatRelativeTime(item.thread.lastActivityAt ?? item.thread.updatedAt);
   return (
     <View style={[styles.thread, selected && styles.threadSelected]}>
@@ -1063,7 +1087,7 @@ const DrawerRowItem = memo(function DrawerRowItem({
         ]}
         accessibilityHint="Long press for chat actions"
         accessibilityRole="button"
-        accessibilityLabel={`Open thread ${item.thread.title}`}
+        accessibilityLabel={`Open thread ${item.thread.title}, ${attentionLabel}`}
         accessibilityState={{ selected }}
         delayLongPress={350}
         onAccessibilityAction={(event) => {
@@ -1093,7 +1117,9 @@ const DrawerRowItem = memo(function DrawerRowItem({
                 numberOfLines={1}
                 style={styles.threadTime}
               >
-                {item.workspaceTitle ? `${item.workspaceTitle} · ${relativeTime}` : relativeTime}
+                {item.workspaceTitle
+                  ? `${item.workspaceTitle} · ${attentionLabel} · ${relativeTime}`
+                  : `${attentionLabel} · ${relativeTime}`}
               </Text>
             </View>
           </>
@@ -1117,6 +1143,7 @@ function areDrawerRowItemsEqual(previous: DrawerRowItemProps, next: DrawerRowIte
   if (
     previous.archiveThreadPending !== next.archiveThreadPending ||
     previous.canRenameThread !== next.canRenameThread ||
+    previous.hasUnseenCompletion !== next.hasUnseenCompletion ||
     previous.isCreatingThread !== next.isCreatingThread ||
     previous.item.kind !== next.item.kind ||
     previous.item.id !== next.item.id ||

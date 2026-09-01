@@ -14,6 +14,10 @@ export type ThreadEventApplyResult =
   | { kind: "duplicate"; cursor: ThreadEventCursor }
   | { kind: "gap"; cursor: ThreadEventCursor; expectedSequence: number; receivedSequence: number };
 
+export function isAuthoritativeTerminalThreadEvent(event: StreamThreadRunEvent) {
+  return event.type === "thread.state.changed" && event.thread.state !== "running";
+}
+
 export class ThreadEventSequenceGapError extends Error {
   expectedSequence: number;
   receivedSequence: number;

@@ -1,0 +1,118 @@
+import { spawn } from "node:child_process";
+import { connect } from "node:net";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+
+import {
+  resolveCodexSharedAppServerSocketPath,
+  resolveCodexSharedAppServerSpawn,
+  type CodexAppServerMode,
+  type CodexAppServerSpawn,
+  type CodexAppServerSpawnInput,
+} from "./codex-binary.js";
+
+type EnsureDaemonInput = CodexAppServerSpawnInput & {
+  pollIntervalMs?: number;
+  socketReachable?: (path: string) => Promise<boolean>;
+  start?: (spawn: CodexAppServerSpawn, env: NodeJS.ProcessEnv) => Promise<number>;
+  timeoutMs?: number;
+};
+
+export type CodexSharedAppServerDaemon =
+  | { socketPath: string; status: "alreadyRunning" }
+  | { pid: number; socketPath: string; status: "started" };
+
+export function effectiveManagedSharedAppServerState(input: {
+  appServerMode: CodexAppServerMode | undefined;
+  managed: boolean;
+  socketPath: string | undefined;
+}) {
+  const sharedSocketIsActive = input.appServerMode === "socket";
+  return {
+    sharedAppServerManaged: sharedSocketIsActive && input.managed,
+    sharedAppServerSocketPath: sharedSocketIsActive ? input.socketPath : undefined,
+  };
+}
+
+export async function ensureCodexSharedAppServerDaemon(
+  input: EnsureDaemonInput = {},
+): Promise<CodexSharedAppServerDaemon> {
+  const env = { ...process.env, ...input.env };
+  const socketPath = resolveCodexSharedAppServerSocketPath(env);
+  const socketReachable = input.socketReachable ?? isSocketReachable;
+  if (await socketReachable(socketPath)) {
+    return { socketPath, status: "alreadyRunning" };
+  }
+
+  const pid = await (input.start ?? startDetachedSharedAppServer)(
+    resolveCodexSharedAppServerSpawn(input),
+    env,
+  );
+  const timeoutMs = input.timeoutMs ?? 15_000;
+  const pollIntervalMs = input.pollIntervalMs ?? 25;
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (await socketReachable(socketPath)) {
+      return { pid, socketPath, status: "started" };
+    }
+    await delay(pollIntervalMs);
+  } while (Date.now() < deadline);
+  throw new Error(`Timed out waiting for detached Codex app-server daemon at ${socketPath}.`);
+}
+
+async function startDetachedSharedAppServer(
+  spawnConfig: CodexAppServerSpawn,
+  env: NodeJS.ProcessEnv,
+) {
+  const child = spawn(spawnConfig.command, spawnConfig.args, {
+    cwd: resolveCodexSharedAppServerDaemonCwd(env),
+    detached: true,
+    env,
+    shell: spawnConfig.shell,
+    stdio: "ignore",
+    windowsHide: spawnConfig.windowsHide,
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
+  if (!child.pid) {
+    throw new Error("Detached Codex app-server daemon did not return a process ID.");
+  }
+  child.unref();
+  return child.pid;
+}
+
+export function resolveCodexSharedAppServerDaemonCwd(
+  env: Partial<NodeJS.ProcessEnv> = process.env,
+) {
+  return resolve(
+    env.CODEX_RELAY_APP_SERVER_CWD?.trim() ||
+      env.CODEX_RELAY_WORKSPACE_PATH?.trim() ||
+      env.HOME?.trim() ||
+      homedir(),
+  );
+}
+
+function isSocketReachable(path: string) {
+  return new Promise<boolean>((resolve) => {
+    const socket = connect({ path });
+    let settled = false;
+    const finish = (reachable: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(reachable);
+    };
+    socket.once("connect", () => {
+      finish(true);
+    });
+    socket.once("error", () => {
+      finish(false);
+    });
+  });
+}

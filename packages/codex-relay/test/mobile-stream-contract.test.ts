@@ -17,16 +17,36 @@ import {
 import {
   completeThreadRunSession,
   createThreadRunSseDispatcher,
+  durableStreamCheckpointAction,
   handleThreadRunStreamEvent,
   isThreadActiveWriterStreamEvent,
   isThreadMessageStreamEvent,
   reconcileThreadRunEventAfterTerminal,
+  streamTerminalSettlementTiming,
   threadRunStreamEventTypes,
 } from "../../../apps/mobile/src/lib/thread-run-stream.js";
 
 describe("mobile stream contract", () => {
   beforeEach(() => {
     resetChatSessionState();
+  });
+
+  it("reconnects a durable stream when checkpoint recovery finds the thread still running", () => {
+    expect(durableCheckpointAction("thread-active", "thread-active", "running")).toBe("reconnect");
+  });
+
+  it("settles a durable stream only after checkpoint recovery confirms a terminal state", () => {
+    expect(durableCheckpointAction("thread-active", "thread-active", "completed")).toBe("settle");
+    expect(durableCheckpointAction("thread-active", "thread-active", "failed")).toBe("settle");
+  });
+
+  it("ignores a recovered durable checkpoint after the user switches threads", () => {
+    expect(durableCheckpointAction("thread-other", "thread-active", "running")).toBe("ignore");
+  });
+
+  it("defers durable terminal settlement while preserving immediate legacy settlement", () => {
+    expect(streamTerminalSettlementTiming("durable")).toBe("after-checkpoint");
+    expect(streamTerminalSettlementTiming("legacy")).toBe("immediate");
   });
 
   it("subscribes to pending input request events on named SSE streams", () => {
@@ -642,6 +662,14 @@ describe("mobile stream contract", () => {
     ]);
   });
 });
+
+function durableCheckpointAction(
+  activeThreadId: string | undefined,
+  threadId: string,
+  recoveredState: ThreadSummary["state"],
+) {
+  return durableStreamCheckpointAction({ activeThreadId, recoveredState, threadId });
+}
 
 function threadSummary(id: string, state: ThreadSummary["state"]): ThreadSummary {
   return {

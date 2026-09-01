@@ -1,6 +1,7 @@
 import type { ConfigContext, ExpoConfig } from "expo/config";
 
 export default function appConfig(_context: ConfigContext): ExpoConfig {
+  const tailcatEnabled = process.env.EXPO_PUBLIC_CODEX_RELAY_TAILCAT_TRANSPORT === "1";
   return {
     name: "Codex Relay",
     slug: "codex-relay",
@@ -14,11 +15,12 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
       bundleIdentifier: process.env.IOS_BUNDLE_IDENTIFIER ?? "com.gronstudio.codexrelay",
       supportsTablet: true,
       infoPlist: {
+        CodexRelayTailcatTransportEnabled: tailcatEnabled,
         NSAppTransportSecurity: {
           NSAllowsArbitraryLoads: true,
           NSAllowsLocalNetworking: true,
         },
-        ITSAppUsesNonExemptEncryption: false,
+        ITSAppUsesNonExemptEncryption: tailcatEnabled,
         NSLocalNetworkUsageDescription:
           "Codex Relay uses the local network to connect this device to the Codex Relay server running on your computer.",
         "UISupportedInterfaceOrientations~ipad": [
@@ -111,6 +113,7 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
       reactCompiler: true,
     },
     extra: {
+      tailcatEnabled,
       router: {},
       eas: {
         projectId: "6659e28f-2ac7-4055-8f56-7b4ca5e65847",

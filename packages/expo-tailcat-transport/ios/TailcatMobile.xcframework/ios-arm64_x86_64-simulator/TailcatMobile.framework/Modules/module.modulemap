@@ -1,0 +1,8 @@
+framework module "TailcatMobile" {
+	header "ref.h"
+    header "CRTailcatmobile.objc.h"
+    header "Universe.objc.h"
+    header "TailcatMobile.h"
+
+    export *
+}

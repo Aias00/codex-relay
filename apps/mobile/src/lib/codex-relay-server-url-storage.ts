@@ -3,6 +3,7 @@ import { createMMKV } from "react-native-mmkv";
 const defaultServerUrl = "http://localhost:8787";
 const serverUrlCandidatesStorageKey = "codex-relay.server-url-candidates";
 const serverUrlStorageKey = "codex-relay.server-url";
+let ephemeralServerUrl: string | undefined;
 
 export const codexRelayStorage = createMMKV({ id: "codex-relay" });
 
@@ -15,7 +16,11 @@ export const fallbackCodexRelayServerUrl =
   process.env.EXPO_PUBLIC_CODEX_RELAY_SERVER_URL?.replace(/\/$/, "") ?? defaultServerUrl;
 
 export function getCodexRelayServerUrl() {
-  return codexRelayStorage.getString(serverUrlStorageKey) ?? fallbackCodexRelayServerUrl;
+  return (
+    ephemeralServerUrl ??
+    codexRelayStorage.getString(serverUrlStorageKey) ??
+    fallbackCodexRelayServerUrl
+  );
 }
 
 export function getCodexRelayServerUrlCandidates(): CodexRelayServerUrlCandidate[] {
@@ -38,11 +43,22 @@ export function getCodexRelayServerUrlCandidates(): CodexRelayServerUrlCandidate
 
 export function setCodexRelayServerUrl(url: string) {
   const normalizedUrl = normalizeServerUrl(url);
+  ephemeralServerUrl = undefined;
   codexRelayStorage.set(serverUrlStorageKey, normalizedUrl);
   return normalizedUrl;
 }
 
+export function setEphemeralCodexRelayServerUrl(url: string) {
+  ephemeralServerUrl = normalizeServerUrl(url);
+  return ephemeralServerUrl;
+}
+
+export function clearEphemeralCodexRelayServerUrl() {
+  ephemeralServerUrl = undefined;
+}
+
 export function clearCodexRelayServerUrlState() {
+  ephemeralServerUrl = undefined;
   codexRelayStorage.remove(serverUrlStorageKey);
   codexRelayStorage.remove(serverUrlCandidatesStorageKey);
 }

@@ -1,5 +1,17 @@
 export const foregroundRefreshDedupeMs = 10_000;
 
+export function connectionRefreshActionPresentation(
+  connection: "checking" | "connected" | "offline",
+) {
+  if (connection === "connected") {
+    return { icon: "refresh" as const, label: "Refresh chat" };
+  }
+  return {
+    icon: "warning" as const,
+    label: connection === "offline" ? "Offline. Retry connection" : "Checking connection",
+  };
+}
+
 export function shouldStartForegroundRefresh(
   lastStartedAt: number | undefined,
   now: number,

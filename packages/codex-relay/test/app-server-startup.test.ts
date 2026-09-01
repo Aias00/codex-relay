@@ -10,6 +10,7 @@ vi.mock("../src/debug-log.js", () => ({
 }));
 
 import { CodexAppServerClient } from "../src/app-server.js";
+import { effectiveManagedSharedAppServerState } from "../src/app-server-daemon.js";
 import { relayDebugLog } from "../src/debug-log.js";
 
 type SharedSocketServer = {
@@ -50,6 +51,16 @@ describe("CodexAppServerClient startup mode", () => {
       expect(startSharedServer).toHaveBeenCalledOnce();
       expect(onStartupFallback).toHaveBeenCalledWith(sharedError);
       expect(client.appServerMode).toBe("stdio");
+      expect(
+        effectiveManagedSharedAppServerState({
+          appServerMode: client.appServerMode,
+          managed: true,
+          socketPath: "/Users/lea/.codex/app-server-control/app-server-control.sock",
+        }),
+      ).toEqual({
+        sharedAppServerManaged: false,
+        sharedAppServerSocketPath: undefined,
+      });
       await expect(client.listModels()).resolves.toEqual([]);
     } finally {
       client.close();

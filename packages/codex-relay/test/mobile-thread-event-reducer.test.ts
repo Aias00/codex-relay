@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { StreamThreadRunEvent, ThreadEvent } from "../src/api-schema.js";
 import {
   applyOrderedThreadEvent,
+  isAuthoritativeTerminalThreadEvent,
   streamEventFromThreadEvent,
 } from "../../../apps/mobile/src/lib/thread-event-reducer.js";
 
@@ -74,9 +75,19 @@ describe("mobile thread event reducer", () => {
       type: "thread.state.changed",
     });
   });
+
+  it("treats non-running state events as authoritative terminal snapshots", () => {
+    expect(isAuthoritativeTerminalThreadEvent(stateEvent(undefined, "idle"))).toBe(true);
+    expect(isAuthoritativeTerminalThreadEvent(stateEvent(undefined, "completed"))).toBe(true);
+    expect(isAuthoritativeTerminalThreadEvent(stateEvent(undefined, "failed"))).toBe(true);
+    expect(isAuthoritativeTerminalThreadEvent(stateEvent(undefined, "running"))).toBe(false);
+  });
 });
 
-function stateEvent(sequence: number | undefined, state: "running" | "completed") {
+function stateEvent(
+  sequence: number | undefined,
+  state: "completed" | "failed" | "idle" | "running",
+) {
   return {
     type: "thread.state.changed" as const,
     ...(sequence === undefined ? {} : { eventId: `event-${sequence}`, sequence }),

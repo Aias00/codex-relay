@@ -1,4 +1,5 @@
 import type { PairingSessionStore } from "./pairing-store.js";
+import { PushNotificationDataSchema, type PushNotificationData } from "./api-schema.js";
 
 const expoPushEndpoint = "https://exp.host/--/api/v2/push/send";
 const expoPushChunkSize = 100;
@@ -7,20 +8,12 @@ export type PushNotificationIntent = "turn_terminal" | "action_required";
 
 export type RelayPushNotification = {
   body: string;
-  data: {
-    intent: PushNotificationIntent;
-    threadId: string;
-    turnId?: string;
-  };
+  data: PushNotificationData;
   title: "Codex Relay";
   to: string;
 };
 
-export type PushNotificationEvent = {
-  intent: PushNotificationIntent;
-  threadId: string;
-  turnId?: string;
-};
+export type PushNotificationEvent = PushNotificationData;
 
 export type PushNotificationDelivery = {
   invalidExpoPushTokens: readonly string[];
@@ -122,11 +115,7 @@ function notificationForEvent(
       event.intent === "action_required"
         ? "Codex needs your attention."
         : "A Codex turn has finished.",
-    data: {
-      intent: event.intent,
-      threadId: event.threadId,
-      ...(event.turnId ? { turnId: event.turnId } : {}),
-    },
+    data: PushNotificationDataSchema.parse(event),
     title: "Codex Relay",
     to: expoPushToken,
   };

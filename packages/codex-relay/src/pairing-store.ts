@@ -40,6 +40,7 @@ export type PushNotificationSubscription = PushNotificationPreferences & {
 export type PairingSessionStore = {
   approvePendingPairing(approvalCode: string, now: number): Promise<PendingPairing | undefined>;
   clearAll(): Promise<{ pendingPairingsCleared: number; sessionsCleared: number }>;
+  close(): void;
   countActive(): Promise<number>;
   deletePushNotificationSubscription(clientSessionId: string): Promise<void>;
   deletePushNotificationSubscriptionsByExpoPushToken(expoPushToken: string): Promise<void>;
@@ -193,6 +194,9 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
         };
       })();
       return result;
+    },
+    close() {
+      db.close();
     },
     countActive,
     async deletePushNotificationSubscription(clientSessionId) {

@@ -1,5 +1,10 @@
+import { threadAttentionState } from "./thread-attention";
+
 export type ThreadPrefetchCandidate = {
   cwd?: string;
+  goal?: { status?: string } | null;
+  hasBlockingRequest?: boolean;
+  hasUnseenCompletion?: boolean;
   id: string;
   messageCount?: number;
   state?: string;
@@ -47,10 +52,44 @@ export async function runBoundedThreadPrefetch<T>(
   await Promise.all(workers);
 }
 
+export function runCoalescedRequest<Key, Value>(
+  requests: Map<Key, Promise<Value>>,
+  key: Key,
+  request: () => Promise<Value>,
+) {
+  const existing = requests.get(key);
+  if (existing) {
+    return existing;
+  }
+  const pending = Promise.resolve().then(request);
+  const tracked = pending.finally(() => {
+    if (requests.get(key) === tracked) {
+      requests.delete(key);
+    }
+  });
+  requests.set(key, tracked);
+  return tracked;
+}
+
 function prefetchScore(thread: ThreadPrefetchCandidate, activeThreadId?: string) {
+  const attention = threadAttentionState({
+    goalStatus: thread.goal?.status,
+    hasBlockingRequest: thread.hasBlockingRequest,
+    hasUnseenCompletion: thread.hasUnseenCompletion,
+    threadState: thread.state,
+  });
+  const attentionScore = {
+    blocked: 600_000,
+    failed: 500_000,
+    "completed-unseen": 400_000,
+    paused: 300_000,
+    working: 200_000,
+    idle: 100_000,
+    unknown: 0,
+  }[attention];
   return (
     (thread.id === activeThreadId ? 1_000_000 : 0) +
-    (thread.state === "running" ? 100_000 : 0) +
+    attentionScore +
     Math.min(thread.messageCount ?? 0, 10_000)
   );
 }

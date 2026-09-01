@@ -32,7 +32,14 @@ describe("Expo push notification sender", () => {
     const delivery = await sender.send([
       {
         body: "A Codex turn has finished.",
-        data: { intent: "turn_terminal", threadId: "thread-1", turnId: "turn-1" },
+        data: {
+          intent: "turn_terminal",
+          relayId: "relay-1",
+          semanticEventId: "turn_terminal:thread-1:turn-1",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          workspaceId: "workspace-1",
+        },
         title: "Codex Relay",
         to: "ExponentPushToken[active]",
       },
@@ -52,7 +59,14 @@ describe("Expo push notification sender", () => {
     expect(payload).toEqual([
       expect.objectContaining({
         body: "A Codex turn has finished.",
-        data: { intent: "turn_terminal", threadId: "thread-1", turnId: "turn-1" },
+        data: {
+          intent: "turn_terminal",
+          relayId: "relay-1",
+          semanticEventId: "turn_terminal:thread-1:turn-1",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          workspaceId: "workspace-1",
+        },
         title: "Codex Relay",
       }),
       expect.objectContaining({
@@ -106,8 +120,11 @@ describe("push notification dispatcher", () => {
 
     await dispatcher.dispatch({
       intent: "turn_terminal",
+      relayId: "relay-1",
+      semanticEventId: "turn_terminal:thread-1:turn-1",
       threadId: "thread-1",
       turnId: "turn-1",
+      workspaceId: "workspace-1",
     });
     await dispatcher.dispatch({
       intent: "action_required",
@@ -118,7 +135,14 @@ describe("push notification dispatcher", () => {
     expect(sent).toEqual([
       [
         expect.objectContaining({
-          data: { intent: "turn_terminal", threadId: "thread-1", turnId: "turn-1" },
+          data: {
+            intent: "turn_terminal",
+            relayId: "relay-1",
+            semanticEventId: "turn_terminal:thread-1:turn-1",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            workspaceId: "workspace-1",
+          },
           to: "ExponentPushToken[turn-device]",
         }),
       ],

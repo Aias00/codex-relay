@@ -7,6 +7,8 @@
     "apps/mobile/src/uniwind-types.d.ts",
     "apps/mobile/ios/**",
     "apps/mobile/android/**",
+    "packages/codex-relay/.playwright-mcp/**",
+    "work/**",
     ".omx"
   ]
 }

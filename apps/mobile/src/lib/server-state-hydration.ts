@@ -1,13 +1,14 @@
 import type { ListThreadsResponse } from "codex-relay/api-schema";
 import type { QueryClient } from "@tanstack/react-query";
 
-import { serverStateKeys } from "@/lib/server-state";
+import { promoteLegacyRelayServerState, serverStateKeys } from "@/lib/server-state";
 import { filterThreadsForWorkspace } from "@/lib/server-state-workspace-cache";
-import { chatStore$, setActiveThread } from "@/state/chat-store";
+import { chatStore$, initializeThreadSeenBaseline, setActiveThread } from "@/state/chat-store";
 
 let hydratedDefaultThreadId: string | undefined;
 
 export function restoreChatStoreFromQueryCache(queryClient: QueryClient) {
+  promoteLegacyRelayServerState(queryClient);
   const workspaceId = chatStore$.workspaceId.peek();
   const workspacePath = chatStore$.workspacePath.peek();
   const targetKey = serverStateKeys.threads({ workspaceId, workspacePath });
@@ -30,6 +31,9 @@ export function restoreChatStoreFromQueryCache(queryClient: QueryClient) {
   if (!chatStore$.activeThreadId.peek() && threads?.threads[0]) {
     hydratedDefaultThreadId = threads.threads[0].id;
     setActiveThread(threads.threads[0].id);
+  }
+  if (threads) {
+    initializeThreadSeenBaseline(threads.threads);
   }
 }
 

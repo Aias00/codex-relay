@@ -59,6 +59,7 @@
     "expo-status-bar": "~56.0.4",
     "expo-store-review": "~56.0.3",
     "expo-system-ui": "~56.0.5",
+    "expo-tailcat-transport": "workspace:*",
     "expo-web-browser": "~56.0.5",
     "ghostty-web": "0.3.0",
     "lucide-react-native": "^1.11.0",

@@ -117,6 +117,19 @@ An already-running standalone TUI cannot be converted in place. Exit it and reco
 
 Shared mode uses Codex's experimental app-server transport. A directly connected terminal TUI has its own WebSocket connection, which the relay cannot observe or reconnect. If that terminal reports a socket reset while the thread continues on mobile, reconnect it with the matching remote endpoint above and append the thread ID if needed.
 
+On macOS, Linux, and WSL, Relay starts the shared app-server as a detached local daemon before attaching. Restarting or stopping Relay does not terminate that daemon or an active terminal turn. Reconnect the TUI with `codex resume --remote unix:// <THREAD_ID>` after a terminal disconnect.
+
+### 4. Optional: connect Codex Desktop on macOS
+
+TUI users do not need this step. Compatible Codex Desktop builds can connect to the same detached daemon:
+
+```sh
+npx codex-relay@latest desktop
+npx codex-relay@latest desktop --launch
+```
+
+Fully quit an already-running Desktop app before `--launch`. The command verifies app support and the app-server handshake, then waits until the new Desktop process is observably connected to the expected Unix socket before reporting success. Existing standalone stdio turns cannot move in place; reopen the same thread after launching shared mode.
+
 ### Push notifications
 
 After pairing, open **Settings > Notifications** in the mobile app and enable either or both alerts:
@@ -189,10 +202,15 @@ release pull request and publishes it after that pull request is merged. See
 | `npx codex-relay@latest qr`                         | Print the current pairing QR for an existing relay. |
 | `npx codex-relay@latest approve XXXX-XXXX`          | Approve a pending mobile pairing request.           |
 | `npx codex-relay@latest clear`                      | Sign out every paired mobile app.                   |
+| `npx codex-relay@latest compatibility`              | Check legacy API retirement readiness.              |
 | `npx codex-relay@latest diagnostics`                | Inspect content-safe durable state counts.          |
+| `npx codex-relay@latest desktop`                    | Check optional Codex Desktop sharing readiness.     |
+| `npx codex-relay@latest desktop --launch`           | Launch Codex Desktop on the shared daemon.          |
 | `npx codex-relay@latest backup`                     | Create consistent SQLite backups.                   |
 | `npx codex-relay@latest compact THREAD --through N` | Compact one thread through an event sequence.       |
 | `npx codex-relay@latest repair-owner THREAD`        | Repair an expired owner lease.                      |
+| `npx codex-relay@latest tailcat-key rotate ...`     | Rotate the optional Tailcat server key safely.      |
+| `npx codex-relay@latest transport-benchmark FILE`   | Summarize content-safe route benchmark JSONL.       |
 
 ## Configuration
 
@@ -209,11 +227,54 @@ The relay listens on `0.0.0.0:8787` by default.
 | `CODEX_RELAY_PUBLIC_URL`               | Public URL to prefer in the pairing QR, such as a Cloudflare Tunnel URL.                             |
 | `CODEX_RELAY_THREAD_LIST_CACHE_TTL_MS` | Short server-side cache for app-server thread list reads. Defaults to `3000`; set to `0` to disable. |
 | `CODEX_RELAY_APP_SERVER_MODE`          | `socket` for shared terminal/mobile sessions; defaults to `stdio`.                                   |
+| `CODEX_RELAY_DESKTOP_APP_PATH`         | Optional macOS Codex Desktop or ChatGPT application bundle path.                                     |
+| `CODEX_RELAY_TAILCAT_TRANSPORT`        | Experimental. Set to `1` to own a Tailcat sidecar; disabled by default.                              |
+| `CODEX_RELAY_TAILCAT_BINARY`           | Optional Tailcat executable path. Defaults to `tailcat` on `PATH`.                                   |
+| `CODEX_RELAY_TAILCAT_KEY_PATH`         | Persistent Tailcat server key path. Required when the experiment is enabled.                         |
+| `CODEX_RELAY_TAILCAT_ADDRESS_PATH`     | Private address-token file written by the sidecar. Defaults under the Relay data directory.          |
+| `CODEX_RELAY_TAILCAT_PID_PATH`         | Private PID file used to validate and clean stale Relay-owned sidecars. Defaults beside the token.   |
+| `CODEX_RELAY_TAILCAT_START_TIMEOUT_MS` | Optional positive sidecar startup timeout. Defaults to `10000`.                                      |
 | `CODEX_BIN`                            | Codex CLI executable path.                                                                           |
 | `CODEX_HOME`                           | Codex home directory for reading local session metadata.                                             |
 
 Background mode writes runtime files under `.codex-relay/` in the current
 workspace, including server logs, process state, and pairing data.
+
+Relay advertises the Tailcat token only to authenticated clients that contain and declare the
+native Tailcat capability. Expo Go and older installed builds continue using LAN, Tailscale, and
+public HTTPS candidates. Tailcat support requires a new native iOS build; an OTA JavaScript update
+cannot add the embedded Go framework.
+
+Internal Tailcat native builds also require `EXPO_PUBLIC_CODEX_RELAY_TAILCAT_TRANSPORT=1` during
+Expo prebuild. That flag writes the iOS encryption declaration and an immutable native capability
+gate. JavaScript and later OTA bundles read the native gate instead of their own build environment,
+so an OTA cannot accidentally enable an ordinary distribution binary or disable an enabled internal
+binary. Leave the flag unset for ordinary distribution builds until export-compliance and App Store
+review work is complete. Do not run a separate Tailcat LaunchAgent on the same Relay port; the Relay
+owns and cleans the sidecar when `CODEX_RELAY_TAILCAT_TRANSPORT=1`.
+
+Rotate a persistent Tailcat server key with an explicit DERP region or custom DERP hostname:
+
+```sh
+npx codex-relay@latest tailcat-key rotate --region derp.example.com
+```
+
+The command discards Tailcat token output, validates the replacement with Tailcat itself, atomically
+replaces the configured key, and keeps one mode-0600 `.previous` rollback copy. Restart Relay after
+rotation to activate the replacement and invalidate old Tailcat tokens. Relay pairing sessions and
+durable conversation state are not changed.
+
+Summarize internal transport benchmark samples without accessing Relay state:
+
+```sh
+npx codex-relay@latest transport-benchmark transport-samples.jsonl
+```
+
+The strict JSONL format accepts only an opaque UUID, timestamp, app version, route
+(`lan`, `tailcat_direct`, `tailcat_derp`, `tailscale`, or `cloudflare`), scenario
+(`connect`, `reconnect`, `sse`, or `history`), success, duration, and optional aggregate
+byte/event/battery measurements. URLs, tokens, thread/workspace IDs, prompts, messages, and
+free-form notes are rejected. Output contains only grouped success rates and P50/P95 metrics.
 
 ## Troubleshooting
 

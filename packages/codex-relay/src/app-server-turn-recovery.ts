@@ -187,7 +187,7 @@ export async function recoverActiveAppServerTurnClaims(input: {
   return result;
 }
 
-function dispatchedTurnCandidates(turns: AppServerTurn[], dispatchStartedAt: string) {
+export function dispatchedTurnCandidates(turns: AppServerTurn[], dispatchStartedAt: string) {
   const dispatchStartedAtMs = Date.parse(dispatchStartedAt);
   if (!Number.isFinite(dispatchStartedAtMs)) {
     return [];
@@ -199,7 +199,7 @@ function dispatchedTurnCandidates(turns: AppServerTurn[], dispatchStartedAt: str
     const startedAtMs =
       turn.startedAt < 1_000_000_000_000 ? turn.startedAt * 1_000 : turn.startedAt;
     return (
-      startedAtMs >= dispatchStartedAtMs - 1_500 && startedAtMs <= dispatchStartedAtMs + 30_000
+      startedAtMs >= dispatchStartedAtMs - 1_500 && startedAtMs <= dispatchStartedAtMs + 35_000
     );
   });
 }

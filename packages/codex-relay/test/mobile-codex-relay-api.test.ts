@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearCodexRelayServerUrlState,
+  clearEphemeralCodexRelayServerUrl,
   fallbackCodexRelayServerUrl,
   getCodexRelayServerUrl,
   getCodexRelayServerUrlCandidates,
   saveCodexRelayServerUrlCandidates,
   setCodexRelayServerUrl,
+  setEphemeralCodexRelayServerUrl,
   sortServerUrlsByConnectionPreference,
 } from "../../../apps/mobile/src/lib/codex-relay-server-url-storage.js";
 import { requestWithNetworkTimeout } from "../../../apps/mobile/src/lib/network-timeout.js";
@@ -76,6 +78,17 @@ describe("mobile Codex Relay API session storage", () => {
       "https://codex-relay.aias.eu.org",
       fallbackCodexRelayServerUrl,
     ]);
+  });
+
+  it("uses a Tailcat loopback URL only for the current JS runtime", () => {
+    setCodexRelayServerUrl("https://codex-relay.aias.eu.org");
+    setEphemeralCodexRelayServerUrl("http://127.0.0.1:49152");
+
+    expect(getCodexRelayServerUrl()).toBe("http://127.0.0.1:49152");
+
+    clearEphemeralCodexRelayServerUrl();
+
+    expect(getCodexRelayServerUrl()).toBe("https://codex-relay.aias.eu.org");
   });
 
   it("rejects bootstrap requests when the network hangs", async () => {

@@ -12,7 +12,7 @@ import * as Notifications from "expo-notifications";
 import { router, Stack } from "expo-router";
 import { DarkTheme, ThemeProvider } from "expo-router/react-navigation";
 import * as SplashScreen from "expo-splash-screen";
-import React, { useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import { Text, TextInput } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { KeyboardProvider } from "react-native-keyboard-controller";
@@ -22,7 +22,9 @@ import { useInitialPushNotificationRegistration } from "@/hooks/use-initial-push
 import { addHotUpdaterLog, formatHotUpdaterProgress } from "@/lib/hot-updater-logs";
 import {
   configurePushNotificationPresentation,
-  notificationResponseThreadId,
+  isPushNotificationEventProcessed,
+  notificationResponseTarget,
+  stagePushNotificationTarget,
   supportsPushNotifications,
 } from "@/lib/push-notifications";
 import {
@@ -30,8 +32,8 @@ import {
   queryClientPersister,
   shouldPersistQuery,
 } from "@/lib/query-persistence";
+import { isAppHydrationReady } from "@/lib/server-state-persistence";
 import { restoreChatStoreFromQueryCache } from "@/lib/server-state-hydration";
-import { setActiveThread } from "@/state/chat-store";
 
 void SplashScreen.preventAutoHideAsync();
 configurePushNotificationPresentation();
@@ -129,12 +131,14 @@ function TabLayout() {
     GeistMono: require("../../assets/fonts/GeistMono-Regular.ttf"),
     "GeistMono-Medium": require("../../assets/fonts/GeistMono-Medium.ttf"),
   });
+  const [queryCacheRestored, setQueryCacheRestored] = useState(false);
+  const appHydrationReady = isAppHydrationReady({ fontsLoaded, queryCacheRestored });
 
   useEffect(() => {
-    if (fontsLoaded) {
+    if (appHydrationReady) {
       void SplashScreen.hideAsync();
     }
-  }, [fontsLoaded]);
+  }, [appHydrationReady]);
 
   useEffect(() => {
     const unsubscribeProgress = HotUpdater.addListener("onProgress", (event) => {
@@ -151,13 +155,13 @@ function TabLayout() {
       return;
     }
     const openNotificationThread = (response: Notifications.NotificationResponse) => {
-      const threadId = notificationResponseThreadId(response);
-      if (!threadId) {
+      const target = notificationResponseTarget(response);
+      Notifications.clearLastNotificationResponse();
+      if (!target || isPushNotificationEventProcessed(target)) {
         return;
       }
-      setActiveThread(threadId);
+      stagePushNotificationTarget(target);
       router.replace("/");
-      Notifications.clearLastNotificationResponse();
     };
 
     const mostRecentResponse = Notifications.getLastNotificationResponse();
@@ -176,9 +180,13 @@ function TabLayout() {
   return (
     <PersistQueryClientProvider
       client={queryClient}
-      onSuccess={() => restoreChatStoreFromQueryCache(queryClient)}
+      onError={() => setQueryCacheRestored(true)}
+      onSuccess={() => {
+        restoreChatStoreFromQueryCache(queryClient);
+        setQueryCacheRestored(true);
+      }}
       persistOptions={{
-        buster: "codex-relay-server-state-v2",
+        buster: "codex-relay-server-state-v3",
         dehydrateOptions: {
           shouldDehydrateQuery: shouldPersistQuery,
         },

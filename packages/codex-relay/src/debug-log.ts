@@ -2,6 +2,7 @@ import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
 type DebugFields = Record<string, unknown>;
+let pendingDebugWrite = Promise.resolve();
 
 export function isRelayDebugEnabled() {
   return process.env.CODEX_RELAY_DEBUG === "1" || process.env.CODEX_RELAY_DEBUG_STREAM === "1";
@@ -20,12 +21,19 @@ export function relayDebugLog(event: string, fields: DebugFields = {}) {
   const line = `${JSON.stringify(entry)}\n`;
   const path = process.env.CODEX_RELAY_DEBUG_LOG_PATH?.trim();
   if (path) {
-    void mkdir(dirname(path), { recursive: true })
-      .then(() => appendFile(path, line, { mode: 0o600 }))
+    pendingDebugWrite = pendingDebugWrite
+      .then(async () => {
+        await mkdir(dirname(path), { recursive: true });
+        await appendFile(path, line, { mode: 0o600 });
+      })
       .catch(() => undefined);
   }
 
   console.log(`[debug] ${event} ${formatDebugFields(fields)}`.trimEnd());
+}
+
+export async function flushRelayDebugLog() {
+  await pendingDebugWrite;
 }
 
 function sanitizeDebugValue(value: unknown): unknown {

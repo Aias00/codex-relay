@@ -75,6 +75,8 @@ export function MessageTimeline({
   threadId?: string;
 }) {
   const listRef = useRef<LegendListRef | null>(null);
+  const latestMessageIdRef = useRef<string | undefined>(undefined);
+  const wasLoadingRef = useRef(Boolean(isLoading));
   const removeAtEndListenerRef = useRef<(() => void) | null>(null);
   const { bottom } = useSafeAreaInsets();
   const rows = messages;
@@ -84,6 +86,9 @@ export function MessageTimeline({
   const extraContentPadding = useSharedValue(0);
   const contentRevealProgress = useSharedValue(0);
   const hasRows = rows.length > 0;
+  const latestMessage = rows.at(-1);
+  const latestMessageId = latestMessage?.id;
+  const latestMessageRole = latestMessage?.role;
   const isTimelineReady = !hasRows || settledTimelineKey === timelineKey;
   const showBlockingLoadingConversation = isLoading && !hasRows;
   const showLoadingConversation = showBlockingLoadingConversation || (hasRows && !isTimelineReady);
@@ -102,7 +107,52 @@ export function MessageTimeline({
   useEffect(() => {
     setIsAtEnd(true);
     setSettledTimelineKey(undefined);
+    latestMessageIdRef.current = undefined;
   }, [timelineKey]);
+
+  useEffect(() => {
+    const previousLatestMessageId = latestMessageIdRef.current;
+    latestMessageIdRef.current = latestMessageId;
+    if (
+      !latestMessageId ||
+      latestMessageRole !== "user" ||
+      latestMessageId === previousLatestMessageId
+    ) {
+      return;
+    }
+    let scrollFrame: number | undefined;
+    const layoutFrame = requestAnimationFrame(() => {
+      scrollFrame = requestAnimationFrame(() => {
+        void listRef.current?.scrollToEnd({ animated: true }).catch(() => undefined);
+      });
+    });
+    return () => {
+      cancelAnimationFrame(layoutFrame);
+      if (scrollFrame !== undefined) {
+        cancelAnimationFrame(scrollFrame);
+      }
+    };
+  }, [latestMessageId, latestMessageRole, timelineKey]);
+
+  useEffect(() => {
+    const wasLoading = wasLoadingRef.current;
+    wasLoadingRef.current = Boolean(isLoading);
+    if (!wasLoading || isLoading || !hasRows) {
+      return;
+    }
+    let scrollFrame: number | undefined;
+    const layoutFrame = requestAnimationFrame(() => {
+      scrollFrame = requestAnimationFrame(() => {
+        void listRef.current?.scrollToEnd({ animated: false }).catch(() => undefined);
+      });
+    });
+    return () => {
+      cancelAnimationFrame(layoutFrame);
+      if (scrollFrame !== undefined) {
+        cancelAnimationFrame(scrollFrame);
+      }
+    };
+  }, [hasRows, isLoading, timelineKey]);
 
   useEffect(
     () => () => {

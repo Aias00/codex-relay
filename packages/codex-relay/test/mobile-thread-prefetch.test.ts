@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   prioritizeThreadPrefetch,
   runBoundedThreadPrefetch,
+  runCoalescedRequest,
 } from "../../../apps/mobile/src/lib/thread-prefetch.js";
 
 describe("mobile thread prefetch policy", () => {
@@ -19,6 +20,21 @@ describe("mobile thread prefetch policy", () => {
     );
 
     expect(candidates.map((thread) => thread.id)).toEqual(["running", "recent-large", "old-small"]);
+  });
+
+  it("uses the shared attention priority before message volume", () => {
+    const candidates = prioritizeThreadPrefetch(
+      [
+        { id: "idle", messageCount: 500, state: "completed" },
+        { id: "working", messageCount: 1, state: "running" },
+        { id: "failed", messageCount: 1, state: "failed" },
+        { hasBlockingRequest: true, id: "blocked", messageCount: 1, state: "running" },
+      ],
+      undefined,
+      4,
+    );
+
+    expect(candidates.map((thread) => thread.id)).toEqual(["blocked", "failed", "working", "idle"]);
   });
 
   it("bounds concurrent prefetch work and continues after an individual failure", async () => {
@@ -41,5 +57,25 @@ describe("mobile thread prefetch policy", () => {
     expect(maximumActive).toBeLessThanOrEqual(2);
     expect(prefetch).toHaveBeenCalledTimes(4);
     expect(completed).toEqual(["one", "two", "three"]);
+  });
+
+  it("coalesces concurrent requests with the same key", async () => {
+    const requests = new Map<string, Promise<string>>();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const request = vi.fn<() => Promise<string>>(async () => {
+      await gate;
+      return "loaded";
+    });
+
+    const first = runCoalescedRequest(requests, "thread-1", request);
+    const second = runCoalescedRequest(requests, "thread-1", request);
+    release();
+
+    await expect(Promise.all([first, second])).resolves.toEqual(["loaded", "loaded"]);
+    expect(request).toHaveBeenCalledOnce();
+    expect(requests).toHaveLength(0);
   });
 });
