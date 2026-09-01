@@ -53,13 +53,16 @@ jobs:
             previous_version="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).version)' "$previous_package")"
           fi
 
+          published_version="$(npm view codex-relay version 2>/dev/null || true)"
+
           publish=false
-          if [[ -n "$previous_version" && "$previous_version" != "$current_version" ]]; then
+          if [[ "$published_version" != "$current_version" ]]; then
             publish=true
           fi
 
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
           echo "previous-version=${previous_version:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "published-version=${published_version:-unknown}" >> "$GITHUB_OUTPUT"
           echo "current-version=$current_version" >> "$GITHUB_OUTPUT"
 
       - name: Read current iOS app version
@@ -122,7 +125,9 @@ jobs:
           fi
 
       - name: Publish npm package
+        id: npm-publish
         if: steps.npm-release.outputs.publish == 'true'
+        continue-on-error: true
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: pnpm release
@@ -259,3 +264,9 @@ jobs:
                 });
               }
             }
+
+      - name: Report npm publish failure
+        if: always() && steps.npm-publish.outcome == 'failure'
+        run: |
+          echo "::error::codex-relay@${{ steps.npm-release.outputs.current-version }} was not published. Configure NPM_TOKEN or npm Trusted Publishing for this repository."
+          exit 1
