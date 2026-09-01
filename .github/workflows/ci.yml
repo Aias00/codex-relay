@@ -40,5 +40,14 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
+      - name: Test
+        run: pnpm test
+
+      - name: Test mobile
+        run: pnpm test:mobile
+
+      - name: Build packages
+        run: pnpm build
+
       - name: Test release version policy
         run: pnpm test:release

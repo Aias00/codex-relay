@@ -118,8 +118,18 @@ export async function startTailcatSidecar(input: {
     await stopTailcatChild(child);
     throw new Error("Tailcat sidecar did not publish a process ID.");
   }
-  await writeFile(pidPath, `${child.pid}\n`, { mode: 0o600 });
-  await chmod(pidPath, 0o600);
+  try {
+    await mkdir(dirname(pidPath), { mode: 0o700, recursive: true });
+    await writeFile(pidPath, `${child.pid}\n`, { mode: 0o600 });
+    await chmod(pidPath, 0o600);
+  } catch (error) {
+    await stopTailcatChild(child);
+    await unlinkOwnedPidFile(pidPath, child.pid);
+    await unlinkIfPresent(addressPath);
+    throw new Error("Tailcat sidecar failed before publishing a valid address.", {
+      cause: error,
+    });
+  }
 
   let closing = false;
   let status: TailcatSidecarDiagnostics["status"] = "starting";

@@ -40,6 +40,7 @@ import { Text } from "@/components/ui/text";
 import { codexRelayRepositoryUrl } from "@/constants/links";
 import { Fonts } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
+import { archivedActiveThreadReplacement } from "@/lib/chat-correctness-decisions";
 import { hasCodexRelaySession } from "@/lib/codex-relay-api";
 import { hapticLightImpact, hapticSelection, hapticSuccess } from "@/lib/haptics";
 import {
@@ -197,24 +198,45 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
     mutationFn: (threadId: string) => archiveThreadServerState(queryClient, threadId),
     onMutate: async (threadId) => {
       const previousActiveThreadId = chatStore$.activeThreadId.peek();
+      const previousSelection = {
+        threadId: previousActiveThreadId,
+        workspaceId: chatStore$.workspaceId.peek(),
+        workspacePath: chatStore$.workspacePath.peek(),
+      };
       const currentThreads =
         queryClient.getQueryData<Awaited<ReturnType<typeof serverStateQueryFns.threads>>>(
           serverStateKeys.threads({}),
         )?.threads ?? [];
-      const nextActiveThreadId = currentThreads.find((thread) => thread.id !== threadId)?.id;
+      const replacement = archivedActiveThreadReplacement({
+        activeThreadId: previousActiveThreadId,
+        archivedThreadId: threadId,
+        previousSelection,
+        threads: currentThreads,
+      });
       const snapshot = await optimisticallyArchiveThreadState(queryClient, threadId, {});
-      if (previousActiveThreadId === threadId) {
-        setActiveThread(nextActiveThreadId);
+      if (replacement) {
+        if (replacement.replacement && replacement.replacementSelection) {
+          activateWorkspaceThread(replacement.replacement.id, replacement.replacementSelection);
+        } else {
+          setActiveThread(undefined);
+        }
       }
-      return { nextActiveThreadId, previousActiveThreadId, snapshot };
+      return {
+        archivedActiveThread: Boolean(replacement),
+        nextActiveThreadId: replacement?.replacement?.id,
+        previousActiveThreadId,
+        previousSelection,
+        snapshot,
+      };
     },
     onError: (_caught, _threadId, context) => {
       restoreOptimisticArchiveThreadState(queryClient, context?.snapshot);
       if (
+        context?.archivedActiveThread &&
         context?.previousActiveThreadId &&
         chatStore$.activeThreadId.peek() === context.nextActiveThreadId
       ) {
-        setActiveThread(context.previousActiveThreadId);
+        activateWorkspaceThread(context.previousActiveThreadId, context.previousSelection);
       }
     },
     onSuccess: async (_response, threadId) => {
@@ -881,7 +903,16 @@ function useThreadDrawerActions({
       try {
         const response = await archiveThreadMutateAsync(threadId);
         if (chatStore$.activeThreadId.peek() === threadId) {
-          setActiveThread(response.threads[0]?.id);
+          const replacement = archivedActiveThreadReplacement({
+            activeThreadId: threadId,
+            archivedThreadId: threadId,
+            threads: response.threads,
+          });
+          if (replacement?.replacement && replacement.replacementSelection) {
+            activateWorkspaceThread(replacement.replacement.id, replacement.replacementSelection);
+          } else {
+            setActiveThread(undefined);
+          }
         }
         hapticSuccess();
       } catch (caught) {

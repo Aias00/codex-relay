@@ -56,6 +56,7 @@ export type PairingSessionStore = {
   listPendingPairings(now: number): Promise<PendingPairing[]>;
   listActivePushNotificationSubscriptions(): Promise<PushNotificationSubscription[]>;
   pruneExpiredPendingPairings(now: number): Promise<void>;
+  reserveServerCounterRange(tokenHash: string, count: number): Promise<SecureSession | undefined>;
   rotateSession(
     oldTokenHash: string,
     newTokenHash: string,
@@ -243,48 +244,50 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
     async createSession(tokenHash, session) {
       const now = Date.now();
       const secure = encodeSecureSession(session.secureSession);
-      if (session.clientSessionId) {
-        await db
-          .prepare("DELETE FROM pairing_sessions WHERE client_session_id = ?")
-          .run(session.clientSessionId);
-        if (session.clientName) {
-          await db
-            .prepare(
-              "DELETE FROM pairing_sessions WHERE client_session_id IS NULL AND client_name = ?",
-            )
-            .run(session.clientName);
+      await db.transaction(async (transaction) => {
+        if (session.clientSessionId) {
+          await transaction
+            .prepare("DELETE FROM pairing_sessions WHERE client_session_id = ?")
+            .run(session.clientSessionId);
+          if (session.clientName) {
+            await transaction
+              .prepare(
+                "DELETE FROM pairing_sessions WHERE client_session_id IS NULL AND client_name = ?",
+              )
+              .run(session.clientName);
+          }
         }
-      }
-      await db
-        .prepare(
-          `INSERT INTO pairing_sessions (
-             token_hash,
-             client_session_id,
-             client_name,
-             expires_at,
-             key_epoch,
-             mobile_to_server_key,
-             server_to_mobile_key,
-             last_mobile_counter,
-             next_server_counter,
-             created_at,
-             updated_at
-           )
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          tokenHash,
-          session.clientSessionId ?? null,
-          session.clientName ?? null,
-          session.expiresAt ?? permanentClientSessionExpiresAt,
-          secure?.keyEpoch ?? null,
-          secure?.mobileToServerKey ?? null,
-          secure?.serverToMobileKey ?? null,
-          secure?.lastMobileCounter ?? null,
-          secure?.nextServerCounter ?? null,
-          now,
-          now,
-        );
+        await transaction
+          .prepare(
+            `INSERT INTO pairing_sessions (
+               token_hash,
+               client_session_id,
+               client_name,
+               expires_at,
+               key_epoch,
+               mobile_to_server_key,
+               server_to_mobile_key,
+               last_mobile_counter,
+               next_server_counter,
+               created_at,
+               updated_at
+            )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            tokenHash,
+            session.clientSessionId ?? null,
+            session.clientName ?? null,
+            session.expiresAt ?? permanentClientSessionExpiresAt,
+            secure?.keyEpoch ?? null,
+            secure?.mobileToServerKey ?? null,
+            secure?.serverToMobileKey ?? null,
+            secure?.lastMobileCounter ?? null,
+            secure?.nextServerCounter ?? null,
+            now,
+            now,
+          );
+      })();
       return countActive();
     },
     deleteSession,
@@ -466,6 +469,43 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
           tokenHash,
         );
     },
+    async reserveServerCounterRange(tokenHash, count) {
+      if (!Number.isSafeInteger(count) || count < 1) {
+        throw new TypeError("Server counter reservation must be a positive safe integer.");
+      }
+      return db.transaction(async (transaction) => {
+        const row = await transaction
+          .prepare(
+            `SELECT key_epoch AS keyEpoch,
+                    mobile_to_server_key AS mobileToServerKey,
+                    server_to_mobile_key AS serverToMobileKey,
+                    last_mobile_counter AS lastMobileCounter,
+                    next_server_counter AS nextServerCounter
+             FROM pairing_sessions
+             WHERE token_hash = ?`,
+          )
+          .get(tokenHash);
+        if (!row) {
+          return undefined;
+        }
+        const secureSession = decodeSecureSession(row);
+        if (!secureSession) {
+          return undefined;
+        }
+        const serverCounterLimit = secureSession.nextServerCounter + count;
+        if (!Number.isSafeInteger(serverCounterLimit)) {
+          throw new Error("Server counter reservation exceeds the safe integer range.");
+        }
+        await transaction
+          .prepare(
+            `UPDATE pairing_sessions
+             SET next_server_counter = ?, updated_at = ?
+             WHERE token_hash = ?`,
+          )
+          .run(serverCounterLimit, Date.now(), tokenHash);
+        return { ...secureSession, serverCounterLimit };
+      })();
+    },
     async upsertPushNotificationSubscription(subscription) {
       const now = Date.now();
       await db
@@ -527,6 +567,34 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
     const pendingColumns = new Set(resultRows(pendingRows).map((row) => String(row.name)));
     if (!pendingColumns.has("client_session_id")) {
       await db.exec("ALTER TABLE pending_pairings ADD COLUMN client_session_id TEXT");
+    }
+    await deleteDuplicateClientSessionRows();
+    await db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS pairing_sessions_client_session_id_unique_idx
+      ON pairing_sessions(client_session_id)
+      WHERE client_session_id IS NOT NULL
+    `);
+  }
+
+  async function deleteDuplicateClientSessionRows() {
+    const rows = await db
+      .prepare(
+        `SELECT token_hash AS tokenHash,
+                client_session_id AS clientSessionId
+         FROM pairing_sessions
+         WHERE client_session_id IS NOT NULL
+         ORDER BY updated_at DESC, created_at DESC, token_hash DESC`,
+      )
+      .all();
+    const seen = new Set<string>();
+    for (const row of resultRows(rows)) {
+      const clientSessionId = String(row.clientSessionId);
+      const tokenHash = String(row.tokenHash);
+      if (!seen.has(clientSessionId)) {
+        seen.add(clientSessionId);
+        continue;
+      }
+      await db.prepare("DELETE FROM pairing_sessions WHERE token_hash = ?").run(tokenHash);
     }
   }
 }

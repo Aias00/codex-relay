@@ -1,6 +1,7 @@
 import type { ThreadSummary } from "codex-relay/api-schema";
 
 import type { WorkspaceCacheSelection } from "./server-state-workspace-cache";
+import { isRunningThreadState } from "./remote-turn-phase";
 
 export const threadDetailSwitchStaleTimeMs = 30_000;
 
@@ -34,7 +35,7 @@ export function isAuthoritativeThreadSnapshot(state: ThreadSummary["state"], ref
 }
 
 export function shouldAttachRunningThreadStream(thread: Pick<ThreadSummary, "state"> | undefined) {
-  return thread?.state === "running";
+  return isRunningThreadState(thread?.state);
 }
 
 export function runningThreadRecoveryMode(

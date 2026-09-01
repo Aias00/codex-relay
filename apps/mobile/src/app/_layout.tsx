@@ -34,6 +34,9 @@ import {
 } from "@/lib/query-persistence";
 import { isAppHydrationReady } from "@/lib/server-state-persistence";
 import { restoreChatStoreFromQueryCache } from "@/lib/server-state-hydration";
+import { initializeCodexRelayCredentials } from "@/lib/secure-credentials";
+import { initializeSecureTransportStorage } from "@/lib/secure-transport";
+import { initializeInputDeliveryOutbox } from "@/lib/input-delivery-outbox";
 
 void SplashScreen.preventAutoHideAsync();
 configurePushNotificationPresentation();
@@ -66,6 +69,7 @@ const TextWithDefaults = Text as typeof Text & {
 const TextInputWithDefaults = TextInput as typeof TextInput & {
   defaultProps?: Partial<React.ComponentProps<typeof TextInput>>;
 };
+const secureStateRetryDelayMs = 2000;
 
 TextWithDefaults.defaultProps = {
   ...TextWithDefaults.defaultProps,
@@ -132,7 +136,42 @@ function TabLayout() {
     "GeistMono-Medium": require("../../assets/fonts/GeistMono-Medium.ttf"),
   });
   const [queryCacheRestored, setQueryCacheRestored] = useState(false);
-  const appHydrationReady = isAppHydrationReady({ fontsLoaded, queryCacheRestored });
+  const [secureStateRestored, setSecureStateRestored] = useState(false);
+  const appHydrationReady = isAppHydrationReady({
+    fontsLoaded,
+    queryCacheRestored,
+    secureStateRestored,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const restoreSecureState = () => {
+      void Promise.all([
+        initializeCodexRelayCredentials(),
+        initializeSecureTransportStorage(),
+        initializeInputDeliveryOutbox(),
+      ]).then(
+        () => {
+          if (!cancelled) {
+            setSecureStateRestored(true);
+          }
+        },
+        () => {
+          if (!cancelled) {
+            retry = setTimeout(restoreSecureState, secureStateRetryDelayMs);
+          }
+        },
+      );
+    };
+    restoreSecureState();
+    return () => {
+      cancelled = true;
+      if (retry) {
+        clearTimeout(retry);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (appHydrationReady) {
@@ -173,7 +212,7 @@ function TabLayout() {
     return () => subscription.remove();
   }, []);
 
-  if (!fontsLoaded) {
+  if (!fontsLoaded || !secureStateRestored) {
     return null;
   }
 

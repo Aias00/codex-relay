@@ -11,6 +11,7 @@ import type {
   RuntimePreferences,
   StreamThreadRunEvent,
   StreamThreadRunRequest,
+  ThreadInputDeliveryState,
   ThreadDetailResponse,
   ThreadCollaborationMode,
   ThreadSummary,
@@ -78,12 +79,12 @@ import {
   uploadImageAttachments,
 } from "@/lib/codex-relay-api";
 import { getStoredConnectionPlan } from "@/lib/codex-relay-connection-plan";
+import type { PendingInputIdentity } from "@/lib/input-delivery-state";
 import {
-  claimInputIdentity,
-  clearInputIdentity,
-  moveInputIdentity,
-  type PendingInputIdentity,
-} from "@/lib/input-delivery-state";
+  claimPersistedInputIdentity,
+  clearPersistedInputIdentity,
+  movePersistedInputIdentity,
+} from "@/lib/input-delivery-outbox";
 import {
   hapticLightImpact,
   hapticMediumImpact,
@@ -142,6 +143,13 @@ import {
   updateThreadGoalServerState,
   updateRuntimePreferencesServerState,
 } from "@/lib/server-state";
+import {
+  approvalMutationReconciliationAction,
+  interruptMutationReconciliationAction,
+  promptRunEarlyStreamLossAction,
+  queuedMutationReconciliationAction,
+  shouldRestoreQueuedPromptAfterReconciliation,
+} from "@/lib/chat-correctness-decisions";
 import { optimisticRunMessageId } from "@/lib/server-state-messages";
 import { recordSuccessfulAiConversationForReviewPrompt } from "@/lib/store-review-prompt";
 import {
@@ -166,6 +174,7 @@ import {
   streamTerminalSettlementTiming,
 } from "@/lib/thread-run-stream";
 import { readCachedWorkspaceRuntimePreferences } from "@/lib/workspace-runtime-preferences-cache";
+import { isRemoteTurnActive, resolveRemoteTurnPhase } from "@/lib/remote-turn-phase";
 import {
   activateWorkspaceThread,
   appendComposerAttachments,
@@ -254,6 +263,9 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   );
   const [isPastePairOpen, setPastePairOpen] = useState(false);
   const [isPastePairing, setPastePairing] = useState(false);
+  const [inputDeliveryStateByThreadId, setInputDeliveryStateByThreadId] = useState<
+    Record<string, ThreadInputDeliveryState | undefined>
+  >({});
   const [isAttachingImages, setAttachingImages] = useState(false);
   const composerFocusRequestKey = 0;
   const [isScannerOpen, setScannerOpen] = useState(false);
@@ -653,7 +665,13 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     [queuedInputsQuery.data?.inputs],
   );
   const pendingInputRequest = activeThreadDetailQuery.data?.pendingInputRequests?.[0];
-  const isRunning = activeThread?.state === "running";
+  const activeTurnPhase = resolveRemoteTurnPhase({
+    connection,
+    deliveryState: activeThreadId ? inputDeliveryStateByThreadId[activeThreadId] : undefined,
+    queuedInputCount: queuedPrompts.length,
+    threadState: activeThread?.state,
+  });
+  const isRunning = isRemoteTurnActive(activeTurnPhase);
   const [webPreviewTargetsByThreadId, setWebPreviewTargetsByThreadId] = useState<
     Record<string, WebPreviewTarget | undefined>
   >({});
@@ -712,6 +730,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     if (!hasSession) {
       clearServerState(queryClient);
       resetChatSessionState();
+      setInputDeliveryStateByThreadId({});
     }
     return hasSession;
   }, [queryClient]);
@@ -1121,10 +1140,38 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   );
 
   const recoverPromptRunAfterEarlyStreamLoss = useCallback(
-    async (threadId: string, fallbackError: string, restorePrompt: () => void) => {
+    async (
+      threadId: string,
+      fallbackError: string,
+      restorePrompt: () => void,
+      onServerAccepted?: () => void,
+    ) => {
       const state = await syncThreadSnapshot(threadId);
-      if (state === "running") {
+      const action = promptRunEarlyStreamLossAction(state);
+      if (action.kind === "reconnect") {
+        onServerAccepted?.();
         requestThreadStreamReconnect(threadId);
+        return;
+      }
+
+      if (action.kind === "settle") {
+        onServerAccepted?.();
+        const recoveredThread = queryClient.getQueryData<ThreadDetailResponse>(
+          serverStateKeys.thread(threadId, selectedWorkspaceSelection),
+        )?.thread;
+        completeThreadRunSession({
+          threadId,
+          clearQueuedPrompts,
+          onSuccessfulCompletion: recordSuccessfulAiConversationForReviewPrompt,
+          setQueuedInputs: (queuedThreadId, inputs) =>
+            setQueuedInputsState(queryClient, queuedThreadId, inputs),
+          setRunning: (isRunning) => setThreadRunningState(queryClient, threadId, isRunning),
+          terminalEvent: recoveredThread
+            ? { type: "thread.state.changed", thread: recoveredThread }
+            : undefined,
+          refreshUsageStatus,
+        });
+        setConnection("connected");
         return;
       }
 
@@ -1134,18 +1181,14 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       restorePrompt();
       hapticWarning();
       showSendFailureToast(fallbackError);
-
-      if (state) {
-        setConnection("connected");
-        return;
-      }
-
       void keepConnectionIfSessionIsValid(fallbackError);
     },
     [
       clearQueuedPrompts,
       keepConnectionIfSessionIsValid,
       queryClient,
+      refreshUsageStatus,
+      selectedWorkspaceSelection,
       showSendFailureToast,
       syncThreadSnapshot,
     ],
@@ -1926,7 +1969,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       collaborationMode: requestCollaborationMode,
     };
     const inputIdentityComposerKey = composerThreadKey(composerThreadId);
-    const clientEventId = claimInputIdentity(
+    const clientEventId = await claimPersistedInputIdentity(
       pendingInputIdentitiesRef.current,
       inputIdentityComposerKey,
       JSON.stringify(requestBody),
@@ -1953,7 +1996,8 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             clientEventId,
           },
         });
-        clearInputIdentity(
+        setInputDeliveryState(activeThreadId, response.deliveryState);
+        await clearPersistedInputIdentity(
           pendingInputIdentitiesRef.current,
           inputIdentityComposerKey,
           clientEventId,
@@ -2045,7 +2089,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         setActiveThread(response.thread.id);
         threadId = response.thread.id;
         const threadComposerKey = composerThreadKey(threadId);
-        moveInputIdentity(
+        await movePersistedInputIdentity(
           pendingInputIdentitiesRef.current,
           inputIdentityComposerKey,
           threadComposerKey,
@@ -2055,6 +2099,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       }
 
       const runThreadId = threadId;
+      setInputDeliveryState(runThreadId, "dispatched");
       const optimisticMessageId = optimisticRunMessageId(input.clientEventId);
       appendOptimisticRunMessageState(queryClient, runThreadId, {
         attachments: input.requestBody.attachments ?? [],
@@ -2100,7 +2145,8 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             }
             markStreamActivity();
             receivedStreamEvent = true;
-            clearInputIdentity(
+            setInputDeliveryState(runThreadId, "running");
+            void clearPersistedInputIdentity(
               pendingInputIdentitiesRef.current,
               inputIdentityComposerKey,
               input.clientEventId,
@@ -2146,6 +2192,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
                 }
                 sawTerminalStreamEvent = true;
                 terminalStreamEvent = terminalEvent;
+                setInputDeliveryState(terminalThreadId, undefined);
                 completeThreadRunSession({
                   threadId: terminalThreadId,
                   clearQueuedPrompts,
@@ -2184,7 +2231,18 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
               void recoverThreadAfterStreamLoss(runThreadId, caught.message);
               return;
             }
-            void recoverPromptRunAfterEarlyStreamLoss(runThreadId, caught.message, restorePrompt);
+            void recoverPromptRunAfterEarlyStreamLoss(
+              runThreadId,
+              caught.message,
+              restorePrompt,
+              () => {
+                void clearPersistedInputIdentity(
+                  pendingInputIdentitiesRef.current,
+                  inputIdentityComposerKey,
+                  input.clientEventId,
+                );
+              },
+            );
           },
           onClose() {
             if (streamGeneration !== streamGenerationRef.current) {
@@ -2199,6 +2257,13 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
                 runThreadId,
                 "Codex Relay stream closed before the request started.",
                 restorePrompt,
+                () => {
+                  void clearPersistedInputIdentity(
+                    pendingInputIdentitiesRef.current,
+                    inputIdentityComposerKey,
+                    input.clientEventId,
+                  );
+                },
               );
               return;
             }
@@ -2263,6 +2328,9 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         requestThreadStreamReconnect(request.threadId);
       }
     } catch (caught) {
+      if (await reconcileApprovalMutation(request)) {
+        return;
+      }
       syncPairedSessionState();
       setConnection("offline", errorMessage(caught));
     }
@@ -2284,9 +2352,35 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         requestThreadStreamReconnect(request.threadId);
       }
     } catch (caught) {
+      if (await reconcileApprovalMutation(request)) {
+        return;
+      }
       syncPairedSessionState();
       setConnection("offline", errorMessage(caught));
     }
+  }
+
+  async function reconcileApprovalMutation(request: PendingInputRequest) {
+    const state = await syncThreadSnapshot(request.threadId, {
+      refresh: true,
+      setOfflineOnError: false,
+    }).catch(() => undefined);
+    const pendingRequests = queryClient.getQueryData<ThreadDetailResponse>(
+      serverStateKeys.thread(request.threadId, selectedWorkspaceSelection),
+    )?.pendingInputRequests;
+    const action = approvalMutationReconciliationAction({
+      approvalStillPending: pendingRequests?.some((pending) => pending.id === request.id) ?? true,
+      threadState: state,
+    });
+    if (action === "unconfirmed") {
+      return false;
+    }
+    removePendingInputRequestState(queryClient, request.threadId, request.id);
+    setConnection("connected");
+    if (action === "settled-reconnect" && chatStore$.activeThreadId.peek() === request.threadId) {
+      requestThreadStreamReconnect(request.threadId);
+    }
+    return true;
   }
 
   async function attachImagesFromGallery() {
@@ -2399,6 +2493,10 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       });
       removeQueuedPromptFromState(item);
     } catch (caught) {
+      if (await reconcileQueuedMutation(activeThreadId, item)) {
+        removeQueuedPromptFromState(item);
+        return;
+      }
       syncPairedSessionState();
       setConnection("offline", errorMessage(caught));
     }
@@ -2415,30 +2513,14 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         threadId: activeThreadId,
       });
       removeQueuedPromptFromState(item);
-      const draft = getComposerDraft(activeThreadId);
-      setComposerDraft(
-        draft.trim() ? `${draft.trim()}\n${item.prompt}` : item.prompt,
-        activeThreadId,
-      );
-      if (item.attachments.length > 0) {
-        setComposerAttachments(
-          [
-            ...getComposerAttachments(activeThreadId),
-            ...item.attachments.map(localAttachmentFromPromptAttachment),
-          ],
-          activeThreadId,
-        );
-      }
-      if (item.skills.length > 0) {
-        setComposerSkills(
-          mergeAgentSkills(
-            getComposerSkills(activeThreadId),
-            agentSkillsFromPromptSkills(item.skills, skillsQuery.data?.skills ?? []),
-          ),
-          activeThreadId,
-        );
-      }
+      restoreQueuedPromptToComposer(item, activeThreadId);
     } catch (caught) {
+      const reconciliation = await reconcileQueuedMutation(activeThreadId, item);
+      if (shouldRestoreQueuedPromptAfterReconciliation(reconciliation)) {
+        removeQueuedPromptFromState(item);
+        restoreQueuedPromptToComposer(item, activeThreadId);
+        return;
+      }
       syncPairedSessionState();
       setConnection("offline", errorMessage(caught));
     }
@@ -2457,9 +2539,87 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       setConnection("connected");
       hapticMediumImpact();
     } catch (caught) {
+      if (await reconcileQueuedMutation(activeThreadId, item)) {
+        hapticMediumImpact();
+        return;
+      }
       syncPairedSessionState();
       setConnection("offline", errorMessage(caught));
     }
+  }
+
+  function restoreQueuedPromptToComposer(item: QueuedComposerPrompt, threadId: string) {
+    const draft = getComposerDraft(threadId);
+    setComposerDraft(draft.trim() ? `${draft.trim()}\n${item.prompt}` : item.prompt, threadId);
+    if (item.attachments.length > 0) {
+      setComposerAttachments(
+        [
+          ...getComposerAttachments(threadId),
+          ...item.attachments.map(localAttachmentFromPromptAttachment),
+        ],
+        threadId,
+      );
+    }
+    if (item.skills.length > 0) {
+      setComposerSkills(
+        mergeAgentSkills(
+          getComposerSkills(threadId),
+          agentSkillsFromPromptSkills(item.skills, skillsQuery.data?.skills ?? []),
+        ),
+        threadId,
+      );
+    }
+  }
+
+  async function reconcileQueuedMutation(threadId: string, item: QueuedComposerPrompt) {
+    try {
+      const queued = await fetchQueuedInputsState(queryClient, threadId);
+      const cachedState = queryClient.getQueryData<ThreadDetailResponse>(
+        serverStateKeys.thread(threadId, selectedWorkspaceSelection),
+      )?.thread.state;
+      const action = queuedMutationReconciliationAction({
+        inputStillQueued: queued.inputs.some((input) => input.id === item.id),
+        threadState: cachedState,
+      });
+      if (action === "unconfirmed") {
+        return false;
+      }
+      const state = await syncThreadSnapshot(threadId, {
+        refresh: true,
+        setOfflineOnError: false,
+      });
+      setConnection("connected");
+      if (
+        (action === "settled-reconnect" || state === "running") &&
+        chatStore$.activeThreadId.peek() === threadId
+      ) {
+        requestThreadStreamReconnect(threadId);
+      }
+      const detail = queryClient.getQueryData<ThreadDetailResponse>(
+        serverStateKeys.thread(threadId, selectedWorkspaceSelection),
+      );
+      const semanticEventId = item.clientEventId ?? item.id;
+      return {
+        settled: true,
+        started:
+          detail?.messages.some((message) => message.semanticEventId === semanticEventId) ?? false,
+      };
+    } catch {
+      return false;
+    }
+  }
+
+  function setInputDeliveryState(
+    threadId: string,
+    deliveryState: ThreadInputDeliveryState | undefined,
+  ) {
+    setInputDeliveryStateByThreadId((current) => {
+      if (deliveryState === undefined) {
+        const { [threadId]: _removed, ...rest } = current;
+        return rest;
+      }
+      return { ...current, [threadId]: deliveryState };
+    });
   }
 
   async function stopRun() {
@@ -2476,12 +2636,21 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       });
     } catch (caught) {
       syncPairedSessionState();
-      showSendFailureToast(errorMessage(caught));
       const state = await syncThreadSnapshot(activeThreadId, {
         refresh: true,
         setOfflineOnError: true,
       }).catch(() => undefined);
-      if (state === "running" && chatStore$.activeThreadId.peek() === activeThreadId) {
+      const action = interruptMutationReconciliationAction(state);
+      if (action === "settled") {
+        setThreadRunningState(queryClient, activeThreadId, false);
+        clearQueuedPrompts(activeThreadId);
+        setQueuedInputsState(queryClient, activeThreadId, []);
+        setConnection("connected");
+        hapticWarning();
+        return;
+      }
+      showSendFailureToast(errorMessage(caught));
+      if (action === "reconnect" && chatStore$.activeThreadId.peek() === activeThreadId) {
         requestThreadStreamReconnect(activeThreadId);
       }
       return;

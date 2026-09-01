@@ -15,6 +15,13 @@ import {
   setRunning,
 } from "../../../apps/mobile/src/state/chat-store.js";
 import {
+  approvalMutationReconciliationAction,
+  interruptMutationReconciliationAction,
+  promptRunEarlyStreamLossAction,
+  queuedMutationReconciliationAction,
+  shouldRestoreQueuedPromptAfterReconciliation,
+} from "../../../apps/mobile/src/lib/chat-correctness-decisions.js";
+import {
   completeThreadRunSession,
   createThreadRunSseDispatcher,
   durableStreamCheckpointAction,
@@ -38,6 +45,55 @@ describe("mobile stream contract", () => {
   it("settles a durable stream only after checkpoint recovery confirms a terminal state", () => {
     expect(durableCheckpointAction("thread-active", "thread-active", "completed")).toBe("settle");
     expect(durableCheckpointAction("thread-active", "thread-active", "failed")).toBe("settle");
+  });
+
+  it("settles an early completed snapshot as an accepted prompt instead of restoring draft", () => {
+    expect(promptRunEarlyStreamLossAction("completed")).toEqual({
+      kind: "settle",
+      restorePrompt: false,
+      showFailureToast: false,
+      terminalState: "completed",
+    });
+  });
+
+  it("settles a queued mutation only after the authoritative queue drops the input", () => {
+    expect(
+      queuedMutationReconciliationAction({ inputStillQueued: true, threadState: "running" }),
+    ).toBe("unconfirmed");
+    expect(
+      queuedMutationReconciliationAction({ inputStillQueued: false, threadState: "running" }),
+    ).toBe("settled-reconnect");
+    expect(
+      queuedMutationReconciliationAction({ inputStillQueued: false, threadState: "completed" }),
+    ).toBe("settled");
+  });
+
+  it("reconciles interrupt and approval mutations from authoritative thread state", () => {
+    expect(interruptMutationReconciliationAction(undefined)).toBe("unconfirmed");
+    expect(interruptMutationReconciliationAction("running")).toBe("reconnect");
+    expect(interruptMutationReconciliationAction("completed")).toBe("settled");
+    expect(
+      approvalMutationReconciliationAction({
+        approvalStillPending: true,
+        threadState: "running",
+      }),
+    ).toBe("unconfirmed");
+    expect(
+      approvalMutationReconciliationAction({
+        approvalStillPending: false,
+        threadState: "running",
+      }),
+    ).toBe("settled-reconnect");
+  });
+
+  it("restores a removed queued prompt only when it did not start running", () => {
+    expect(shouldRestoreQueuedPromptAfterReconciliation({ settled: true, started: false })).toBe(
+      true,
+    );
+    expect(shouldRestoreQueuedPromptAfterReconciliation({ settled: true, started: true })).toBe(
+      false,
+    );
+    expect(shouldRestoreQueuedPromptAfterReconciliation(false)).toBe(false);
   });
 
   it("ignores a recovered durable checkpoint after the user switches threads", () => {

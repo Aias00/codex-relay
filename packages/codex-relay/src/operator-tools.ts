@@ -2,6 +2,23 @@ import { access, mkdir } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { DatabaseSync, backup } from "node:sqlite";
 
+import {
+  normalizeThreadInputDeliveryPhase,
+  ThreadInputDeliveryStateSchema,
+  type TurnLifecyclePhase,
+} from "./api-schema.js";
+
+export type RelayStreamDiagnostics = {
+  compactedThreadCount: number;
+  latestEventAt?: string;
+  maximumSequence: number;
+  threadCount: number;
+};
+
+export type RelayTurnLifecycleDiagnostics = Record<TurnLifecyclePhase, number> & {
+  unknown: number;
+};
+
 export type RelayStateDiagnostics = {
   activeClaimCount: number;
   eventCount: number;
@@ -11,6 +28,8 @@ export type RelayStateDiagnostics = {
   path: string;
   pendingApprovalCount: number;
   schemaVersion?: number;
+  streams: RelayStreamDiagnostics;
+  turnLifecycle: RelayTurnLifecycleDiagnostics;
 };
 
 export type RelayWorkspaceInspection = {
@@ -183,6 +202,8 @@ export async function inspectRelayState(path: string): Promise<RelayStateDiagnos
       ownerCount: 0,
       path: resolvedPath,
       pendingApprovalCount: 0,
+      streams: emptyStreamDiagnostics(),
+      turnLifecycle: emptyTurnLifecycleDiagnostics(),
     };
   }
 
@@ -202,10 +223,85 @@ export async function inspectRelayState(path: string): Promise<RelayStateDiagnos
       path: resolvedPath,
       pendingApprovalCount: countRows(database, "pending_approvals", "state = 'pending'"),
       schemaVersion: maximumSchemaVersion(database),
+      streams: inspectStreamDiagnostics(database),
+      turnLifecycle: inspectTurnLifecycle(database),
     };
   } finally {
     database.close();
   }
+}
+
+function emptyStreamDiagnostics(): RelayStreamDiagnostics {
+  return {
+    compactedThreadCount: 0,
+    maximumSequence: 0,
+    threadCount: 0,
+  };
+}
+
+function emptyTurnLifecycleDiagnostics(): RelayTurnLifecycleDiagnostics {
+  return {
+    completed: 0,
+    dispatching: 0,
+    failed: 0,
+    interrupted: 0,
+    queued: 0,
+    running: 0,
+    unknown: 0,
+  };
+}
+
+function inspectStreamDiagnostics(database: DatabaseSync): RelayStreamDiagnostics {
+  if (!tableExists(database, "thread_events")) {
+    return emptyStreamDiagnostics();
+  }
+  const row = database
+    .prepare(
+      `SELECT COUNT(DISTINCT thread_id) AS threadCount,
+              COALESCE(MAX(sequence), 0) AS maximumSequence,
+              MAX(created_at) AS latestEventAt
+         FROM thread_events`,
+    )
+    .get() as Record<string, unknown> | undefined;
+  const latestEventAt = optionalNumber(row?.latestEventAt);
+  return {
+    compactedThreadCount: countRows(database, "thread_event_compaction"),
+    latestEventAt: latestEventAt === undefined ? undefined : isoTimestamp(latestEventAt),
+    maximumSequence: Number(row?.maximumSequence ?? 0),
+    threadCount: Number(row?.threadCount ?? 0),
+  };
+}
+
+function inspectTurnLifecycle(database: DatabaseSync): RelayTurnLifecycleDiagnostics {
+  const diagnostics = emptyTurnLifecycleDiagnostics();
+  if (!tableExists(database, "thread_inputs")) {
+    return diagnostics;
+  }
+  const rows = tableExists(database, "turn_claims")
+    ? database
+        .prepare(
+          `SELECT inputs.state,
+                  claims.dispatch_started_at AS dispatchStartedAt,
+                  claims.runtime_turn_id AS runtimeTurnId
+             FROM thread_inputs AS inputs
+             LEFT JOIN turn_claims AS claims
+               ON claims.input_id = inputs.input_id AND claims.state = 'active'`,
+        )
+        .all()
+    : database.prepare("SELECT state FROM thread_inputs").all();
+  for (const row of rows) {
+    const state = ThreadInputDeliveryStateSchema.safeParse(row.state);
+    if (!state.success) {
+      diagnostics.unknown += 1;
+      continue;
+    }
+    const phase = normalizeThreadInputDeliveryPhase(state.data, {
+      dispatchStarted: row.dispatchStartedAt !== null && row.dispatchStartedAt !== undefined,
+      runtimeTurnStarted: typeof row.runtimeTurnId === "string" && row.runtimeTurnId.length > 0,
+    });
+    diagnostics[phase] += 1;
+  }
+  return diagnostics;
 }
 
 export async function backupRelayDatabases(input: {

@@ -1,5 +1,6 @@
 ---
 "codex-relay": minor
+"@codex-relay/mobile": patch
 ---
 
 Run the shared app-server as a detached local daemon so terminal, optional Codex Desktop, and mobile clients keep active sessions across Relay restarts. Subscribe Relay before starting turns on TUI-loaded threads so mobile clients receive assistant and terminal events, including after switching from the run stream to durable replay. Preserve canonical user-message replacement metadata across repeated app-server item events and begin carrying one semantic client event identity from mobile optimistic state through canonical app-server user messages to prevent duplicate mobile bubbles. Keep cached active-thread navigation during transient detail refresh failures instead of replacing it with an unrelated list fallback, and invalidate that selection when the persisted connection plan identifies a different Relay. Scope persisted server state by Relay identity with URL-only cache migration, and use one attention priority plus a Relay/workspace/thread-scoped seen ledger for background catch-up and conversation status. Route push activation with Relay, workspace, thread, turn, and bounded semantic-event deduplication while retaining legacy payload compatibility. Load recent thread history through paginated, single-flight app-server requests so large conversations remain responsive over Tailscale and Cloudflare. Coalesce mobile refreshes and reduce background thread prefetch concurrency to keep the active conversation responsive. Add a verified macOS Desktop launcher without changing the TUI-first workflow.
@@ -21,3 +22,9 @@ Shut Relay down through explicit quiesce, bounded drain, and close phases so acc
 Derive durable semantic event IDs for accepted and canonical user messages, and recover mobile timelines through one event-cursor, message-cursor, authoritative-snapshot, and generation-guarded background-history ladder.
 
 Stage push activation until Relay, workspace, and thread snapshots materialize, retaining transient failures for retry and preventing stale notifications from replacing valid navigation.
+
+Harden pairing and encrypted transport state with loopback-only management authorization, replay windows, crash-safe server counter reservations, transactional client replacement, and SecureStore-backed credentials and traffic keys. Encrypt persisted mobile query state and preserve legacy migration without leaving plaintext conversation caches.
+
+Make mobile mutations recoverable across unstable networks: persist content-free input identities in a SecureStore outbox, reconcile early stream loss from authoritative snapshots, and make queued cancel, steer, interrupt, and approval retries idempotent across lost responses and Relay restarts. Add one normalized turn lifecycle for mobile reconnecting state and content-safe operator diagnostics for durable stream and input phases.
+
+Clean up failed app-server and Tailcat startup processes, correct workspace selection after archive, add the main server and mobile regression suites plus package builds to CI, and update vulnerable direct and transitive dependencies within the supported Expo SDK.

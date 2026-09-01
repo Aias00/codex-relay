@@ -111,6 +111,7 @@ import {
   type WorkspaceTerminalOutputResponse,
   type WorkspaceTerminalSessionResponse,
 } from "./api-schema.js";
+import { getConnInfo } from "@hono/node-server/conninfo";
 import {
   openRepository,
   type DeltaType,
@@ -120,7 +121,7 @@ import {
   type Status,
   type StatusEntry,
 } from "es-git";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -137,6 +138,7 @@ import {
 } from "node:fs";
 import { mkdir, open, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { isIP } from "node:net";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { setInterval as setNodeInterval } from "node:timers";
@@ -240,6 +242,7 @@ const defaultWebPreviewPorts = [3000, 3001, 5173, 4173, 8080, 19006];
 const threadEventStreamPageLimit = 500;
 const threadEventStreamPollIntervalMs = 250;
 const threadEventStreamHeartbeatIntervalMs = 15_000;
+const secureServerCounterReservationSize = 1_000_000;
 
 export const relayThreadOwnerCapabilities = {
   approve: true,
@@ -284,9 +287,16 @@ type ConnectionPlanOptions = {
 type ManagementOptions = {
   connectUrl?: string;
   connectUrlCandidates?: Array<{ label: string; url: string }>;
+  getConnectionInfo?: (request: Request, context: Context) => LocalManagementConnectionInfo;
   listenUrl?: string;
   pairingPayload?: string;
   port?: number;
+};
+
+type LocalManagementConnectionInfo = {
+  remote?: {
+    address?: string;
+  };
 };
 
 type PairingOptions = {
@@ -294,6 +304,7 @@ type PairingOptions = {
   approvalTtlMs?: number;
   dangerouslyAutoApprove?: boolean;
   serverIdentity?: ServerIdentity;
+  serverCounterReservationSize?: number;
   createClientToken: () => string;
   hashClientToken: (token: string) => string;
   sessions: PairingSessionStore;
@@ -1387,7 +1398,7 @@ export function createApp(options: AppOptions = {}) {
   app.use("*", cors());
 
   app.get("/", async (c, next) => {
-    if (!isLocalManagementRequest(c.req.header("host"))) {
+    if (!isLocalManagementRequest(c, options.management)) {
       await next();
       return;
     }
@@ -1396,7 +1407,7 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.get("/local/pairing", async (c) => {
-    if (!isLocalManagementRequest(c.req.header("host"))) {
+    if (!isLocalManagementRequest(c, options.management)) {
       return c.json(
         apiError("forbidden", "Local pairing management is only available on localhost."),
         403,
@@ -1407,7 +1418,7 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.post("/local/pairing/approve", async (c) => {
-    if (!isLocalManagementRequest(c.req.header("host"))) {
+    if (!isLocalManagementRequest(c, options.management)) {
       return c.json(
         apiError("forbidden", "Local pairing management is only available on localhost."),
         403,
@@ -1455,7 +1466,21 @@ export function createApp(options: AppOptions = {}) {
     }
     if (options.pairing.serverIdentity && !secureSessionsByTokenHash.has(tokenHash)) {
       if (validSession.secureSession) {
-        secureSessionsByTokenHash.set(tokenHash, validSession.secureSession);
+        const reservationSize = secureCounterReservationSize(options.pairing);
+        const reserved = await options.pairing.sessions.reserveServerCounterRange(
+          tokenHash,
+          reservationSize * 2,
+        );
+        if (!reserved) {
+          return c.json(
+            apiError("secure_session_required", "Secure session expired. Pair this device again."),
+            401,
+          );
+        }
+        secureSessionsByTokenHash.set(
+          tokenHash,
+          activateSecureCounterReservation(reserved, reservationSize),
+        );
       } else {
         return c.json(
           apiError("secure_session_required", "Secure session expired. Pair this device again."),
@@ -1577,9 +1602,20 @@ export function createApp(options: AppOptions = {}) {
       clientName: pending.clientName,
       secureSession: pairing.session,
     });
+    const reservationSize = secureCounterReservationSize(options.pairing);
+    const reservedSession = await options.pairing.sessions.reserveServerCounterRange(
+      tokenHash,
+      reservationSize * 2,
+    );
+    if (!reservedSession) {
+      throw new Error("Failed to reserve secure server counters for the paired session.");
+    }
     await options.pairing.sessions.deletePendingPairing(approvalCode);
     options.pairing.onPaired?.({ clientName: pending.clientName, tokenCount });
-    secureSessionsByTokenHash.set(tokenHash, pairing.session);
+    secureSessionsByTokenHash.set(
+      tokenHash,
+      activateSecureCounterReservation(reservedSession, reservationSize),
+    );
     return c.json(PairResponseSchema.parse({ secure: pairing.response }), 201);
   });
 
@@ -1646,12 +1682,12 @@ export function createApp(options: AppOptions = {}) {
     const clientSessionId =
       normalizeClientSessionId(c.req.header("x-codex-relay-client-session-id")) ??
       oldSession.clientSessionId;
+    const secureSession = secureSessionsByTokenHash.get(oldTokenHash) ?? oldSession.secureSession;
     const tokenCount = await options.pairing.sessions.rotateSession(oldTokenHash, newTokenHash, {
       clientSessionId,
       clientName: oldSession.clientName,
-      secureSession: secureSessionsByTokenHash.get(oldTokenHash) ?? oldSession.secureSession,
+      secureSession: secureSession ? durableSecureSessionSnapshot(secureSession) : undefined,
     });
-    const secureSession = secureSessionsByTokenHash.get(oldTokenHash) ?? oldSession.secureSession;
     if (secureSession) {
       secureSessionsByTokenHash.set(oldTokenHash, secureSession);
     }
@@ -1674,7 +1710,10 @@ export function createApp(options: AppOptions = {}) {
     if (secureSession) {
       secureSessionsByTokenHash.delete(oldTokenHash);
       secureSessionsByTokenHash.set(newTokenHash, secureSession);
-      await options.pairing.sessions.updateSecureSession(newTokenHash, secureSession);
+      await options.pairing.sessions.updateSecureSession(
+        newTokenHash,
+        durableSecureSessionSnapshot(secureSession),
+      );
     }
     return jsonResponse;
   });
@@ -4099,6 +4138,14 @@ export function createApp(options: AppOptions = {}) {
           ResolveApprovalResponseSchema.parse({ ok: true }),
         );
       }
+      if ((await options.approvalStore?.getPendingApprovalState?.(approvalId)) === "resolved") {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          ResolveApprovalResponseSchema.parse({ ok: true }),
+        );
+      }
       return secureJson(
         c,
         options.pairing,
@@ -4570,41 +4617,77 @@ export function createApp(options: AppOptions = {}) {
         400,
       );
     }
-    await ensureQueuedInputsHydrated();
-    const thread = threads.get(threadId);
-    if (!thread) {
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("not_found", `Thread ${threadId} is not known to this server.`),
-        404,
+    return runThreadOperation(threadId, async () => {
+      await ensureQueuedInputsHydrated();
+      const thread = threads.get(threadId);
+      if (!thread) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("not_found", `Thread ${threadId} is not known to this server.`),
+          404,
+        );
+      }
+      const durableInput = await findDurableThreadInput(options.threadInputs, threadId, inputId);
+      if (durableInput?.state === "cancelled") {
+        removeQueuedInput(queuedInputsByThreadId, threadId, inputId);
+        const response = QueuedThreadInputActionResponseSchema.parse({
+          queueLength: queuedInputsByThreadId.get(threadId)?.length ?? 0,
+          thread,
+        });
+        return secureJson(c, options.pairing, secureSessionsByTokenHash, response, 200);
+      }
+      const queuedInput = (queuedInputsByThreadId.get(threadId) ?? []).find(
+        (input) => input.id === inputId,
       );
-    }
-    const ownerEpochError = await expectedThreadOwnerEpochError(
-      threadId,
-      parsed.data.expectedOwnerEpoch,
-    );
-    if (ownerEpochError) {
-      return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
-    }
-    const queuedInput = removeQueuedInput(queuedInputsByThreadId, threadId, inputId);
-    if (!queuedInput) {
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("not_found", `Queued input ${inputId} is not known to this thread.`),
-        404,
+      if (!queuedInput) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("not_found", `Queued input ${inputId} is not known to this thread.`),
+          404,
+        );
+      }
+      const ownerEpochError = await expectedThreadOwnerEpochError(
+        threadId,
+        parsed.data.expectedOwnerEpoch,
       );
-    }
-    await options.threadInputs?.updateThreadInputState(inputId, "cancelled");
-    const response = QueuedThreadInputActionResponseSchema.parse({
-      input: queuedThreadInputSummary(queuedInput),
-      queueLength: queuedInputsByThreadId.get(threadId)?.length ?? 0,
-      thread,
+      if (ownerEpochError) {
+        return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
+      }
+      const cancellation = await cancelDurableQueuedThreadInput(
+        options.threadInputs,
+        threadId,
+        inputId,
+      );
+      if (cancellation === "not_queued") {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("input_not_queued", `Input ${inputId} is no longer queued.`),
+          409,
+        );
+      }
+      if (cancellation === "not_found") {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("not_found", `Queued input ${inputId} is not known to this thread.`),
+          404,
+        );
+      }
+      removeQueuedInput(queuedInputsByThreadId, threadId, inputId);
+      const response = QueuedThreadInputActionResponseSchema.parse({
+        input: queuedThreadInputSummary(queuedInput),
+        queueLength: queuedInputsByThreadId.get(threadId)?.length ?? 0,
+        thread,
+      });
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, response, 200);
     });
-    return secureJson(c, options.pairing, secureSessionsByTokenHash, response, 200);
   });
 
   app.post("/v1/threads/:threadId/input/:inputId/steer", async (c) => {
@@ -4642,6 +4725,27 @@ export function createApp(options: AppOptions = {}) {
           404,
         );
       }
+      const durableInput = await findDurableThreadInput(options.threadInputs, threadId, inputId);
+      if (durableInput && isReconciledSteerState(durableInput.state)) {
+        removeQueuedInput(queuedInputsByThreadId, threadId, inputId);
+        const response = QueuedThreadInputActionResponseSchema.parse({
+          queueLength: queuedInputsByThreadId.get(threadId)?.length ?? 0,
+          thread: knownThread,
+        });
+        return secureJson(c, options.pairing, secureSessionsByTokenHash, response, 202);
+      }
+      const queuedInput = (queuedInputsByThreadId.get(threadId) ?? []).find(
+        (input) => input.id === inputId,
+      );
+      if (!queuedInput) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("not_found", `Queued input ${inputId} is not known to this thread.`),
+          404,
+        );
+      }
       const ownerEpochError = await expectedThreadOwnerEpochError(
         threadId,
         parsed.data.expectedOwnerEpoch,
@@ -4676,19 +4780,6 @@ export function createApp(options: AppOptions = {}) {
           409,
         );
       }
-      const queuedInput = (queuedInputsByThreadId.get(threadId) ?? []).find(
-        (input) => input.id === inputId,
-      );
-      if (!queuedInput) {
-        return secureJson(
-          c,
-          options.pairing,
-          secureSessionsByTokenHash,
-          apiError("not_found", `Queued input ${inputId} is not known to this thread.`),
-          404,
-        );
-      }
-
       let turnClaim: TurnClaim | undefined;
       if (options.threadCoordinator) {
         const owner = await ensureRelayThreadOwner(threadId, knownThread.workspaceId);
@@ -4815,133 +4906,149 @@ export function createApp(options: AppOptions = {}) {
         400,
       );
     }
-    await ensureQueuedInputsHydrated();
-    const knownThread = await ensureKnownThread({
-      appServer,
-      threadId,
-      messagesByThreadId,
-      threads,
-    });
-    relayDebugLog("thread.interrupt.requested", {
-      knownState: knownThread?.state,
-      path: c.req.path,
-      threadId,
-    });
-    if (!knownThread) {
-      relayDebugLog("thread.interrupt.rejected", {
-        reason: "unknown_thread",
+    return runThreadOperation(threadId, async () => {
+      await ensureQueuedInputsHydrated();
+      const knownThread = await ensureKnownThread({
+        appServer,
+        threadId,
+        messagesByThreadId,
+        threads,
+      });
+      relayDebugLog("thread.interrupt.requested", {
+        knownState: knownThread?.state,
+        path: c.req.path,
         threadId,
       });
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("not_found", `Thread ${threadId} is not known to this server.`),
-        404,
+      if (!knownThread) {
+        relayDebugLog("thread.interrupt.rejected", {
+          reason: "unknown_thread",
+          threadId,
+        });
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("not_found", `Thread ${threadId} is not known to this server.`),
+          404,
+        );
+      }
+      const trackedTurnId = activeAppServerTurnIdsByThreadId.get(threadId);
+      if (!trackedTurnId && knownThread.state !== "running") {
+        relayDebugLog("thread.interrupt.completed", {
+          mode: "already_terminal",
+          threadId,
+        });
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          InterruptThreadRunResponseSchema.parse({ thread: knownThread }),
+          200,
+        );
+      }
+      const ownerEpochError = await expectedThreadOwnerEpochError(
+        threadId,
+        parsed.data.expectedOwnerEpoch,
       );
-    }
-    const ownerEpochError = await expectedThreadOwnerEpochError(
-      threadId,
-      parsed.data.expectedOwnerEpoch,
-    );
-    if (ownerEpochError) {
-      relayDebugLog("thread.interrupt.rejected", {
-        reason: "stale_owner_epoch",
-        threadId,
-      });
-      return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
-    }
-    if (!appServer) {
-      relayDebugLog("thread.interrupt.rejected", {
-        reason: "app_server_unavailable",
-        threadId,
-      });
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("unsupported", "Running-thread interrupt requires the Codex app-server."),
-        409,
-      );
-    }
+      if (ownerEpochError) {
+        relayDebugLog("thread.interrupt.rejected", {
+          reason: "stale_owner_epoch",
+          threadId,
+        });
+        return secureJson(c, options.pairing, secureSessionsByTokenHash, ownerEpochError, 409);
+      }
+      if (!appServer) {
+        relayDebugLog("thread.interrupt.rejected", {
+          reason: "app_server_unavailable",
+          threadId,
+        });
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("unsupported", "Running-thread interrupt requires the Codex app-server."),
+          409,
+        );
+      }
 
-    let turnId = activeAppServerTurnIdsByThreadId.get(threadId);
-    if (!turnId && typeof appServer.readThread === "function") {
+      let turnId = trackedTurnId;
+      if (!turnId && typeof appServer.readThread === "function") {
+        try {
+          turnId = latestRunningTurnId(await appServer.readThread(threadId));
+        } catch {}
+      }
+      if (!turnId) {
+        relayDebugLog("thread.interrupt.rejected", {
+          reason: "no_active_turn",
+          threadId,
+        });
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("no_active_turn", `Thread ${threadId} does not have an active turn.`),
+          409,
+        );
+      }
+
+      const dispatchOwnerEpochError = await expectedThreadOwnerEpochError(
+        threadId,
+        parsed.data.expectedOwnerEpoch,
+      );
+      if (dispatchOwnerEpochError) {
+        relayDebugLog("thread.interrupt.rejected", {
+          reason: "stale_owner_epoch_before_dispatch",
+          threadId,
+        });
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          dispatchOwnerEpochError,
+          409,
+        );
+      }
+
       try {
-        turnId = latestRunningTurnId(await appServer.readThread(threadId));
-      } catch {}
-    }
-    if (!turnId) {
-      relayDebugLog("thread.interrupt.rejected", {
-        reason: "no_active_turn",
+        await appServer.interruptTurn({ threadId, turnId });
+      } catch (error) {
+        relayDebugLog("thread.interrupt.failed", {
+          error: errorMessage(error),
+          threadId,
+          turnId,
+        });
+        throw error;
+      }
+      relayDebugLog("thread.interrupt.completed", { threadId, turnId });
+      activeAppServerTurnIdsByThreadId.delete(threadId);
+      await finalizeActiveThreadInputState(
+        options.threadInputs,
+        options.threadCoordinator,
+        activeTurnClaimsByThreadId,
+        activeThreadInputIdsByThreadId,
         threadId,
+        "cancelled",
+        forgetRelayThreadOwner,
+      );
+      await updateQueuedThreadInputStates(
+        options.threadInputs,
+        queuedInputsByThreadId.get(threadId) ?? [],
+        "cancelled",
+      );
+      queuedInputsByThreadId.delete(threadId);
+      steeringThreads.delete(threadId);
+      const thread = updateThread(threads, messagesByThreadId, threadId, {
+        state: "completed",
+        lastError: undefined,
       });
       return secureJson(
         c,
         options.pairing,
         secureSessionsByTokenHash,
-        apiError("no_active_turn", `Thread ${threadId} does not have an active turn.`),
-        409,
+        InterruptThreadRunResponseSchema.parse({ thread }),
+        200,
       );
-    }
-
-    const dispatchOwnerEpochError = await expectedThreadOwnerEpochError(
-      threadId,
-      parsed.data.expectedOwnerEpoch,
-    );
-    if (dispatchOwnerEpochError) {
-      relayDebugLog("thread.interrupt.rejected", {
-        reason: "stale_owner_epoch_before_dispatch",
-        threadId,
-      });
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        dispatchOwnerEpochError,
-        409,
-      );
-    }
-
-    try {
-      await appServer.interruptTurn({ threadId, turnId });
-    } catch (error) {
-      relayDebugLog("thread.interrupt.failed", {
-        error: errorMessage(error),
-        threadId,
-        turnId,
-      });
-      throw error;
-    }
-    relayDebugLog("thread.interrupt.completed", { threadId, turnId });
-    activeAppServerTurnIdsByThreadId.delete(threadId);
-    await finalizeActiveThreadInputState(
-      options.threadInputs,
-      options.threadCoordinator,
-      activeTurnClaimsByThreadId,
-      activeThreadInputIdsByThreadId,
-      threadId,
-      "cancelled",
-      forgetRelayThreadOwner,
-    );
-    await updateQueuedThreadInputStates(
-      options.threadInputs,
-      queuedInputsByThreadId.get(threadId) ?? [],
-      "cancelled",
-    );
-    queuedInputsByThreadId.delete(threadId);
-    steeringThreads.delete(threadId);
-    const thread = updateThread(threads, messagesByThreadId, threadId, {
-      state: "completed",
-      lastError: undefined,
     });
-    return secureJson(
-      c,
-      options.pairing,
-      secureSessionsByTokenHash,
-      InterruptThreadRunResponseSchema.parse({ thread }),
-      200,
-    );
   });
 
   app.post("/v1/threads/:threadId/runs/stream", async (c) => {
@@ -5398,14 +5505,74 @@ function terminalQrCode(payload: string) {
   return qrText;
 }
 
-function isLocalManagementRequest(hostHeader: string | undefined) {
+function isLocalManagementRequest(c: Context, management: ManagementOptions | undefined) {
+  const host = c.req.header("host");
+  if (!isLoopbackHostHeader(host)) {
+    return false;
+  }
+  const origin = c.req.header("origin");
+  if (origin && !isSameLocalManagementOrigin(origin, host)) {
+    return false;
+  }
+  return isLoopbackAddress(localManagementRemoteAddress(c, management));
+}
+
+function localManagementRemoteAddress(
+  c: Context,
+  management: ManagementOptions | undefined,
+): string | undefined {
+  try {
+    return (management?.getConnectionInfo?.(c.req.raw, c) ?? getConnInfo(c)).remote?.address;
+  } catch {
+    return undefined;
+  }
+}
+
+function isLoopbackHostHeader(hostHeader: string | undefined) {
   const host = hostHeader?.trim().toLowerCase();
   if (!host) {
     return false;
   }
 
   const hostname = host.startsWith("[") ? host.slice(1, host.indexOf("]")) : host.split(":")[0];
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  return isLoopbackHostname(hostname);
+}
+
+function isSameLocalManagementOrigin(origin: string, hostHeader: string | undefined) {
+  try {
+    const parsed = new URL(origin);
+    return (
+      (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      isLoopbackHostname(parsed.hostname) &&
+      parsed.host.toLowerCase() === hostHeader?.trim().toLowerCase()
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isLoopbackHostname(hostname: string) {
+  const normalized = hostname.trim().toLowerCase();
+  return normalized === "localhost" || isLoopbackAddress(normalized);
+}
+
+function isLoopbackAddress(address: string | undefined) {
+  const normalized = address?.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (normalized === "::1") {
+    return true;
+  }
+  const ipv4Mapped = normalized.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  const candidate = ipv4Mapped?.[1] ?? normalized;
+  if (isIP(candidate) !== 4) {
+    return false;
+  }
+  const octets = candidate.split(".").map((part) => Number(part));
+  return (
+    octets.length === 4 && octets.every((part) => part >= 0 && part <= 255) && octets[0] === 127
+  );
 }
 
 function createManagementPage() {
@@ -6734,7 +6901,86 @@ async function updateQueuedThreadInputStates(
   if (!store || inputs.length === 0) {
     return;
   }
+  if (state === "cancelled") {
+    await Promise.all(
+      inputs.map((input) => cancelDurableQueuedThreadInput(store, undefined, input.id)),
+    );
+    return;
+  }
   await Promise.all(inputs.map((input) => store.updateThreadInputState(input.id, state)));
+}
+
+async function cancelDurableQueuedThreadInput(
+  store: ThreadInputStore | undefined,
+  threadId: string | undefined,
+  inputId: string,
+) {
+  if (!store) {
+    return "cancelled" as const;
+  }
+  const inputs = await store.listThreadInputs(threadId ? { threadId } : undefined);
+  const input = inputs.find((candidate) => candidate.inputId === inputId);
+  if (!input) {
+    return "not_found" as const;
+  }
+  if (input.state !== "queued") {
+    return "not_queued" as const;
+  }
+  await store.updateThreadInputState(inputId, "cancelled");
+  return "cancelled" as const;
+}
+
+async function findDurableThreadInput(
+  store: ThreadInputStore | undefined,
+  threadId: string,
+  inputId: string,
+) {
+  if (!store) {
+    return undefined;
+  }
+  const inputs = await store.listThreadInputs({ threadId });
+  return inputs.find((input) => input.inputId === inputId);
+}
+
+function isReconciledSteerState(state: ThreadInputState) {
+  return state === "steered" || state === "running" || state === "completed";
+}
+
+async function resolvePendingApprovalFromServerNotification(input: {
+  approvalId: string;
+  approvalStore?: PendingApprovalStore;
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  encoder: TextEncoder;
+  pendingApprovals: Map<string, PendingApproval>;
+  secureSession?: SecureSessionHandle;
+  threadId: string;
+}) {
+  const pending = input.pendingApprovals.get(input.approvalId);
+  if (!pending || pending.threadId !== input.threadId) {
+    return;
+  }
+
+  try {
+    await input.approvalStore?.resolvePendingApproval(input.approvalId);
+  } catch (error) {
+    relayDebugLog("thread.approval.resolve_persistence_failed", {
+      approvalId: input.approvalId,
+      error: errorMessage(error),
+      threadId: input.threadId,
+    });
+  }
+
+  if (input.pendingApprovals.get(input.approvalId) !== pending) {
+    return;
+  }
+  input.pendingApprovals.delete(input.approvalId);
+  if (pending.kind === "structuredUserInput") {
+    sendSse(input.controller, input.encoder, input.secureSession, {
+      type: "thread.input_request.resolved",
+      requestId: input.approvalId,
+      threadId: input.threadId,
+    });
+  }
 }
 
 async function finalizeActiveThreadInputState(
@@ -7025,18 +7271,15 @@ async function streamRunningAppServerThread(input: {
               return;
             }
             const approvalId = appServerApprovalId(input.threadId, requestId);
-            const pending = input.pendingApprovals.get(approvalId);
-            if (!pending || pending.threadId !== input.threadId) {
-              return;
-            }
-            input.pendingApprovals.delete(approvalId);
-            if (pending.kind === "structuredUserInput") {
-              sendSse(input.controller, input.encoder, input.secureSession, {
-                type: "thread.input_request.resolved",
-                requestId: approvalId,
-                threadId: input.threadId,
-              });
-            }
+            void resolvePendingApprovalFromServerNotification({
+              approvalId,
+              approvalStore: input.approvalStore,
+              controller: input.controller,
+              encoder: input.encoder,
+              pendingApprovals: input.pendingApprovals,
+              secureSession: input.secureSession,
+              threadId: input.threadId,
+            });
             return;
           }
           case "thread/status/changed": {
@@ -7917,18 +8160,15 @@ async function runAppServerPromptStreamed(input: {
               return;
             }
             const approvalId = appServerApprovalId(activeThreadId, requestId);
-            const pending = input.pendingApprovals.get(approvalId);
-            if (!pending || pending.threadId !== activeThreadId) {
-              return;
-            }
-            input.pendingApprovals.delete(approvalId);
-            if (pending.kind === "structuredUserInput") {
-              sendSse(input.controller, input.encoder, input.secureSession, {
-                type: "thread.input_request.resolved",
-                requestId: approvalId,
-                threadId: activeThreadId,
-              });
-            }
+            void resolvePendingApprovalFromServerNotification({
+              approvalId,
+              approvalStore: input.approvalStore,
+              controller: input.controller,
+              encoder: input.encoder,
+              pendingApprovals: input.pendingApprovals,
+              secureSession: input.secureSession,
+              threadId: activeThreadId,
+            });
             return;
           }
           case "thread/status/changed": {
@@ -8678,17 +8918,67 @@ function createSecureSessionHandle(
   tokenHash: string,
   session: SecureSession,
 ): SecureSessionHandle {
-  let pendingPersist = Promise.resolve();
   return {
     persist: () => {
-      pendingPersist = pendingPersist
+      const reservationSize = secureCounterReservationSize(pairing);
+      session.serverCounterMutation = (session.serverCounterMutation ?? Promise.resolve())
         .catch(() => undefined)
-        .then(() => pairing.sessions.updateSecureSession(tokenHash, session));
-      return pendingPersist;
+        .then(async () => {
+          if (
+            session.serverCounterLimit !== undefined &&
+            session.serverCounterRenewAt !== undefined &&
+            session.nextServerCounter >= session.serverCounterRenewAt
+          ) {
+            const renewed = await pairing.sessions.reserveServerCounterRange(
+              tokenHash,
+              reservationSize,
+            );
+            if (renewed?.serverCounterLimit === undefined) {
+              throw new Error("Secure server counter reservation could not be renewed.");
+            }
+            session.serverCounterLimit = renewed.serverCounterLimit;
+            session.serverCounterRenewAt = renewed.serverCounterLimit - reservationSize;
+          }
+          await pairing.sessions.updateSecureSession(
+            tokenHash,
+            durableSecureSessionSnapshot(session),
+          );
+        });
+      return session.serverCounterMutation;
     },
     session,
     tokenHash,
   };
+}
+
+function durableSecureSessionSnapshot(session: SecureSession): SecureSession {
+  return {
+    keyEpoch: session.keyEpoch,
+    lastMobileCounter: session.lastMobileCounter,
+    mobileCounterFloor: session.mobileCounterFloor,
+    mobileToServerKey: session.mobileToServerKey,
+    nextServerCounter: session.serverCounterLimit ?? session.nextServerCounter,
+    seenMobileCounters: session.seenMobileCounters,
+    serverToMobileKey: session.serverToMobileKey,
+  };
+}
+
+function secureCounterReservationSize(pairing: PairingOptions) {
+  const configured = pairing.serverCounterReservationSize ?? secureServerCounterReservationSize;
+  if (!Number.isSafeInteger(configured) || configured < 1) {
+    throw new TypeError("Secure server counter reservation size must be a positive safe integer.");
+  }
+  return configured;
+}
+
+function activateSecureCounterReservation(session: SecureSession, reservationSize: number) {
+  if (session.serverCounterLimit !== undefined) {
+    session.serverCounterRenewAt = Math.max(
+      session.nextServerCounter,
+      session.serverCounterLimit - reservationSize,
+    );
+  }
+  return session;
 }
 
 function sortedThreads(threads: Map<string, ThreadMetadata>) {

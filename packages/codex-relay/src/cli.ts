@@ -549,6 +549,14 @@ program
     }
     console.log(`Schema: ${diagnostics.schemaVersion ?? "unknown"}`);
     console.log(`Events: ${diagnostics.eventCount}`);
+    console.log(
+      `Event streams: ${diagnostics.streams.threadCount} thread(s), max sequence ${diagnostics.streams.maximumSequence}, ${diagnostics.streams.compactedThreadCount} compacted`,
+    );
+    console.log(
+      `Turn lifecycle: ${Object.entries(diagnostics.turnLifecycle)
+        .map(([phase, count]) => `${phase}=${count}`)
+        .join(", ")}`,
+    );
     console.log(`Pending approvals: ${diagnostics.pendingApprovalCount}`);
     console.log(`Owners: ${diagnostics.ownerCount} (${diagnostics.expiredOwnerCount} expired)`);
     console.log(`Active claims: ${diagnostics.activeClaimCount}`);

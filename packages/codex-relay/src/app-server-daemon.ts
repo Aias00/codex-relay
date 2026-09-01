@@ -16,6 +16,7 @@ type EnsureDaemonInput = CodexAppServerSpawnInput & {
   pollIntervalMs?: number;
   socketReachable?: (path: string) => Promise<boolean>;
   start?: (spawn: CodexAppServerSpawn, env: NodeJS.ProcessEnv) => Promise<number>;
+  stop?: (pid: number) => Promise<void> | void;
   timeoutMs?: number;
 };
 
@@ -52,13 +53,18 @@ export async function ensureCodexSharedAppServerDaemon(
   const timeoutMs = input.timeoutMs ?? 15_000;
   const pollIntervalMs = input.pollIntervalMs ?? 25;
   const deadline = Date.now() + timeoutMs;
-  do {
-    if (await socketReachable(socketPath)) {
-      return { pid, socketPath, status: "started" };
-    }
-    await delay(pollIntervalMs);
-  } while (Date.now() < deadline);
-  throw new Error(`Timed out waiting for detached Codex app-server daemon at ${socketPath}.`);
+  try {
+    do {
+      if (await socketReachable(socketPath)) {
+        return { pid, socketPath, status: "started" };
+      }
+      await delay(pollIntervalMs);
+    } while (Date.now() < deadline);
+    throw new Error(`Timed out waiting for detached Codex app-server daemon at ${socketPath}.`);
+  } catch (error) {
+    await (input.stop ?? stopDetachedSharedAppServer)(pid);
+    throw error;
+  }
 }
 
 async function startDetachedSharedAppServer(
@@ -82,6 +88,39 @@ async function startDetachedSharedAppServer(
   }
   child.unref();
   return child.pid;
+}
+
+async function stopDetachedSharedAppServer(pid: number) {
+  signalDetachedSharedAppServer(pid, "SIGTERM");
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    if (!detachedSharedAppServerIsRunning(pid)) {
+      return;
+    }
+    await delay(25);
+  }
+  if (detachedSharedAppServerIsRunning(pid)) {
+    signalDetachedSharedAppServer(pid, "SIGKILL");
+  }
+}
+
+function signalDetachedSharedAppServer(pid: number, signal: NodeJS.Signals) {
+  try {
+    process.kill(pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+      throw error;
+    }
+  }
+}
+
+function detachedSharedAppServerIsRunning(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
 }
 
 export function resolveCodexSharedAppServerDaemonCwd(

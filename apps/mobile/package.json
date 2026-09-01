@@ -18,7 +18,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@expo/dom-webview": "56.0.4",
+    "@expo/dom-webview": "~56.0.6",
     "@expo/metro-runtime": "~56.0.14",
     "@expo/ui": "~56.0.16",
     "@gorhom/bottom-sheet": "^5",
@@ -40,7 +40,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "codex-relay": "workspace:*",
-    "expo": "56.0.9",
+    "expo": "~56.0.21",
     "expo-build-properties": "~56.0.17",
     "expo-camera": "^56.0.7",
     "expo-clipboard": "~56.0.4",
@@ -79,7 +79,7 @@
     "react-native-pager-view": "8.0.1",
     "react-native-reanimated": "4.3.1",
     "react-native-safe-area-context": "~5.7.0",
-    "react-native-screens": "4.25.2",
+    "react-native-screens": "~4.26.0",
     "react-native-sse": "^1.2.1",
     "react-native-svg": "^15.15.4",
     "react-native-unistyles": "^3.2.4",

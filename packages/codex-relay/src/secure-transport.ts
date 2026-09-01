@@ -18,8 +18,15 @@ export type SecureSession = {
   mobileToServerKey: Uint8Array;
   serverToMobileKey: Uint8Array;
   lastMobileCounter: number;
+  mobileCounterFloor?: number;
   nextServerCounter: number;
+  serverCounterLimit?: number;
+  serverCounterMutation?: Promise<void>;
+  serverCounterRenewAt?: number;
+  seenMobileCounters?: number[];
 };
+
+const replayWindowSize = 1024;
 
 export function createServerIdentity(): ServerIdentity {
   const privateKey = ed25519.utils.randomSecretKey();
@@ -87,6 +94,12 @@ export function createSecurePairing(input: {
 }
 
 export function encryptForMobile(session: SecureSession, plaintext: string) {
+  if (
+    session.serverCounterLimit !== undefined &&
+    session.nextServerCounter >= session.serverCounterLimit
+  ) {
+    throw new Error("Secure server counter reservation is exhausted.");
+  }
   const envelope = encryptWithKey(
     session.serverToMobileKey,
     "server",
@@ -102,7 +115,14 @@ export function decryptFromMobile(session: SecureSession, envelope: unknown) {
   if (!isEncryptedEnvelope(envelope) || envelope.sender !== "mobile") {
     throw new Error("Expected encrypted mobile payload.");
   }
-  if (envelope.keyEpoch !== session.keyEpoch || envelope.counter <= session.lastMobileCounter) {
+  const counterFloor = session.mobileCounterFloor ?? session.lastMobileCounter + 1;
+  const seenCounters = session.seenMobileCounters ?? [];
+  if (
+    envelope.keyEpoch !== session.keyEpoch ||
+    !Number.isSafeInteger(envelope.counter) ||
+    envelope.counter < counterFloor ||
+    seenCounters.includes(envelope.counter)
+  ) {
     throw new Error("Rejected stale encrypted mobile payload.");
   }
 
@@ -112,7 +132,15 @@ export function decryptFromMobile(session: SecureSession, envelope: unknown) {
     envelope.counter,
     envelope.ciphertext,
   );
-  session.lastMobileCounter = envelope.counter;
+  session.lastMobileCounter = Math.max(session.lastMobileCounter, envelope.counter);
+  seenCounters.push(envelope.counter);
+  session.mobileCounterFloor = Math.max(
+    counterFloor,
+    session.lastMobileCounter - replayWindowSize + 1,
+  );
+  session.seenMobileCounters = seenCounters.filter(
+    (counter) => counter >= (session.mobileCounterFloor ?? 0),
+  );
   return plaintext;
 }
 
@@ -130,6 +158,7 @@ function deriveSession(
   return {
     keyEpoch,
     lastMobileCounter: -1,
+    mobileCounterFloor: 0,
     mobileToServerKey: hkdf(
       sha256,
       sharedSecret,
@@ -138,6 +167,7 @@ function deriveSession(
       32,
     ),
     nextServerCounter: 0,
+    seenMobileCounters: [],
     serverToMobileKey: hkdf(
       sha256,
       sharedSecret,

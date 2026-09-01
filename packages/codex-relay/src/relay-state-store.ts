@@ -153,6 +153,7 @@ export type PendingApprovalStore = {
     approval: Omit<DurablePendingApproval, "createdAt" | "updatedAt">,
   ): Promise<DurablePendingApproval>;
   listPendingApprovals(): Promise<DurablePendingApproval[]>;
+  getPendingApprovalState?(approvalId: string): Promise<"pending" | "resolved" | undefined>;
   resolvePendingApproval(approvalId: string): Promise<boolean>;
 };
 
@@ -1701,6 +1702,13 @@ export async function createRelayStateStore(path: string): Promise<RelayStateSto
         )
         .all();
       return rows.map(pendingApprovalFromRow);
+    },
+    async getPendingApprovalState(approvalId) {
+      const row = await database
+        .prepare("SELECT state FROM pending_approvals WHERE approval_id = ?")
+        .get(approvalId);
+      const state = row?.state;
+      return state === "pending" || state === "resolved" ? state : undefined;
     },
     async markTurnClaimDispatch(input) {
       const now = Date.now();

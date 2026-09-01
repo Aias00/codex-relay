@@ -1,5 +1,6 @@
 import { type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,7 +21,7 @@ describe("Tailcat sidecar", () => {
     await writeFile(join(directory, "server.private.json"), "test-key", { mode: 0o600 });
     const child = fakeChild(token);
     const spawnProcess = vi.fn<TailcatSidecarSpawn>(() => {
-      void writeFile(addressPath, token, { mode: 0o600 });
+      writeFileSync(addressPath, token, { mode: 0o600 });
       return child;
     });
 
@@ -48,6 +49,69 @@ describe("Tailcat sidecar", () => {
       await expect(readFile(`${addressPath}.pid`, "utf8")).rejects.toMatchObject({
         code: "ENOENT",
       });
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("creates a custom PID parent directory with private permissions", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codex-relay-tailcat-pid-parent-"));
+    const addressPath = join(directory, "address.token");
+    const pidDirectory = join(directory, "runtime", "tailcat");
+    const pidPath = join(pidDirectory, "sidecar.pid");
+    const token = "tco2_test_token_with_custom_pid_parent";
+    await writeFile(join(directory, "server.private.json"), "test-key", { mode: 0o600 });
+    const child = fakeChild(token);
+    const spawnProcess = vi.fn<TailcatSidecarSpawn>(() => {
+      writeFileSync(addressPath, token, { mode: 0o600 });
+      return child;
+    });
+
+    const sidecar = await startTailcatSidecar({
+      addressPath,
+      binaryPath: "/usr/local/bin/tailcat",
+      keyPath: join(directory, "server.private.json"),
+      localTargetPort: 8788,
+      pidPath,
+      spawnProcess,
+      startTimeoutMs: 1_000,
+    });
+
+    try {
+      expect(await readFile(pidPath, "utf8")).toBe("1234\n");
+      expect((await stat(pidDirectory)).mode & 0o777).toBe(0o700);
+      expect((await stat(pidPath)).mode & 0o777).toBe(0o600);
+    } finally {
+      await sidecar.close();
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("terminates the child and removes the address file when PID persistence fails after spawn", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codex-relay-tailcat-pid-failed-"));
+    const addressPath = join(directory, "address.token");
+    const token = "tco2_test_token_for_pid_write_failure";
+    await writeFile(join(directory, "server.private.json"), "test-key", { mode: 0o600 });
+    const child = fakeChild(token);
+    const spawnProcess = vi.fn<TailcatSidecarSpawn>(() => {
+      writeFileSync(addressPath, token, { mode: 0o600 });
+      return child;
+    });
+
+    try {
+      await expect(
+        startTailcatSidecar({
+          addressPath,
+          binaryPath: "/usr/local/bin/tailcat",
+          keyPath: join(directory, "server.private.json"),
+          localTargetPort: 8788,
+          pidPath: directory,
+          spawnProcess,
+          startTimeoutMs: 1_000,
+        }),
+      ).rejects.toThrow("Tailcat sidecar failed before publishing a valid address.");
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      await expect(readFile(addressPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
       await rm(directory, { force: true, recursive: true });
     }
   });

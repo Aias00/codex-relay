@@ -1378,6 +1378,7 @@ describe("Codex Relay server routes", () => {
       management: {
         connectUrl: "http://127.0.0.1:8788",
         connectUrlCandidates: [{ label: "Local", url: "http://127.0.0.1:8788" }],
+        getConnectionInfo: () => ({ remote: { address: "127.0.0.1" } }),
         listenUrl: "http://0.0.0.0:8788",
         pairingPayload: "codex-relay://pair?serverUrl=http%3A%2F%2F127.0.0.1%3A8788",
         port: 8788,
@@ -1442,11 +1443,64 @@ describe("Codex Relay server routes", () => {
     });
   });
 
+  it("rejects local pairing controls without a loopback socket peer or with a cross-site origin", async () => {
+    const sessions = await createTursoPairingSessionStore(":memory:");
+    const app = createApp({
+      codex: createMockCodex(),
+      management: {
+        getConnectionInfo: (request) => {
+          const url = new URL(request.url);
+          return {
+            remote: {
+              address: url.searchParams.get("peer") ?? "127.0.0.1",
+            },
+          };
+        },
+        pairingPayload: "codex-relay://pair",
+      },
+      pairing: {
+        createClientToken: () => "client-token",
+        hashClientToken: (token) => token,
+        sessions,
+      },
+    });
+
+    const nonLoopbackPeer = await app.request("/local/pairing?peer=192.168.31.114", {
+      headers: { host: "localhost:8788" },
+    });
+    expect(nonLoopbackPeer.status).toBe(403);
+
+    const crossSiteOrigin = await app.request("/local/pairing", {
+      headers: {
+        host: "localhost:8788",
+        origin: "https://example.invalid",
+      },
+    });
+    expect(crossSiteOrigin.status).toBe(403);
+
+    const localOrigin = await app.request("/local/pairing", {
+      headers: {
+        host: "localhost:8788",
+        origin: "http://localhost:8788",
+      },
+    });
+    expect(localOrigin.status).toBe(200);
+
+    const otherLoopbackOrigin = await app.request("/local/pairing", {
+      headers: {
+        host: "localhost:8788",
+        origin: "http://localhost:3000",
+      },
+    });
+    expect(otherLoopbackOrigin.status).toBe(403);
+  });
+
   it("rejects local pairing controls from non-localhost hosts", async () => {
     const sessions = await createTursoPairingSessionStore(":memory:");
     const app = createApp({
       codex: createMockCodex(),
       management: {
+        getConnectionInfo: () => ({ remote: { address: "127.0.0.1" } }),
         pairingPayload: "codex-relay://pair",
       },
       pairing: {
@@ -1806,6 +1860,7 @@ describe("Codex Relay server routes", () => {
 
   it("approves pairing requests and encrypts paired responses", async () => {
     const sessions = await createTursoPairingSessionStore(":memory:");
+    const reserveServerCounterRange = vi.spyOn(sessions, "reserveServerCounterRange");
     const serverIdentity = createServerIdentity();
     const tokens = ["client-token", "client-token-2"];
     const onPairApprovalRequested =
@@ -1823,6 +1878,7 @@ describe("Codex Relay server routes", () => {
         onPairApproved,
         onPaired,
         onTokenRefreshed,
+        serverCounterReservationSize: 2,
         serverIdentity,
         sessions,
       },
@@ -1917,10 +1973,12 @@ describe("Codex Relay server routes", () => {
       clientToken: "client-token",
       clientTokenExpiresAt: "9999-12-31T23:59:59.999Z",
     });
-    expect(await sessions.getValidSession("client-token")).toMatchObject({
+    const storedPairedSession = await sessions.getValidSession("client-token");
+    expect(storedPairedSession).toMatchObject({
       clientName: "test phone",
       clientSessionId: "phone-session",
     });
+    expect(storedPairedSession?.secureSession?.nextServerCounter).toBeGreaterThan(2);
 
     const status = await app.request("/v1/status", {
       headers: { authorization: "Bearer client-token" },
@@ -1935,6 +1993,15 @@ describe("Codex Relay server routes", () => {
       machineName: expect.any(String),
       workspacePath: "/tmp/codex-relay",
     });
+    const secondStatus = await app.request("/v1/status", {
+      headers: { authorization: "Bearer client-token" },
+    });
+    expect(secondStatus.status).toBe(200);
+    await secondStatus.json();
+    expect(reserveServerCounterRange).toHaveBeenCalledTimes(2);
+    expect(
+      (await sessions.getValidSession("client-token"))?.secureSession?.nextServerCounter,
+    ).toBeGreaterThan(5);
 
     const refresh = await app.request("/v1/session/refresh", {
       method: "POST",
@@ -1942,7 +2009,7 @@ describe("Codex Relay server routes", () => {
     });
     const refreshEnvelope = await refresh.json();
     const refreshBody = JSON.parse(
-      testDecrypt(keys.serverToMobileKey, "server", 2, refreshEnvelope.ciphertext),
+      testDecrypt(keys.serverToMobileKey, "server", 3, refreshEnvelope.ciphertext),
     );
     expect(refresh.status).toBe(201);
     expect(refreshBody).toMatchObject({
@@ -5205,6 +5272,19 @@ describe("Codex Relay server routes", () => {
       runtimeMode: "full-access",
       sandboxMode: "danger-full-access",
     });
+    const duplicateInterruptResponse = await app.request(
+      "/v1/threads/app-thread-interrupt/runs/interrupt",
+      {
+        method: "POST",
+        body: JSON.stringify({ expectedOwnerEpoch: 999 }),
+        headers: { "content-type": "application/json" },
+      },
+    );
+    expect(duplicateInterruptResponse.status).toBe(200);
+    await expect(duplicateInterruptResponse.json()).resolves.toMatchObject({
+      thread: { id: "app-thread-interrupt", state: "completed" },
+    });
+    expect(interruptTurn).toHaveBeenCalledTimes(1);
 
     for (const handler of notificationHandlers) {
       handler({
@@ -7434,6 +7514,220 @@ describe("Codex Relay server routes", () => {
     );
   });
 
+  it("recognizes a durable resolved approval after Relay restarts", async () => {
+    const approvalStore = await createRelayStateStore(":memory:");
+    await approvalStore.createPendingApproval({
+      approvalId: "approval-durable-retry",
+      kind: "commandExecution",
+      method: "item/commandExecution/requestApproval",
+      requestId: 42,
+      threadId: "app-thread-approval-retry",
+    });
+    await approvalStore.resolvePendingApproval("approval-durable-retry");
+    const app = createApp({
+      approvalStore,
+      codex: createMockCodex(),
+    });
+
+    const response = await app.request("/v1/approvals/approval-durable-retry", {
+      method: "POST",
+      body: JSON.stringify({ decision: "approve" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ ok: true });
+  });
+
+  it("persists app-server request resolution notifications on attached running streams", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const approvalStore = await createRelayStateStore(":memory:");
+    const notificationHandlers = new Set<(notification: unknown) => void>();
+    const requestHandlers = new Set<(request: unknown) => void>();
+    const now = Date.now() / 1000;
+    const appThread = {
+      id: "app-thread-attached-request-resolution",
+      createdAt: now,
+      cwd: workspacePath,
+      modelProvider: "gpt-5.5",
+      name: "Attached request resolution",
+      preview: "Attached request resolution",
+      source: "app",
+      status: "running",
+      turns: [],
+      updatedAt: now,
+    };
+    const appServer = {
+      onNotification(handler: (notification: unknown) => void) {
+        notificationHandlers.add(handler);
+        return () => notificationHandlers.delete(handler);
+      },
+      onRequest(handler: (request: unknown) => void) {
+        requestHandlers.add(handler);
+        return () => requestHandlers.delete(handler);
+      },
+      readThread: vi.fn<() => Promise<unknown>>(async () => appThread),
+      rejectRequest: vi.fn<() => Promise<void>>(),
+      startThread: vi.fn<() => Promise<unknown>>(async () => appThread),
+    };
+    const app = createApp({
+      appServer: appServer as never,
+      approvalStore,
+      codex: createMockCodex(),
+      workspacePath,
+    });
+
+    await app.request("/v1/threads", {
+      method: "POST",
+      body: JSON.stringify({ title: "Attached request resolution" }),
+      headers: { "content-type": "application/json" },
+    });
+    const streamResponse = await app.request(
+      "/v1/threads/app-thread-attached-request-resolution/runs/stream",
+      {
+        method: "POST",
+        body: JSON.stringify({}),
+        headers: { "content-type": "application/json" },
+      },
+    );
+    for (const handler of requestHandlers) {
+      handler({
+        id: 73,
+        method: "item/tool/requestUserInput",
+        params: {
+          isBlocking: false,
+          questions: [{ id: "scope", question: "What next?" }],
+          threadId: "app-thread-attached-request-resolution",
+          turnId: "turn-attached-request-resolution",
+        },
+      });
+    }
+    await vi.waitFor(async () => {
+      await expect(approvalStore.listPendingApprovals()).resolves.toHaveLength(1);
+    });
+
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "serverRequest/resolved",
+        params: {
+          requestId: 73,
+          threadId: "app-thread-attached-request-resolution",
+        },
+      });
+    }
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "thread/status/changed",
+        params: {
+          status: "idle",
+          threadId: "app-thread-attached-request-resolution",
+        },
+      });
+    }
+
+    await streamResponse.text();
+    await expect(approvalStore.listPendingApprovals()).resolves.toEqual([]);
+  });
+
+  it("persists app-server request resolution notifications on relay-managed turn streams", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const approvalStore = await createRelayStateStore(":memory:");
+    const notificationHandlers = new Set<(notification: unknown) => void>();
+    const requestHandlers = new Set<(request: unknown) => void>();
+    const now = Date.now() / 1000;
+    const appThread = {
+      id: "app-thread-managed-request-resolution",
+      createdAt: now,
+      cwd: workspacePath,
+      modelProvider: "gpt-5.5",
+      name: "Managed request resolution",
+      preview: "Managed request resolution",
+      source: "app",
+      status: "idle",
+      turns: [],
+      updatedAt: now,
+    };
+    const appServer = {
+      onNotification(handler: (notification: unknown) => void) {
+        notificationHandlers.add(handler);
+        return () => notificationHandlers.delete(handler);
+      },
+      onRequest(handler: (request: unknown) => void) {
+        requestHandlers.add(handler);
+        return () => requestHandlers.delete(handler);
+      },
+      readThread: vi.fn<() => Promise<unknown>>(async () => appThread),
+      rejectRequest: vi.fn<() => Promise<void>>(),
+      startThread: vi.fn<() => Promise<unknown>>(async () => appThread),
+      startTurn: vi.fn<() => Promise<unknown>>(async () => ({
+        completedAt: null,
+        id: "turn-managed-request-resolution",
+        items: [],
+        startedAt: now,
+        status: "running",
+      })),
+    };
+    const app = createApp({
+      appServer: appServer as never,
+      approvalStore,
+      codex: createMockCodex(),
+      workspacePath,
+    });
+
+    await app.request("/v1/threads", {
+      method: "POST",
+      body: JSON.stringify({ title: "Managed request resolution" }),
+      headers: { "content-type": "application/json" },
+    });
+    const streamResponse = await app.request(
+      "/v1/threads/app-thread-managed-request-resolution/runs/stream",
+      {
+        method: "POST",
+        body: JSON.stringify({ prompt: "Needs input" }),
+        headers: { "content-type": "application/json" },
+      },
+    );
+    await vi.waitFor(() => expect(appServer.startTurn).toHaveBeenCalledTimes(1));
+    for (const handler of requestHandlers) {
+      handler({
+        id: 74,
+        method: "item/tool/requestUserInput",
+        params: {
+          isBlocking: false,
+          questions: [{ id: "scope", question: "What next?" }],
+          threadId: "app-thread-managed-request-resolution",
+          turnId: "turn-managed-request-resolution",
+        },
+      });
+    }
+    await vi.waitFor(async () => {
+      await expect(approvalStore.listPendingApprovals()).resolves.toHaveLength(1);
+    });
+
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "serverRequest/resolved",
+        params: {
+          requestId: 74,
+          threadId: "app-thread-managed-request-resolution",
+        },
+      });
+    }
+    for (const handler of notificationHandlers) {
+      handler({
+        method: "turn/completed",
+        params: {
+          status: "completed",
+          threadId: "app-thread-managed-request-resolution",
+          turnId: "turn-managed-request-resolution",
+        },
+      });
+    }
+
+    await streamResponse.text();
+    await expect(approvalStore.listPendingApprovals()).resolves.toEqual([]);
+  });
+
   it("rejects an approval from a stale thread owner without resolving the request", async () => {
     const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
     const relayState = await createRelayStateStore(":memory:");
@@ -8831,6 +9125,205 @@ describe("Codex Relay server routes", () => {
     }
     expect(await streamResponse.text()).toContain("thread.state.changed");
     expect(await threadInputs.getActiveTurnClaim("app-thread-queue")).toBeUndefined();
+  });
+
+  it("does not cancel a queued input that became running after queue hydration", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const threadInputs = await createRelayStateStore(":memory:");
+    await threadInputs.createThreadInput({
+      clientId: "mobile-client-a",
+      inputId: "queued-stale-input",
+      payload: {
+        attachments: [],
+        id: "queued-stale-input",
+        prompt: "Run after hydration",
+        runOptions: { prompt: "Run after hydration" },
+        skills: [],
+        workspacePath,
+      },
+      state: "queued",
+      threadId: "app-thread-stale-delete",
+    });
+    const now = Date.now() / 1000;
+    const appServer = {
+      startThread: vi.fn<() => Promise<unknown>>(async () => ({
+        id: "app-thread-stale-delete",
+        createdAt: now,
+        cwd: workspacePath,
+        modelProvider: "gpt-5.5",
+        name: "Stale delete",
+        preview: "Stale delete",
+        source: "app",
+        status: "running",
+        turns: [],
+        updatedAt: now,
+      })),
+    };
+    const app = createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      threadInputs,
+      workspacePath,
+    });
+
+    await app.request("/v1/threads", {
+      method: "POST",
+      body: JSON.stringify({ title: "Stale delete" }),
+      headers: { "content-type": "application/json" },
+    });
+    const queued = await app.request("/v1/threads/app-thread-stale-delete/input");
+    expect(await queued.json()).toMatchObject({
+      inputs: [expect.objectContaining({ id: "queued-stale-input" })],
+      queueLength: 1,
+    });
+    await threadInputs.updateThreadInputState("queued-stale-input", "running");
+
+    const cancellation = await app.request(
+      "/v1/threads/app-thread-stale-delete/input/queued-stale-input",
+      {
+        method: "DELETE",
+      },
+    );
+
+    expect(cancellation.status).toBe(409);
+    await expect(
+      threadInputs.listThreadInputs({ threadId: "app-thread-stale-delete" }),
+    ).resolves.toMatchObject([{ inputId: "queued-stale-input", state: "running" }]);
+    await threadInputs.updateThreadInputState("queued-stale-input", "cancelled");
+    const retry = await app.request(
+      "/v1/threads/app-thread-stale-delete/input/queued-stale-input",
+      { method: "DELETE" },
+    );
+    expect(retry.status).toBe(200);
+    await expect(retry.json()).resolves.toMatchObject({ queueLength: 0 });
+  });
+
+  it("returns the current queue after a cancelled input is retried", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const threadInputs = await createRelayStateStore(":memory:");
+    await threadInputs.createThreadInput({
+      clientId: "mobile-client-a",
+      inputId: "queued-cancel-retry",
+      payload: {
+        attachments: [],
+        id: "queued-cancel-retry",
+        prompt: "Cancel once",
+        runOptions: { prompt: "Cancel once" },
+        skills: [],
+        workspacePath,
+      },
+      state: "queued",
+      threadId: "app-thread-cancel-retry",
+    });
+    const now = Date.now() / 1000;
+    const app = createApp({
+      appServer: {
+        startThread: vi.fn<() => Promise<unknown>>(async () => ({
+          id: "app-thread-cancel-retry",
+          createdAt: now,
+          cwd: workspacePath,
+          modelProvider: "gpt-5.5",
+          name: "Cancel retry",
+          preview: "Cancel retry",
+          source: "app",
+          status: "running",
+          turns: [],
+          updatedAt: now,
+        })),
+      } as never,
+      codex: createMockCodex(),
+      threadInputs,
+      workspacePath,
+    });
+
+    await app.request("/v1/threads", {
+      method: "POST",
+      body: JSON.stringify({ title: "Cancel retry" }),
+      headers: { "content-type": "application/json" },
+    });
+    await app.request("/v1/threads/app-thread-cancel-retry/input");
+
+    const first = await app.request(
+      "/v1/threads/app-thread-cancel-retry/input/queued-cancel-retry",
+      { method: "DELETE" },
+    );
+    const retried = await app.request(
+      "/v1/threads/app-thread-cancel-retry/input/queued-cancel-retry",
+      { method: "DELETE" },
+    );
+
+    expect(first.status).toBe(200);
+    expect(retried.status).toBe(200);
+    await expect(retried.json()).resolves.toMatchObject({ queueLength: 0 });
+    await expect(
+      threadInputs.listThreadInputs({ threadId: "app-thread-cancel-retry" }),
+    ).resolves.toMatchObject([{ inputId: "queued-cancel-retry", state: "cancelled" }]);
+  });
+
+  it("treats a steer retry as successful after the durable input already ran", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const threadInputs = await createRelayStateStore(":memory:");
+    await threadInputs.createThreadInput({
+      clientId: "mobile-client-a",
+      inputId: "queued-steer-retry",
+      payload: {
+        attachments: [],
+        id: "queued-steer-retry",
+        prompt: "Already steered",
+        runOptions: { prompt: "Already steered" },
+        skills: [],
+        workspacePath,
+      },
+      state: "queued",
+      threadId: "app-thread-steer-retry",
+    });
+    await threadInputs.createThreadInput({
+      clientId: "mobile-client-a",
+      inputId: "queued-steer-failed",
+      payload: { prompt: "Dispatch failed" },
+      state: "failed",
+      threadId: "app-thread-steer-retry",
+    });
+    const now = Date.now() / 1000;
+    const app = createApp({
+      appServer: {
+        startThread: vi.fn<() => Promise<unknown>>(async () => ({
+          id: "app-thread-steer-retry",
+          createdAt: now,
+          cwd: workspacePath,
+          modelProvider: "gpt-5.5",
+          name: "Steer retry",
+          preview: "Steer retry",
+          source: "app",
+          status: "idle",
+          turns: [],
+          updatedAt: now,
+        })),
+      } as never,
+      codex: createMockCodex(),
+      threadInputs,
+      workspacePath,
+    });
+
+    await app.request("/v1/threads", {
+      method: "POST",
+      body: JSON.stringify({ title: "Steer retry" }),
+      headers: { "content-type": "application/json" },
+    });
+    await app.request("/v1/threads/app-thread-steer-retry/input");
+    await threadInputs.updateThreadInputState("queued-steer-retry", "completed");
+    const retried = await app.request(
+      "/v1/threads/app-thread-steer-retry/input/queued-steer-retry/steer",
+      { method: "POST" },
+    );
+
+    expect(retried.status).toBe(202);
+    await expect(retried.json()).resolves.toMatchObject({ queueLength: 0 });
+    const failed = await app.request(
+      "/v1/threads/app-thread-steer-retry/input/queued-steer-failed/steer",
+      { method: "POST" },
+    );
+    expect(failed.status).toBe(404);
   });
 
   it("reacquires a thread owner after a stale terminal callback", async () => {

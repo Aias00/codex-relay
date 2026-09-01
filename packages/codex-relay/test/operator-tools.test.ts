@@ -39,14 +39,58 @@ describe("relay operator tools", () => {
         requestId: 1,
         threadId: "thread-1",
       });
+      for (const [index, state] of [
+        "queued",
+        "dispatched",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+      ].entries()) {
+        await store.createThreadInput({
+          clientId: "phone",
+          payload: { prompt: `diagnostics-secret-${state}` },
+          state: state as Parameters<typeof store.createThreadInput>[0]["state"],
+          threadId: `thread-${index + 1}`,
+        });
+      }
+      const unknownInput = await store.createThreadInput({
+        clientId: "phone",
+        payload: { prompt: "diagnostics-secret-unknown" },
+        state: "created",
+        threadId: "thread-unknown",
+      });
+      const database = new DatabaseSync(statePath);
+      try {
+        database
+          .prepare("UPDATE thread_inputs SET state = 'unknown-state' WHERE input_id = ?")
+          .run(unknownInput.input.inputId);
+      } finally {
+        database.close();
+      }
 
-      await expect(inspectRelayState(statePath)).resolves.toMatchObject({
+      const diagnostics = await inspectRelayState(statePath);
+      expect(diagnostics).toMatchObject({
         eventCount: 1,
         exists: true,
         path: statePath,
         pendingApprovalCount: 1,
         schemaVersion: 9,
+        streams: {
+          compactedThreadCount: 0,
+          threadCount: 1,
+        },
+        turnLifecycle: {
+          completed: 1,
+          dispatching: 1,
+          failed: 1,
+          interrupted: 1,
+          queued: 1,
+          running: 1,
+          unknown: 1,
+        },
       });
+      expect(JSON.stringify(diagnostics)).not.toContain("diagnostics-secret");
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

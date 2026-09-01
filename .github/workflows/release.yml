@@ -96,7 +96,7 @@ jobs:
           release_type="$(node -e '
             const status = require(process.argv[1]);
             const release = status.releases.find(({ name }) => name === "@codex-relay/mobile");
-            if (release) process.stdout.write(release.type);
+            if (release?.changesets?.length) process.stdout.write(release.type);
           ' /tmp/changeset-status.json)"
           relay_release_version="$(node -e '
             const status = require(process.argv[1]);

@@ -769,6 +769,43 @@ export const ThreadInputDeliveryStateSchema = z.enum([
   "cancelled",
 ]);
 
+export const TurnLifecyclePhaseSchema = z.enum([
+  "queued",
+  "dispatching",
+  "running",
+  "completed",
+  "failed",
+  "interrupted",
+]);
+
+export type ThreadInputDeliveryState = z.infer<typeof ThreadInputDeliveryStateSchema>;
+export type TurnLifecyclePhase = z.infer<typeof TurnLifecyclePhaseSchema>;
+
+export function normalizeThreadInputDeliveryPhase(
+  state: ThreadInputDeliveryState,
+  claim: { dispatchStarted?: boolean; runtimeTurnStarted?: boolean } = {},
+): TurnLifecyclePhase {
+  switch (state) {
+    case "created":
+    case "persisted":
+    case "accepted":
+    case "queued":
+    case "steered":
+      return "queued";
+    case "dispatched":
+      return "dispatching";
+    case "running":
+      return claim.dispatchStarted && !claim.runtimeTurnStarted ? "dispatching" : "running";
+    case "completed":
+      return "completed";
+    case "failed":
+    case "rejected":
+      return "failed";
+    case "cancelled":
+      return "interrupted";
+  }
+}
+
 export const SubmitThreadInputResponseSchema = z.object({
   acceptedAs: z.enum(["steering", "queued"]),
   clientEventId: z.string().uuid().optional(),

@@ -15,3 +15,12 @@ minimumReleaseAge: 0
 
 overrides:
   "@libsql/isomorphic-ws>ws": 8.21.0
+  "metro>@babel/core": 7.29.7
+  "query-string>decode-uri-component": 0.5.0
+  "xcode>uuid": 11.1.1
+  "form-data@4.0.5": 4.0.6
+  "hono@4.12.9": 4.13.5
+  "js-yaml@4.1.1": 4.3.1
+  "nanoid@3.3.12": 3.3.18
+  "shell-quote@1.8.3": 1.10.0
+  "ws@7.5.10": 7.5.11

@@ -5,6 +5,7 @@ import { bytesToUtf8, randomBytes, utf8ToBytes } from "@noble/ciphers/utils.js";
 import { ed25519, x25519 } from "@noble/curves/ed25519.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
+import * as SecureStore from "expo-secure-store";
 import {
   EncryptedPayloadSchema,
   PairEncryptedPayloadSchema,
@@ -22,6 +23,14 @@ const mobileToServerKeyStorageKey = "mobile-to-server-key";
 const serverToMobileKeyStorageKey = "server-to-mobile-key";
 const nextMobileCounterStorageKey = "next-mobile-counter";
 const lastServerCounterStorageKey = "last-server-counter";
+const serverCounterFloorStorageKey = "server-counter-floor";
+const seenServerCountersStorageKey = "seen-server-counters";
+const secureSessionKeyMaterialStorageKey = "codex-relay.secure-session-key-material";
+const replayWindowSize = 1024;
+let secureSessionKeyMaterial: SecureSessionKeyMaterial | undefined;
+let secureSessionKeyMaterialHydration: Promise<void> | undefined;
+let secureSessionKeyMaterialGeneration = 0;
+let secureStoreMutationQueue = Promise.resolve();
 
 export type SecurePairingAttempt = {
   approvalCode?: string;
@@ -37,8 +46,15 @@ type SecureSession = {
   lastServerCounter: number;
   mobileToServerKey: Uint8Array;
   nextMobileCounter: number;
+  seenServerCounters: number[];
+  serverCounterFloor: number;
   serverToMobileKey: Uint8Array;
 };
+
+type SecureSessionKeyMaterial = Pick<
+  SecureSession,
+  "keyEpoch" | "mobileToServerKey" | "serverToMobileKey"
+>;
 
 export function createSecurePairingAttempt(input: {
   serverPublicKey: string;
@@ -58,7 +74,7 @@ export function attachApprovalCode(attempt: SecurePairingAttempt, approvalCode: 
   attempt.approvalCode = approvalCode;
 }
 
-export function completeSecurePairing(attempt: SecurePairingAttempt, response: PairResponse) {
+export async function completeSecurePairing(attempt: SecurePairingAttempt, response: PairResponse) {
   if (!response.secure) {
     throw new Error("Server did not return a secure pairing response.");
   }
@@ -95,8 +111,22 @@ export function completeSecurePairing(attempt: SecurePairingAttempt, response: P
     response.secure.encryptedPayload,
   );
   const payload = PairEncryptedPayloadSchema.parse(JSON.parse(decrypted));
+  await saveSecureSessionKeyMaterial(session);
   saveSecureSession(session);
   return payload;
+}
+
+export function initializeSecureTransportStorage() {
+  if (!secureSessionKeyMaterialHydration) {
+    const pending = hydrateSecureSessionKeyMaterial();
+    secureSessionKeyMaterialHydration = pending;
+    void pending.catch(() => {
+      if (secureSessionKeyMaterialHydration === pending) {
+        secureSessionKeyMaterialHydration = undefined;
+      }
+    });
+  }
+  return secureSessionKeyMaterialHydration;
 }
 
 export function encryptRequestPayload(payload: unknown) {
@@ -126,7 +156,9 @@ export function decryptResponsePayload(payload: unknown) {
   if (
     envelope.data.sender !== "server" ||
     envelope.data.keyEpoch !== session.keyEpoch ||
-    envelope.data.counter <= session.lastServerCounter
+    !Number.isSafeInteger(envelope.data.counter) ||
+    envelope.data.counter < session.serverCounterFloor ||
+    session.seenServerCounters.includes(envelope.data.counter)
   ) {
     throw new Error("Server returned an invalid encrypted payload.");
   }
@@ -137,13 +169,27 @@ export function decryptResponsePayload(payload: unknown) {
     envelope.data.counter,
     envelope.data.ciphertext,
   );
-  session.lastServerCounter = envelope.data.counter;
+  session.lastServerCounter = Math.max(session.lastServerCounter, envelope.data.counter);
+  session.seenServerCounters.push(envelope.data.counter);
+  session.serverCounterFloor = Math.max(
+    session.serverCounterFloor,
+    session.lastServerCounter - replayWindowSize + 1,
+  );
+  session.seenServerCounters = session.seenServerCounters.filter(
+    (counter) => counter >= session.serverCounterFloor,
+  );
   saveSecureSession(session);
   return JSON.parse(decrypted);
 }
 
 export function clearSecureSession() {
+  secureSessionKeyMaterialGeneration += 1;
+  secureSessionKeyMaterial = undefined;
+  secureSessionKeyMaterialHydration = undefined;
   storage.clearAll();
+  return enqueueSecureStoreMutation(() =>
+    SecureStore.deleteItemAsync(secureSessionKeyMaterialStorageKey),
+  );
 }
 
 function deriveSession(
@@ -164,6 +210,8 @@ function deriveSession(
       32,
     ),
     nextMobileCounter: 0,
+    seenServerCounters: [],
+    serverCounterFloor: 1,
     serverToMobileKey: hkdf(
       sha256,
       sharedSecret,
@@ -234,28 +282,137 @@ function nonceFor(sender: "mobile" | "server", counter: number) {
 }
 
 function saveSecureSession(session: SecureSession) {
-  storage.set(keyEpochStorageKey, session.keyEpoch);
-  storage.set(mobileToServerKeyStorageKey, bytesToBase64(session.mobileToServerKey));
-  storage.set(serverToMobileKeyStorageKey, bytesToBase64(session.serverToMobileKey));
   storage.set(nextMobileCounterStorageKey, session.nextMobileCounter);
   storage.set(lastServerCounterStorageKey, session.lastServerCounter);
+  storage.set(serverCounterFloorStorageKey, session.serverCounterFloor);
+  storage.set(seenServerCountersStorageKey, JSON.stringify(session.seenServerCounters));
 }
 
 function readSecureSession() {
-  const mobileToServerKey = storage.getString(mobileToServerKeyStorageKey);
-  const serverToMobileKey = storage.getString(serverToMobileKeyStorageKey);
-  const keyEpoch = storage.getNumber(keyEpochStorageKey);
-  if (!mobileToServerKey || !serverToMobileKey || keyEpoch === undefined) {
+  if (!secureSessionKeyMaterial) {
     return undefined;
   }
 
+  const lastServerCounter = storage.getNumber(lastServerCounterStorageKey) ?? 0;
+  const storedSeenServerCounters = storage.getString(seenServerCountersStorageKey);
   return {
-    keyEpoch,
-    lastServerCounter: storage.getNumber(lastServerCounterStorageKey) ?? 0,
-    mobileToServerKey: base64ToBytes(mobileToServerKey),
+    keyEpoch: secureSessionKeyMaterial.keyEpoch,
+    lastServerCounter,
+    mobileToServerKey: secureSessionKeyMaterial.mobileToServerKey,
     nextMobileCounter: storage.getNumber(nextMobileCounterStorageKey) ?? 0,
-    serverToMobileKey: base64ToBytes(serverToMobileKey),
+    seenServerCounters: parseStoredCounters(storedSeenServerCounters),
+    serverCounterFloor: storage.getNumber(serverCounterFloorStorageKey) ?? lastServerCounter + 1,
+    serverToMobileKey: secureSessionKeyMaterial.serverToMobileKey,
   };
+}
+
+async function hydrateSecureSessionKeyMaterial() {
+  const generation = secureSessionKeyMaterialGeneration;
+  await secureStoreMutationQueue.catch(() => undefined);
+  const stored = await SecureStore.getItemAsync(secureSessionKeyMaterialStorageKey);
+  const secure = parseSecureSessionKeyMaterial(stored);
+  if (secure) {
+    if (generation === secureSessionKeyMaterialGeneration) {
+      secureSessionKeyMaterial = secure;
+    }
+    removeLegacyKeyMaterial();
+    return;
+  }
+
+  if (generation !== secureSessionKeyMaterialGeneration) {
+    return;
+  }
+
+  const legacy = legacySecureSessionKeyMaterial();
+  if (!legacy) {
+    return;
+  }
+  await saveSecureSessionKeyMaterial(legacy);
+  removeLegacyKeyMaterial();
+}
+
+async function saveSecureSessionKeyMaterial(session: SecureSessionKeyMaterial) {
+  const generation = secureSessionKeyMaterialGeneration;
+  const serialized = JSON.stringify({
+    keyEpoch: session.keyEpoch,
+    mobileToServerKey: bytesToBase64(session.mobileToServerKey),
+    serverToMobileKey: bytesToBase64(session.serverToMobileKey),
+  });
+  await enqueueSecureStoreMutation(() =>
+    SecureStore.setItemAsync(secureSessionKeyMaterialStorageKey, serialized, {
+      keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+    }),
+  );
+  if (generation !== secureSessionKeyMaterialGeneration) {
+    return;
+  }
+  secureSessionKeyMaterial = {
+    keyEpoch: session.keyEpoch,
+    mobileToServerKey: session.mobileToServerKey.slice(),
+    serverToMobileKey: session.serverToMobileKey.slice(),
+  };
+}
+
+function enqueueSecureStoreMutation(operation: () => Promise<void>) {
+  const result = secureStoreMutationQueue.catch(() => undefined).then(operation);
+  secureStoreMutationQueue = result.catch(() => undefined);
+  return result;
+}
+
+function parseSecureSessionKeyMaterial(value: string | null) {
+  if (!value) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    if (
+      !Number.isSafeInteger(parsed.keyEpoch) ||
+      typeof parsed.mobileToServerKey !== "string" ||
+      typeof parsed.serverToMobileKey !== "string"
+    ) {
+      return undefined;
+    }
+    return {
+      keyEpoch: parsed.keyEpoch as number,
+      mobileToServerKey: base64ToBytes(parsed.mobileToServerKey),
+      serverToMobileKey: base64ToBytes(parsed.serverToMobileKey),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function legacySecureSessionKeyMaterial() {
+  const keyEpoch = storage.getNumber(keyEpochStorageKey);
+  const mobileToServerKey = storage.getString(mobileToServerKeyStorageKey);
+  const serverToMobileKey = storage.getString(serverToMobileKeyStorageKey);
+  return keyEpoch !== undefined && mobileToServerKey && serverToMobileKey
+    ? {
+        keyEpoch,
+        mobileToServerKey: base64ToBytes(mobileToServerKey),
+        serverToMobileKey: base64ToBytes(serverToMobileKey),
+      }
+    : undefined;
+}
+
+function removeLegacyKeyMaterial() {
+  storage.remove(keyEpochStorageKey);
+  storage.remove(mobileToServerKeyStorageKey);
+  storage.remove(serverToMobileKeyStorageKey);
+}
+
+function parseStoredCounters(value: string | undefined) {
+  if (!value) {
+    return [];
+  }
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.filter((counter): counter is number => Number.isSafeInteger(counter) && counter >= 0)
+      : [];
+  } catch {
+    return [];
+  }
 }
 
 function bytesToBase64(bytes: Uint8Array) {

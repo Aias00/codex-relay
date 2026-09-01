@@ -3,8 +3,12 @@ export const serverStateRootKey = "codex-relay-server-state";
 const persistableServerStateScopes = new Set(["models", "status", "threads"]);
 const persistableThreadStateScopes = new Set(["detail", "event-cursor"]);
 
-export function isAppHydrationReady(input: { fontsLoaded: boolean; queryCacheRestored: boolean }) {
-  return input.fontsLoaded && input.queryCacheRestored;
+export function isAppHydrationReady(input: {
+  fontsLoaded: boolean;
+  queryCacheRestored: boolean;
+  secureStateRestored: boolean;
+}) {
+  return input.fontsLoaded && input.queryCacheRestored && input.secureStateRestored;
 }
 
 export function isPersistableServerStateQueryKey(queryKey: readonly unknown[]) {

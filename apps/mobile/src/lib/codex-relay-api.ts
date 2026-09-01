@@ -148,12 +148,17 @@ import {
 } from "./codex-relay-server-url-storage";
 import { workspaceSelectionQuery } from "./server-state-workspace-cache";
 import { recordMobileTransportBenchmark } from "./transport-benchmark";
+import {
+  clearCodexRelayClientToken,
+  getCodexRelayClientToken,
+  saveCodexRelayClientToken,
+} from "./secure-credentials";
+import { clearInputDeliveryOutbox } from "./input-delivery-outbox";
 
 const skillsPath = "/v1/skills";
 const skillsRequestTimeoutMs = 8000;
 const clientSessionIdStorageKey = "codex-relay.client-session-id";
 const legacyClientTokenExpiresAtStorageKey = "codex-relay.client-token-expires-at";
-const clientTokenStorageKey = "codex-relay.client-token";
 const pairingConnectTimeoutMs = 2500;
 const fullThreadRefreshTimeoutMs = 45_000;
 const mobileThreadDetailMessageLimit = 100;
@@ -238,7 +243,7 @@ export function codexRelayImageRequestHeaders() {
     accept: "image/*",
     "x-codex-relay-client-session-id": getClientSessionId(),
   };
-  const clientToken = storage.getString(clientTokenStorageKey);
+  const clientToken = getCodexRelayClientToken();
   if (clientToken) {
     headers.authorization = `Bearer ${clientToken}`;
   }
@@ -246,7 +251,8 @@ export function codexRelayImageRequestHeaders() {
 }
 
 export function signOutCodexRelaySession() {
-  storage.remove(clientTokenStorageKey);
+  void clearCodexRelayClientToken();
+  void clearInputDeliveryOutbox();
   storage.remove(legacyClientTokenExpiresAtStorageKey);
   clearSecureSession();
   clearCodexRelayConnectionPlanState();
@@ -258,7 +264,7 @@ export function signOutCodexRelaySession() {
 }
 
 export function hasCodexRelaySession() {
-  return Boolean(storage.getString(clientTokenStorageKey));
+  return Boolean(getCodexRelayClientToken());
 }
 
 export async function pairWithQrPayload(
@@ -347,8 +353,8 @@ async function pairWithApproval(
     [normalizedServerUrl, ...serverUrls],
     parsed.approvalCode,
   );
-  const session = completeSecurePairing(securePairing, approved.response);
-  saveSession(approved.serverUrl, session.clientToken);
+  const session = await completeSecurePairing(securePairing, approved.response);
+  await saveSession(approved.serverUrl, session.clientToken);
   await startPairingTrialIfNeeded();
   return { approvalCode: parsed.approvalCode, serverUrl: approved.serverUrl };
 }
@@ -498,7 +504,7 @@ export async function refreshSession() {
 }
 
 async function refreshCodexRelayConnectionPlan(options: { force?: boolean } = {}) {
-  if (connectionPlanUnavailableForCurrentSession || !storage.getString(clientTokenStorageKey)) {
+  if (connectionPlanUnavailableForCurrentSession || !getCodexRelayClientToken()) {
     return false;
   }
   if (!options.force && connectionPlanPreparedForCurrentSession) {
@@ -513,7 +519,7 @@ async function refreshCodexRelayConnectionPlan(options: { force?: boolean } = {}
     return refreshed;
   }
 
-  const clientToken = storage.getString(clientTokenStorageKey);
+  const clientToken = getCodexRelayClientToken();
   const request = (async () => {
     const bootstrapUrls = getCodexRelayServerUrlCandidates().map(({ url }) => url);
     const tailcatCapability = tailcatConnectionPlanCapability();
@@ -535,7 +541,7 @@ async function refreshCodexRelayConnectionPlan(options: { force?: boolean } = {}
     });
     if (
       generation !== connectionPlanSessionGeneration ||
-      clientToken !== storage.getString(clientTokenStorageKey)
+      clientToken !== getCodexRelayClientToken()
     ) {
       if (resolution.status === "resolved" && "transport" in resolution.sourceCandidate) {
         await stopMaterializedTailcatTransport();
@@ -1734,7 +1740,7 @@ function requestHeaders(
     headers.set(key, value);
   }
 
-  const clientToken = storage.getString(clientTokenStorageKey);
+  const clientToken = getCodexRelayClientToken();
   if (clientToken && !headers.has("authorization")) {
     headers.set("authorization", `Bearer ${clientToken}`);
   }
@@ -1745,14 +1751,14 @@ function requestHeaders(
   return headers;
 }
 
-function saveSession(serverUrl: string, clientToken: string) {
+async function saveSession(serverUrl: string, clientToken: string) {
   clearStoredConnectionPlan();
   connectionPlanUnavailableForCurrentSession = false;
   connectionPlanPreparedForCurrentSession = false;
   connectionPlanSessionGeneration += 1;
   void stopMaterializedTailcatTransport();
   setCodexRelayServerUrl(serverUrl);
-  storage.set(clientTokenStorageKey, clientToken);
+  await saveCodexRelayClientToken(clientToken);
   storage.remove(legacyClientTokenExpiresAtStorageKey);
 }
 
@@ -1783,7 +1789,7 @@ function createUuidV4() {
 }
 
 function authorizationHeader() {
-  const clientToken = storage.getString(clientTokenStorageKey);
+  const clientToken = getCodexRelayClientToken();
   return clientToken ? { authorization: `Bearer ${clientToken}` } : {};
 }
 

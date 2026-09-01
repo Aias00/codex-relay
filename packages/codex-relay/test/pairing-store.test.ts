@@ -201,6 +201,40 @@ describe("pairing session store", () => {
     });
   });
 
+  it("rolls back same-device session replacement when the replacement token already exists", async () => {
+    const sessions = await createTursoPairingSessionStore(":memory:");
+    const expiresAt = Date.now() + 60_000;
+    await sessions.createSession("phone-token", {
+      clientName: "Phone",
+      clientSessionId: "phone-session",
+      expiresAt,
+    });
+    await sessions.createSession("existing-token", {
+      clientName: "Other",
+      clientSessionId: "other-session",
+      expiresAt,
+    });
+
+    await expect(
+      sessions.createSession("existing-token", {
+        clientName: "Phone replacement",
+        clientSessionId: "phone-session",
+        expiresAt,
+      }),
+    ).rejects.toThrow(/UNIQUE constraint failed/);
+
+    expect(await sessions.getValidSession("phone-token")).toMatchObject({
+      clientName: "Phone",
+      clientSessionId: "phone-session",
+      expiresAt,
+    });
+    expect(await sessions.getValidSession("existing-token")).toMatchObject({
+      clientName: "Other",
+      clientSessionId: "other-session",
+      expiresAt,
+    });
+  });
+
   it("keeps concurrent writes outside a rolled-back in-memory transaction", async () => {
     const database = connect(":memory:");
     await database.exec("CREATE TABLE values_table (value TEXT PRIMARY KEY)");
@@ -357,6 +391,28 @@ describe("pairing session store", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
+  });
+
+  it("durably reserves server counters before returning the in-memory range", async () => {
+    const sessions = await createTursoPairingSessionStore(":memory:");
+    await sessions.createSession("reserved-token", {
+      secureSession: {
+        keyEpoch: 1,
+        lastMobileCounter: -1,
+        mobileToServerKey: Uint8Array.from([1, 2, 3]),
+        nextServerCounter: 7,
+        serverToMobileKey: Uint8Array.from([4, 5, 6]),
+      },
+    });
+
+    const reserved = await sessions.reserveServerCounterRange("reserved-token", 100);
+    const durable = await sessions.getValidSession("reserved-token");
+
+    expect(reserved).toMatchObject({
+      nextServerCounter: 7,
+      serverCounterLimit: 107,
+    });
+    expect(durable?.secureSession?.nextServerCounter).toBe(107);
   });
 
   it("reads a live WAL database from a path containing URL-reserved characters", async () => {
