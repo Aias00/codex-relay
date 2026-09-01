@@ -1,4 +1,4 @@
-import type { WebPreviewTarget } from "codex-relay/api-schema";
+import type { WebPreviewTarget } from "@aias00/codex-relay/api-schema";
 import { useSelector } from "@legendapp/state/react";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, TextInput, View } from "react-native";

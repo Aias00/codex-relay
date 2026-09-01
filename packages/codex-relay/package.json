@@ -1,11 +1,11 @@
 {
-  "name": "codex-relay",
+  "name": "@aias00/codex-relay",
   "version": "1.5.0",
   "description": "Local Codex Relay CLI bridge for the Codex Relay mobile app.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/gronxb/codex-relay.git",
+    "url": "git+https://github.com/Aias00/codex-relay.git",
     "directory": "packages/codex-relay"
   },
   "bin": {

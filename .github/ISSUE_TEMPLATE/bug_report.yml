@@ -48,7 +48,7 @@ body:
     attributes:
       label: Steps to reproduce
       placeholder: |
-        1. Run `npx codex-relay@latest`
+        1. Run `npx @aias00/codex-relay@latest`
         2. Scan the QR code
         3. Tap ...
     validations:

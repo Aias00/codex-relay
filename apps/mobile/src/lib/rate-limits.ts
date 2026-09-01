@@ -1,4 +1,4 @@
-import type { RateLimitBucket, RateLimitWindow } from "codex-relay/api-schema";
+import type { RateLimitBucket, RateLimitWindow } from "@aias00/codex-relay/api-schema";
 
 export type RateLimitDisplayRow = {
   id: string;

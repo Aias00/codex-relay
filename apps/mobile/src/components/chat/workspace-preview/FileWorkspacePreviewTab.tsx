@@ -1,4 +1,4 @@
-import type { ListWorkspaceFilesResponse } from "codex-relay/api-schema";
+import type { ListWorkspaceFilesResponse } from "@aias00/codex-relay/api-schema";
 import { router } from "expo-router";
 import { LegendList, type LegendListRenderItemProps } from "@legendapp/list/react-native";
 import { useQuery } from "@tanstack/react-query";

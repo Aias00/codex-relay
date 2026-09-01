@@ -18,14 +18,14 @@ import type {
   WebPreviewTarget,
   WorkspaceChangesResponse,
   WorkspacePreviewNavigationRequest,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 import {
   WORKSPACE_PREVIEW_OPEN_PROTOCOL,
   WorkspacePreviewNavigationRequestSchema,
   promptMarkdownWithSkills,
   promptSkillDisplayName,
   promptSkillMentionTextCandidates,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 import {
   CameraView,
   useCameraPermissions,
@@ -3583,7 +3583,7 @@ function scannerPairingFailureMessage(error: unknown) {
 }
 
 const invalidPairingQrAlertMessage =
-  "Run npx codex-relay@latest on your computer, then scan the QR shown there.";
+  "Run npx @aias00/codex-relay@latest on your computer, then scan the QR shown there.";
 
 const pairingFailureAlertMessage =
   "Use the same Wi-Fi on your phone and computer. If that is not possible, turn on Tailscale on both devices and scan again.";

@@ -18,7 +18,7 @@ import type {
   UpdateThreadGoalRequest,
   VersionResponse,
   WorkspaceSelectionRequest,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
 
 import {

@@ -1,4 +1,7 @@
-import { WORKSPACE_PREVIEW_TAB_VALUES, type WorkspacePreviewTab } from "codex-relay/api-schema";
+import {
+  WORKSPACE_PREVIEW_TAB_VALUES,
+  type WorkspacePreviewTab,
+} from "@aias00/codex-relay/api-schema";
 import { observable } from "@legendapp/state";
 
 import { persistLocalObservable } from "./persistence";

@@ -54,7 +54,7 @@ jobs:
             previous_version="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).version)' "$previous_package")"
           fi
 
-          published_version="$(npm view codex-relay version 2>/dev/null || true)"
+          published_version="$(npm view @aias00/codex-relay version 2>/dev/null || true)"
 
           publish=false
           if [[ "$published_version" != "$current_version" ]]; then
@@ -104,7 +104,7 @@ jobs:
           ' /tmp/changeset-status.json)"
           relay_release_version="$(node -e '
             const status = require(process.argv[1]);
-            const release = status.releases.find(({ name }) => name === "codex-relay");
+            const release = status.releases.find(({ name }) => name === "@aias00/codex-relay");
             if (release) process.stdout.write(release.newVersion);
           ' /tmp/changeset-status.json)"
           echo "relay-package-version=$relay_release_version" >> "$GITHUB_OUTPUT"
@@ -190,7 +190,7 @@ jobs:
           git switch --create changeset-release/npm-main "$GITHUB_SHA"
           pnpm version-packages:npm
           git add .changeset packages/codex-relay
-          git commit -m "chore: release codex-relay"
+          git commit -m "chore: release @aias00/codex-relay"
           git push --force-with-lease origin HEAD:refs/heads/changeset-release/npm-main
 
       - name: Update mobile release branch
@@ -217,11 +217,11 @@ jobs:
             if (process.env.RELAY_RELEASE_VERSION) {
               releases.push({
                 branch: "changeset-release/npm-main",
-                title: `chore: release codex-relay@${process.env.RELAY_RELEASE_VERSION}`,
+                title: `chore: release @aias00/codex-relay@${process.env.RELAY_RELEASE_VERSION}`,
                 body: [
                   "## npm package release",
                   "",
-                  `- Package: \`codex-relay@${process.env.RELAY_RELEASE_VERSION}\``,
+                  `- Package: \`@aias00/codex-relay@${process.env.RELAY_RELEASE_VERSION}\``,
                   "- Deployment: npm publish after merge",
                 ].join("\n"),
               });
@@ -269,5 +269,5 @@ jobs:
       - name: Report npm publish failure
         if: always() && steps.npm-publish.outcome == 'failure'
         run: |
-          echo "::error::codex-relay@${{ steps.npm-release.outputs.current-version }} was not published. Configure NPM_TOKEN or npm Trusted Publishing for this repository."
+          echo "::error::@aias00/codex-relay@${{ steps.npm-release.outputs.current-version }} was not published. Configure NPM_TOKEN or npm Trusted Publishing for this repository."
           exit 1

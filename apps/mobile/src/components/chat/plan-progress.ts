@@ -1,4 +1,4 @@
-import type { ChatMessage } from "codex-relay/api-schema";
+import type { ChatMessage } from "@aias00/codex-relay/api-schema";
 
 export type TimelinePlanProgressStepStatus = "completed" | "inProgress" | "pending";
 

@@ -12,7 +12,7 @@ import type {
   StreamThreadRunEvent,
   ThreadCollaborationMode,
   ThreadSummary,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 
 import {
   cacheChatNavigation,

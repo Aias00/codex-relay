@@ -1,4 +1,4 @@
-import type { PushNotificationData } from "codex-relay/api-schema";
+import type { PushNotificationData } from "@aias00/codex-relay/api-schema";
 
 export type PushNotificationTarget = PushNotificationData;
 

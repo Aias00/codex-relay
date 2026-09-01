@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { nextMobileShipVersion } from "./mobile-release-version.mjs";
 
 const mobilePackageName = "@codex-relay/mobile";
+const relayPackageName = "@aias00/codex-relay";
 const workspaceRoot = fileURLToPath(new URL("..", import.meta.url));
 const mobileRoot = resolve(workspaceRoot, "apps/mobile");
 const mobilePackagePath = resolve(workspaceRoot, "apps/mobile/package.json");
@@ -18,7 +19,7 @@ const iosProjectPath = resolve(
 const changesetDirectory = resolve(workspaceRoot, ".changeset");
 const ignoredPackagesByTarget = {
   npm: [mobilePackageName, "react-native-direct-fetch"],
-  mobile: ["codex-relay", "react-native-direct-fetch"],
+  mobile: [relayPackageName, "react-native-direct-fetch"],
 };
 
 function main() {

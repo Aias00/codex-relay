@@ -1,4 +1,4 @@
-import type { RuntimeMode } from "codex-relay/api-schema";
+import type { RuntimeMode } from "@aias00/codex-relay/api-schema";
 
 import { AppBottomSheet, SheetActionRow, SheetSelectedDot } from "@/components/ui/bottom-sheet";
 import type { AppIconName } from "@/components/ui/icon";

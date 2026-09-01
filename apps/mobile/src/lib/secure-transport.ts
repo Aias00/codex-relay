@@ -11,7 +11,7 @@ import {
   PairEncryptedPayloadSchema,
   type EncryptedPayload,
   type PairResponse,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 import { fromByteArray, toByteArray } from "base64-js";
 import { createMMKV } from "react-native-mmkv";
 

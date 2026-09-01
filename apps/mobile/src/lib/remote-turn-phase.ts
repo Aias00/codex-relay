@@ -3,7 +3,7 @@ import {
   type ThreadInputDeliveryState,
   type ThreadSummary,
   type TurnLifecyclePhase,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 
 export type RemoteTurnPhase = "idle" | "reconnecting" | TurnLifecyclePhase;
 

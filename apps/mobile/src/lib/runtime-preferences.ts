@@ -1,4 +1,4 @@
-import type { RuntimePreferences } from "codex-relay/api-schema";
+import type { RuntimePreferences } from "@aias00/codex-relay/api-schema";
 
 export function runtimePreferencesForWorkspace(
   pending: RuntimePreferences | undefined,

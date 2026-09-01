@@ -3,7 +3,7 @@ import {
   type TransportBenchmarkRoute,
   type TransportBenchmarkSample,
   type TransportBenchmarkScenario,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 
 import { codexRelayStorage as storage } from "./codex-relay-server-url-storage";
 import mobilePackage from "../../package.json";

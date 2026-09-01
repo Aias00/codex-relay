@@ -64,7 +64,7 @@ describe("mobile pinned thread store", () => {
 Run:
 
 ```bash
-corepack pnpm --filter codex-relay exec vitest run test/mobile-pinned-thread-store.test.ts
+corepack pnpm --filter @aias00/codex-relay exec vitest run test/mobile-pinned-thread-store.test.ts
 ```
 
 Expected: FAIL because `pinned-thread-store.ts` does not exist.
@@ -115,7 +115,7 @@ function createDefaultPinnedThreadState(): PinnedThreadState {
 Run:
 
 ```bash
-corepack pnpm --filter codex-relay exec vitest run test/mobile-pinned-thread-store.test.ts
+corepack pnpm --filter @aias00/codex-relay exec vitest run test/mobile-pinned-thread-store.test.ts
 ```
 
 Expected: 3 tests pass with no warnings.
@@ -236,7 +236,7 @@ function thread(id: string): ThreadSummary {
 Run:
 
 ```bash
-corepack pnpm --filter codex-relay exec vitest run test/mobile-thread-drawer-rows.test.ts
+corepack pnpm --filter @aias00/codex-relay exec vitest run test/mobile-thread-drawer-rows.test.ts
 ```
 
 Expected: FAIL because `thread-drawer-rows.ts` does not exist.
@@ -244,7 +244,7 @@ Expected: FAIL because `thread-drawer-rows.ts` does not exist.
 - [ ] **Step 3: Implement the pure row builder**
 
 ```ts
-import type { ThreadSummary } from "codex-relay/api-schema";
+import type { ThreadSummary } from "@aias00/codex-relay/api-schema";
 
 import { workspaceName } from "@/lib/workspace-name";
 
@@ -369,7 +369,7 @@ function projectDetails(thread: ThreadSummary) {
 Run:
 
 ```bash
-corepack pnpm --filter codex-relay exec vitest run test/mobile-thread-drawer-rows.test.ts
+corepack pnpm --filter @aias00/codex-relay exec vitest run test/mobile-thread-drawer-rows.test.ts
 ```
 
 Expected: 6 tests pass.
@@ -403,7 +403,7 @@ const rows = useMemo(
 Run:
 
 ```bash
-corepack pnpm --filter codex-relay exec vitest run test/mobile-thread-drawer-rows.test.ts
+corepack pnpm --filter @aias00/codex-relay exec vitest run test/mobile-thread-drawer-rows.test.ts
 corepack pnpm -r typecheck
 ```
 
@@ -444,7 +444,7 @@ it("toggles a thread pin", () => {
 Run:
 
 ```bash
-corepack pnpm --filter codex-relay exec vitest run test/mobile-pinned-thread-store.test.ts
+corepack pnpm --filter @aias00/codex-relay exec vitest run test/mobile-pinned-thread-store.test.ts
 ```
 
 Expected: FAIL because `togglePinnedThread` is not exported.
@@ -466,7 +466,7 @@ export function togglePinnedThread(threadId: string) {
 Run:
 
 ```bash
-corepack pnpm --filter codex-relay exec vitest run test/mobile-pinned-thread-store.test.ts
+corepack pnpm --filter @aias00/codex-relay exec vitest run test/mobile-pinned-thread-store.test.ts
 ```
 
 Expected: 4 tests pass.
@@ -612,7 +612,7 @@ Run:
 
 ```bash
 corepack pnpm exec oxfmt apps/mobile/src/state/pinned-thread-store.ts apps/mobile/src/components/ui/icon.tsx apps/mobile/src/components/chat/thread-drawer-rows.ts apps/mobile/src/components/chat/ThreadDrawerContent.tsx packages/codex-relay/test/mobile-pinned-thread-store.test.ts packages/codex-relay/test/mobile-thread-drawer-rows.test.ts --write
-corepack pnpm --filter codex-relay exec vitest run test/mobile-pinned-thread-store.test.ts test/mobile-thread-drawer-rows.test.ts
+corepack pnpm --filter @aias00/codex-relay exec vitest run test/mobile-pinned-thread-store.test.ts test/mobile-thread-drawer-rows.test.ts
 corepack pnpm -r typecheck
 ```
 
@@ -634,7 +634,7 @@ git commit -m "feat: add pinned chat actions"
 - [ ] **Step 1: Build the package required by mobile-importing server tests**
 
 ```bash
-corepack pnpm --filter codex-relay build
+corepack pnpm --filter @aias00/codex-relay build
 ```
 
 Expected: `dist/api-schema.js` and the remaining package artifacts build successfully.
@@ -642,7 +642,7 @@ Expected: `dist/api-schema.js` and the remaining package artifacts build success
 - [ ] **Step 2: Run the complete server test suite**
 
 ```bash
-corepack pnpm --filter codex-relay test
+corepack pnpm --filter @aias00/codex-relay test
 ```
 
 Expected: all non-live tests pass, with only the repository's expected live-test skips.
@@ -714,7 +714,7 @@ it("adds workspace labels only to pinned section rows", () => {
 Run:
 
 ```bash
-corepack pnpm --filter codex-relay exec vitest run test/mobile-thread-drawer-rows.test.ts
+corepack pnpm --filter @aias00/codex-relay exec vitest run test/mobile-thread-drawer-rows.test.ts
 ```
 
 Expected: FAIL because pinned thread rows do not yet contain `workspaceTitle`.
@@ -786,7 +786,7 @@ previous.item.workspaceTitle === next.item.workspaceTitle &&
 Run:
 
 ```bash
-corepack pnpm --filter codex-relay exec vitest run test/mobile-thread-drawer-rows.test.ts
+corepack pnpm --filter @aias00/codex-relay exec vitest run test/mobile-thread-drawer-rows.test.ts
 corepack pnpm exec oxfmt apps/mobile/src/components/chat/thread-drawer-rows.ts apps/mobile/src/components/chat/ThreadDrawerContent.tsx packages/codex-relay/test/mobile-thread-drawer-rows.test.ts --write
 corepack pnpm -r typecheck
 ```

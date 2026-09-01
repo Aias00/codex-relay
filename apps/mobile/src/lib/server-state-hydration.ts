@@ -1,4 +1,4 @@
-import type { ListThreadsResponse } from "codex-relay/api-schema";
+import type { ListThreadsResponse } from "@aias00/codex-relay/api-schema";
 import type { QueryClient } from "@tanstack/react-query";
 
 import { promoteLegacyRelayServerState, serverStateKeys } from "@/lib/server-state";

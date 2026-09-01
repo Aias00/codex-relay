@@ -1,4 +1,4 @@
-import type { WorkspaceChangesResponse } from "codex-relay/api-schema";
+import type { WorkspaceChangesResponse } from "@aias00/codex-relay/api-schema";
 import { memo, useMemo, useState } from "react";
 import {
   ActivityIndicator,

@@ -2,7 +2,7 @@ import {
   RuntimePreferencesSchema,
   type RuntimePreferences,
   type StatusResponse,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 import { createMMKV } from "react-native-mmkv";
 
 import {

@@ -1,4 +1,4 @@
-export const relayStartCommand = "npx codex-relay@latest";
+export const relayStartCommand = "npx @aias00/codex-relay@latest";
 
 export function approvalCommand(approvalCode: string, serverUrl?: string) {
   const port = approvalPort(serverUrl);

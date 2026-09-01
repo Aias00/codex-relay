@@ -1,4 +1,4 @@
-import type { WebPreviewTarget, WorkspaceChangesResponse } from "codex-relay/api-schema";
+import type { WebPreviewTarget, WorkspaceChangesResponse } from "@aias00/codex-relay/api-schema";
 import { useSelector } from "@legendapp/state/react";
 import { useEffect, useRef, useState } from "react";
 import { InteractionManager, Pressable, ScrollView, View } from "react-native";

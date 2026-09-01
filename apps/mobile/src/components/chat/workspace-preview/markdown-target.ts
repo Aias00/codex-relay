@@ -1,1 +1,1 @@
-export type { WorkspaceMarkdownPreviewTarget } from "codex-relay/api-schema";
+export type { WorkspaceMarkdownPreviewTarget } from "@aias00/codex-relay/api-schema";

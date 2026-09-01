@@ -1,6 +1,6 @@
 import Constants from "expo-constants";
 import * as Notifications from "expo-notifications";
-import type { PushNotificationPreferences } from "codex-relay/api-schema";
+import type { PushNotificationPreferences } from "@aias00/codex-relay/api-schema";
 import { Platform } from "react-native";
 
 import { codexRelayStorage } from "./codex-relay-server-url-storage";

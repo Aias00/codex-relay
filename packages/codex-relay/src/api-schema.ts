@@ -53,7 +53,7 @@ export const ThreadGoalStatusSchema = z.enum([
 export const VersionResponseSchema = z.object({
   ok: z.boolean(),
   service: z.literal("codex-relay-server"),
-  packageName: z.literal("codex-relay"),
+  packageName: z.enum(["codex-relay", "@aias00/codex-relay"]),
   packageVersion: z.string().min(1),
 });
 
@@ -2039,7 +2039,10 @@ export function createOpenApiDocument() {
           properties: {
             ok: { type: "boolean" },
             service: { type: "string", const: "codex-relay-server" },
-            packageName: { type: "string", const: "codex-relay" },
+            packageName: {
+              type: "string",
+              enum: ["codex-relay", "@aias00/codex-relay"],
+            },
             packageVersion: { type: "string" },
           },
         },

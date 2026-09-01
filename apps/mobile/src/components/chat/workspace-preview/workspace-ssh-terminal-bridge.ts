@@ -1,6 +1,6 @@
 import { bridge, createWebView } from "@webview-bridge/react-native";
 
-import type { WorkspaceTerminalOutputResponse } from "codex-relay/api-schema";
+import type { WorkspaceTerminalOutputResponse } from "@aias00/codex-relay/api-schema";
 
 export type WorkspaceSshTerminalState = {
   fontSize?: number;

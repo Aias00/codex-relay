@@ -94,7 +94,7 @@ import {
   type WorkspaceTailscaleServeResponse,
   type WorkspaceTerminalOutputResponse,
   type WorkspaceTerminalSessionResponse,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 import { Platform } from "react-native";
 import { dfetch, dfetchStream } from "react-native-direct-fetch";
 import { fetch as nitroFetch } from "react-native-nitro-fetch";

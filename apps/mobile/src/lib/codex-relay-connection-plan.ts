@@ -5,7 +5,7 @@ import {
   type HealthResponse,
   type HttpConnectionPlanCandidate,
   type TailcatConnectionPlanCandidate,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 
 import { codexRelayStorage as storage } from "./codex-relay-server-url-storage";
 

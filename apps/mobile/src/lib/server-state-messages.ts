@@ -3,11 +3,11 @@ import type {
   QueuedThreadInput,
   ThreadDetailResponse,
   ThreadSummary,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 import {
   chatMessageDetailsFromPromptContext,
   promptMarkdownWithSkills,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 
 const optimisticSteeringMessageIdPrefix = "optimistic-steering:";
 const optimisticRunMessageIdPrefix = "optimistic-run:";

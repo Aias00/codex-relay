@@ -18,6 +18,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@aias00/codex-relay": "workspace:*",
     "@expo/dom-webview": "~56.0.6",
     "@expo/metro-runtime": "~56.0.14",
     "@expo/ui": "~56.0.16",
@@ -39,7 +40,6 @@
     "base64-js": "1.5.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "codex-relay": "workspace:*",
     "expo": "~56.0.21",
     "expo-build-properties": "~56.0.17",
     "expo-camera": "^56.0.7",

@@ -1,7 +1,7 @@
 import { LegendList, type LegendListRenderItemProps } from "@legendapp/list/react-native";
 import { useSelector } from "@legendapp/state/react";
 import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
-import type { ThreadDetailResponse, ThreadSummary } from "codex-relay/api-schema";
+import type { ThreadDetailResponse, ThreadSummary } from "@aias00/codex-relay/api-schema";
 import { router } from "expo-router";
 import type { Drawer } from "expo-router/drawer";
 import type { ComponentProps } from "react";

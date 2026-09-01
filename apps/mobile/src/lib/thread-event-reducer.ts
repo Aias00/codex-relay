@@ -2,7 +2,7 @@ import {
   StreamThreadRunEventSchema,
   type StreamThreadRunEvent,
   type ThreadEvent,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 
 export type ThreadEventCursor = {
   eventId?: string;

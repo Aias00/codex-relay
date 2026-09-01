@@ -1,4 +1,4 @@
-import type { WorkspaceSelectionRequest } from "codex-relay/api-schema";
+import type { WorkspaceSelectionRequest } from "@aias00/codex-relay/api-schema";
 
 import { workspaceCacheIdentity } from "./server-state-workspace-cache";
 

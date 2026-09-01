@@ -3,7 +3,7 @@ import {
   promptSkillDisplayName,
   promptMarkdownWithSkills,
   type PromptSkill,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 import { memo, useMemo } from "react";
 import { EnrichedMarkdownText, type MarkdownStyle } from "react-native-enriched-markdown";
 

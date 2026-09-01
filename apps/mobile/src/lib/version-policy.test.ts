@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import relayPackage from "codex-relay/package.json";
+import relayPackage from "@aias00/codex-relay/package.json";
 
 import {
   evaluateRelayVersion,
@@ -10,7 +10,7 @@ import {
 function relayVersion(packageVersion: string) {
   return {
     ok: true as const,
-    packageName: "codex-relay" as const,
+    packageName: "@aias00/codex-relay" as const,
     packageVersion,
     service: "codex-relay-server" as const,
   };
@@ -37,7 +37,7 @@ describe("relay version policy", () => {
     const olderVersion = previousPatchVersion(requiredVersion);
 
     expect(relayCompatibilityPolicy.packageVersion).toBe(requiredVersion);
-    expect(relayUpdateCommand).toBe("npx codex-relay@latest");
+    expect(relayUpdateCommand).toBe("npx @aias00/codex-relay@latest");
     expect(evaluateRelayVersion(relayVersion(olderVersion), undefined)).toMatchObject({
       compatible: false,
       current: olderVersion,

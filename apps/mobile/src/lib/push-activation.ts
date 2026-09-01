@@ -1,4 +1,4 @@
-import type { ThreadDetailResponse } from "codex-relay/api-schema";
+import type { ThreadDetailResponse } from "@aias00/codex-relay/api-schema";
 
 import type { PushNotificationTarget } from "./push-notification-routing";
 

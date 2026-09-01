@@ -1,4 +1,4 @@
-import type { ThreadSummary } from "codex-relay/api-schema";
+import type { ThreadSummary } from "@aias00/codex-relay/api-schema";
 
 export function activeThreadAfterRefresh({
   canReplaceMissingActiveThread = true,

@@ -1,4 +1,4 @@
-import type { WorkspaceFileContentResponse } from "codex-relay/api-schema";
+import type { WorkspaceFileContentResponse } from "@aias00/codex-relay/api-schema";
 import { router, useLocalSearchParams } from "expo-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";

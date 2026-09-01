@@ -1,4 +1,4 @@
-import { promptSkillDisplayName, type PromptSkill } from "codex-relay/api-schema";
+import { promptSkillDisplayName, type PromptSkill } from "@aias00/codex-relay/api-schema";
 import { memo } from "react";
 import { Text as NativeText, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";

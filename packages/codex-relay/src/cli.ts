@@ -42,7 +42,7 @@ import {
 
 import { codexRelayDataPath, codexRelayHome, legacyCodexRelayDataPath } from "./paths.js";
 
-const npxCommand = "npx codex-relay@latest";
+const npxCommand = "npx @aias00/codex-relay@latest";
 
 type ServerState = {
   connectUrl?: string;

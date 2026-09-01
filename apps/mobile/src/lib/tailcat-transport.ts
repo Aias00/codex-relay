@@ -1,7 +1,7 @@
 import type {
   HttpConnectionPlanCandidate,
   TailcatConnectionPlanCandidate,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 import {
   isTailcatTransportAvailable,
   isTailcatTransportEnabled,

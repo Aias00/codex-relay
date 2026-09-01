@@ -6,7 +6,7 @@ import type {
   RateLimitBucket,
   ThreadCollaborationMode,
   ThreadGoal,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { Keyboard, View } from "react-native";
 import {

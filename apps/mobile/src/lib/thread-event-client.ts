@@ -1,4 +1,7 @@
-import type { ListThreadEventsResponse, StreamThreadRunEvent } from "codex-relay/api-schema";
+import type {
+  ListThreadEventsResponse,
+  StreamThreadRunEvent,
+} from "@aias00/codex-relay/api-schema";
 
 import { streamEventFromThreadEvent } from "./thread-event-reducer";
 

@@ -8,7 +8,7 @@ import { replaceIosMarketingVersions, splitMixedChangesets } from "./version-pac
 const mixedReleaseChangeset = {
   id: "mixed-release",
   releases: [
-    { name: "codex-relay", type: "patch" },
+    { name: "@aias00/codex-relay", type: "patch" },
     { name: "@codex-relay/mobile", type: "patch" },
   ],
   summary: "Ship one feature through both release channels.",
@@ -51,7 +51,7 @@ test("keeps the mobile release when preparing a mixed npm changeset", () => {
       id: "mixed-release",
       originalReleases: mixedReleaseChangeset.releases,
       remainingReleases: [{ name: "@codex-relay/mobile", type: "patch" }],
-      selectedReleases: [{ name: "codex-relay", type: "patch" }],
+      selectedReleases: [{ name: "@aias00/codex-relay", type: "patch" }],
       summary: mixedReleaseChangeset.summary,
     },
   ]);
@@ -59,7 +59,7 @@ test("keeps the mobile release when preparing a mixed npm changeset", () => {
 
 test("keeps the npm release when preparing a mixed mobile changeset", () => {
   // Given a changeset shared by the npm and mobile release channels
-  const ignoredPackages = ["codex-relay", "react-native-direct-fetch"];
+  const ignoredPackages = ["@aias00/codex-relay", "react-native-direct-fetch"];
 
   // When the changeset is scoped to the mobile release branch
   const scopedChangesets = splitMixedChangesets([mixedReleaseChangeset], ignoredPackages);
@@ -69,7 +69,7 @@ test("keeps the npm release when preparing a mixed mobile changeset", () => {
     {
       id: "mixed-release",
       originalReleases: mixedReleaseChangeset.releases,
-      remainingReleases: [{ name: "codex-relay", type: "patch" }],
+      remainingReleases: [{ name: "@aias00/codex-relay", type: "patch" }],
       selectedReleases: [{ name: "@codex-relay/mobile", type: "patch" }],
       summary: mixedReleaseChangeset.summary,
     },

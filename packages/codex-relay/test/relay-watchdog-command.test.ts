@@ -13,7 +13,7 @@ describe("relay watchdog service command", () => {
     expect(command).toEqual({
       args: [
         "--filter",
-        "codex-relay",
+        "@aias00/codex-relay",
         "exec",
         "tsx",
         "watch",
@@ -29,7 +29,7 @@ describe("relay watchdog service command", () => {
     const command = relayServiceCommand(["stop"]);
 
     expect(command).toEqual({
-      args: ["--filter", "codex-relay", "exec", "tsx", "src/cli.ts", "stop"],
+      args: ["--filter", "@aias00/codex-relay", "exec", "tsx", "src/cli.ts", "stop"],
       command: "pnpm",
       persistent: false,
     });

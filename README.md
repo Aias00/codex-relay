@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/codex-relay"><img alt="npm" src="https://img.shields.io/npm/v/codex-relay?style=flat-square"></a>
+  <a href="https://www.npmjs.com/package/@aias00/codex-relay"><img alt="npm" src="https://img.shields.io/npm/v/@aias00/codex-relay?style=flat-square"></a>
   <a href="https://apps.apple.com/kr/app/codex-relay/id6764463488"><img alt="App Store" src="https://img.shields.io/badge/App%20Store-Codex%20Relay-111111?style=flat-square"></a>
   <img alt="Node.js" src="https://img.shields.io/badge/node-%3E%3D22.14-111111?style=flat-square">
   <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-111111?style=flat-square">
@@ -72,7 +72,7 @@ run.
 From the workspace where you want Codex to work:
 
 ```sh
-npx codex-relay@latest
+npx @aias00/codex-relay@latest
 ```
 
 The relay prints a QR code, a mobile URL, and a `codex-relay://pair...` pairing
@@ -86,7 +86,7 @@ not available, paste the full `codex-relay://pair...` link into the app.
 When the app shows an approval code, approve it from your computer:
 
 ```sh
-npx codex-relay@latest approve XXXX-XXXX
+npx @aias00/codex-relay@latest approve XXXX-XXXX
 ```
 
 Your phone can now talk to your local Codex session.
@@ -96,7 +96,7 @@ Your phone can now talk to your local Codex session.
 The default relay uses its own Codex app-server process. To make mobile and a terminal TUI use the same shared app-server, start the relay with:
 
 ```sh
-npx codex-relay@latest --shared-app-server
+npx @aias00/codex-relay@latest --shared-app-server
 ```
 
 When a shared app-server is already running, the relay attaches to it instead of starting another one. If the relay's own socket connection resets, it reconnects without deliberately stopping the shared app-server.
@@ -124,8 +124,8 @@ On macOS, Linux, and WSL, Relay starts the shared app-server as a detached local
 TUI users do not need this step. Compatible Codex Desktop builds can connect to the same detached daemon:
 
 ```sh
-npx codex-relay@latest desktop
-npx codex-relay@latest desktop --launch
+npx @aias00/codex-relay@latest desktop
+npx @aias00/codex-relay@latest desktop --launch
 ```
 
 Fully quit an already-running Desktop app before `--launch`. The command verifies app support and the app-server handshake, then waits until the new Desktop process is observably connected to the expected Unix socket before reporting success. Existing standalone stdio turns cannot move in place; reopen the same thread after launching shared mode.
@@ -182,7 +182,7 @@ Before opening a connection issue, confirm the network checklist in the issue
 template. Most pairing failures happen because the phone cannot reach the relay
 URL printed by the computer.
 
-Changes to the published `codex-relay` package should include a changeset:
+Changes to the published `@aias00/codex-relay` package should include a changeset:
 
 ```sh
 pnpm changeset
@@ -194,23 +194,23 @@ release pull request and publishes it after that pull request is merged. See
 
 ## Common Commands
 
-| Command                                             | What it does                                        |
-| --------------------------------------------------- | --------------------------------------------------- |
-| `npx codex-relay@latest`                            | Start the relay and print a pairing QR.             |
-| `npx codex-relay@latest --bg`                       | Keep the relay running in the background.           |
-| `npx codex-relay@latest --shared-app-server`        | Share live sessions with an attached terminal TUI.  |
-| `npx codex-relay@latest qr`                         | Print the current pairing QR for an existing relay. |
-| `npx codex-relay@latest approve XXXX-XXXX`          | Approve a pending mobile pairing request.           |
-| `npx codex-relay@latest clear`                      | Sign out every paired mobile app.                   |
-| `npx codex-relay@latest compatibility`              | Check legacy API retirement readiness.              |
-| `npx codex-relay@latest diagnostics`                | Inspect content-safe durable state counts.          |
-| `npx codex-relay@latest desktop`                    | Check optional Codex Desktop sharing readiness.     |
-| `npx codex-relay@latest desktop --launch`           | Launch Codex Desktop on the shared daemon.          |
-| `npx codex-relay@latest backup`                     | Create consistent SQLite backups.                   |
-| `npx codex-relay@latest compact THREAD --through N` | Compact one thread through an event sequence.       |
-| `npx codex-relay@latest repair-owner THREAD`        | Repair an expired owner lease.                      |
-| `npx codex-relay@latest tailcat-key rotate ...`     | Rotate the optional Tailcat server key safely.      |
-| `npx codex-relay@latest transport-benchmark FILE`   | Summarize content-safe route benchmark JSONL.       |
+| Command                                                     | What it does                                        |
+| ----------------------------------------------------------- | --------------------------------------------------- |
+| `npx @aias00/codex-relay@latest`                            | Start the relay and print a pairing QR.             |
+| `npx @aias00/codex-relay@latest --bg`                       | Keep the relay running in the background.           |
+| `npx @aias00/codex-relay@latest --shared-app-server`        | Share live sessions with an attached terminal TUI.  |
+| `npx @aias00/codex-relay@latest qr`                         | Print the current pairing QR for an existing relay. |
+| `npx @aias00/codex-relay@latest approve XXXX-XXXX`          | Approve a pending mobile pairing request.           |
+| `npx @aias00/codex-relay@latest clear`                      | Sign out every paired mobile app.                   |
+| `npx @aias00/codex-relay@latest compatibility`              | Check legacy API retirement readiness.              |
+| `npx @aias00/codex-relay@latest diagnostics`                | Inspect content-safe durable state counts.          |
+| `npx @aias00/codex-relay@latest desktop`                    | Check optional Codex Desktop sharing readiness.     |
+| `npx @aias00/codex-relay@latest desktop --launch`           | Launch Codex Desktop on the shared daemon.          |
+| `npx @aias00/codex-relay@latest backup`                     | Create consistent SQLite backups.                   |
+| `npx @aias00/codex-relay@latest compact THREAD --through N` | Compact one thread through an event sequence.       |
+| `npx @aias00/codex-relay@latest repair-owner THREAD`        | Repair an expired owner lease.                      |
+| `npx @aias00/codex-relay@latest tailcat-key rotate ...`     | Rotate the optional Tailcat server key safely.      |
+| `npx @aias00/codex-relay@latest transport-benchmark FILE`   | Summarize content-safe route benchmark JSONL.       |
 
 ## Configuration
 
@@ -256,7 +256,7 @@ owns and cleans the sidecar when `CODEX_RELAY_TAILCAT_TRANSPORT=1`.
 Rotate a persistent Tailcat server key with an explicit DERP region or custom DERP hostname:
 
 ```sh
-npx codex-relay@latest tailcat-key rotate --region derp.example.com
+npx @aias00/codex-relay@latest tailcat-key rotate --region derp.example.com
 ```
 
 The command discards Tailcat token output, validates the replacement with Tailcat itself, atomically
@@ -267,7 +267,7 @@ durable conversation state are not changed.
 Summarize internal transport benchmark samples without accessing Relay state:
 
 ```sh
-npx codex-relay@latest transport-benchmark transport-samples.jsonl
+npx @aias00/codex-relay@latest transport-benchmark transport-samples.jsonl
 ```
 
 The strict JSONL format accepts only an opaque UUID, timestamp, app version, route
@@ -281,13 +281,13 @@ free-form notes are rejected. Output contains only grouped success rates and P50
 If `qr` cannot find a server, start one first:
 
 ```sh
-npx codex-relay@latest
+npx @aias00/codex-relay@latest
 ```
 
 If another process is using the local pairing database, use the existing server:
 
 ```sh
-npx codex-relay@latest qr
+npx @aias00/codex-relay@latest qr
 ```
 
 If the mobile app cannot connect, confirm that the phone can reach the printed

@@ -1,4 +1,4 @@
-import type { ChatMessage } from "codex-relay/api-schema";
+import type { ChatMessage } from "@aias00/codex-relay/api-schema";
 import * as Clipboard from "expo-clipboard";
 import * as FileSystem from "expo-file-system/legacy";
 import { Image } from "expo-image";

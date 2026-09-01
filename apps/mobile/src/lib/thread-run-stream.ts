@@ -2,7 +2,7 @@ import {
   StreamThreadRunEventSchema,
   type QueuedThreadInput,
   type StreamThreadRunEvent,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 
 export type DecodeStreamPayload = (payload: unknown) => unknown;
 

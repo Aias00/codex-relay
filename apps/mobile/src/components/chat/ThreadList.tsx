@@ -1,6 +1,6 @@
 import { LegendList, type LegendListRenderItemProps } from "@legendapp/list/react-native";
 import { useSelector } from "@legendapp/state/react";
-import type { ThreadSummary } from "codex-relay/api-schema";
+import type { ThreadSummary } from "@aias00/codex-relay/api-schema";
 import { memo, useCallback } from "react";
 import { Pressable, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";

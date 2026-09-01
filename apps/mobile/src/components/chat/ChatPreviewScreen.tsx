@@ -5,7 +5,7 @@ import type {
   ReasoningEffort,
   RuntimeMode,
   ThreadCollaborationMode,
-} from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
 import { router } from "expo-router";
 import { useMemo, useState } from "react";
 import { Keyboard } from "react-native";

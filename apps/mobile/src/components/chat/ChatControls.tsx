@@ -1,4 +1,4 @@
-import type { CodexModel, ReasoningEffort, RuntimeMode } from "codex-relay/api-schema";
+import type { CodexModel, ReasoningEffort, RuntimeMode } from "@aias00/codex-relay/api-schema";
 import { useState } from "react";
 
 import { hapticSelection } from "@/lib/haptics";

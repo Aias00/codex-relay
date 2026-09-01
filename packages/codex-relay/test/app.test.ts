@@ -315,7 +315,7 @@ describe("Codex Relay server routes", () => {
     expect(body).toMatchObject({
       ok: true,
       service: "codex-relay-server",
-      packageName: "codex-relay",
+      packageName: "@aias00/codex-relay",
       packageVersion: relayPackage.version,
     });
   });

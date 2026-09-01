@@ -1,4 +1,8 @@
-import type { CodexModel, ReasoningEffort, RuntimePreferences } from "codex-relay/api-schema";
+import type {
+  CodexModel,
+  ReasoningEffort,
+  RuntimePreferences,
+} from "@aias00/codex-relay/api-schema";
 
 export type ModelPickerOption<Value extends string = string> = {
   label: string;

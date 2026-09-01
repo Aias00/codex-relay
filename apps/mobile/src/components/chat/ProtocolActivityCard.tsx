@@ -1,4 +1,4 @@
-import type { ChatMessage, ThreadMessageDetailField } from "codex-relay/api-schema";
+import type { ChatMessage, ThreadMessageDetailField } from "@aias00/codex-relay/api-schema";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { EnrichedMarkdownText, type MarkdownStyle } from "react-native-enriched-markdown";

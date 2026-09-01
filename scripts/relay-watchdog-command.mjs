@@ -4,7 +4,7 @@ export function relayServiceCommand(cliArgs) {
     command: "pnpm",
     args: [
       "--filter",
-      "codex-relay",
+      "@aias00/codex-relay",
       "exec",
       "tsx",
       ...(persistent ? ["watch"] : []),

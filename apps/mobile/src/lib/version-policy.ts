@@ -1,11 +1,11 @@
-import type { VersionResponse } from "codex-relay/api-schema";
-import relayPackage from "codex-relay/package.json";
+import type { VersionResponse } from "@aias00/codex-relay/api-schema";
+import relayPackage from "@aias00/codex-relay/package.json";
 
 // Kept in the OTA-delivered JS bundle so compatibility can move with app updates.
 export const relayCompatibilityPolicy = {
   packageVersion: relayPackage.version,
 } as const;
-export const relayUpdateCommand = "npx codex-relay@latest";
+export const relayUpdateCommand = "npx @aias00/codex-relay@latest";
 
 export type RelayVersionCompatibility =
   | {

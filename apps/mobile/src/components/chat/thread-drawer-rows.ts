@@ -1,4 +1,4 @@
-import type { ThreadSummary, WorkspaceSummary } from "codex-relay/api-schema";
+import type { ThreadSummary, WorkspaceSummary } from "@aias00/codex-relay/api-schema";
 
 import { workspaceName } from "../../lib/workspace-name";
 

@@ -15,7 +15,7 @@ Codex Relay is an independent project. It is not affiliated with, endorsed by, o
 Run the server from the workspace you want Codex to use:
 
 ```sh
-npx codex-relay@latest
+npx @aias00/codex-relay@latest
 ```
 
 The CLI prints a QR code, a mobile URL, and a `codex-relay://pair...` pairing payload. Scan the QR code from the mobile app. If the relay detects multiple possible network addresses, the QR includes them and the app automatically uses the first address it can reach. If scanning is not available, paste the full pairing payload into the app.
@@ -23,7 +23,7 @@ The CLI prints a QR code, a mobile URL, and a `codex-relay://pair...` pairing pa
 When the app shows an approval code, approve it on the computer:
 
 ```sh
-npx codex-relay@latest approve XXXX-XXXX
+npx @aias00/codex-relay@latest approve XXXX-XXXX
 ```
 
 After approval, the phone can list Codex threads, start new work, stream messages, and handle approval prompts from the local Codex runtime.
@@ -37,7 +37,7 @@ Linux, WSL, and native Windows keep using a private app-server by default. A ter
 Require the shared app-server on any platform:
 
 ```sh
-npx codex-relay@latest --shared-app-server
+npx @aias00/codex-relay@latest --shared-app-server
 ```
 
 This explicit mode does not fall back to a private app-server when shared startup fails.
@@ -69,8 +69,8 @@ On macOS, Linux, and WSL, Relay starts the shared app-server as a detached local
 TUI users do not need this step. On macOS, compatible Codex Desktop builds can connect to the same detached daemon:
 
 ```sh
-npx codex-relay@latest desktop
-npx codex-relay@latest desktop --launch
+npx @aias00/codex-relay@latest desktop
+npx @aias00/codex-relay@latest desktop --launch
 ```
 
 Fully quit an already-running Desktop app before `--launch`. The launcher verifies app support and the app-server handshake, then waits for an observable connection to the expected Unix socket before reporting success.
@@ -80,7 +80,7 @@ Fully quit an already-running Desktop app before `--launch`. The launcher verifi
 To keep the relay running after the command returns:
 
 ```sh
-npx codex-relay@latest --bg
+npx @aias00/codex-relay@latest --bg
 ```
 
 Background mode writes runtime files under `.codex-relay/` in the current directory:
@@ -93,67 +93,67 @@ Background mode writes runtime files under `.codex-relay/` in the current direct
 Print the current pairing QR again:
 
 ```sh
-npx codex-relay@latest qr
+npx @aias00/codex-relay@latest qr
 ```
 
 Stop a background server:
 
 ```sh
-npx codex-relay@latest stop
+npx @aias00/codex-relay@latest stop
 ```
 
 ## Commands
 
 ```sh
-npx codex-relay@latest
+npx @aias00/codex-relay@latest
 ```
 
 Start the relay in the foreground.
 
 ```sh
-npx codex-relay@latest --bg
+npx @aias00/codex-relay@latest --bg
 ```
 
 Start the relay in the background.
 
 ```sh
-npx codex-relay@latest stop
+npx @aias00/codex-relay@latest stop
 ```
 
 Stop the background relay. Repeating this command is safe when no background server is running.
 
 ```sh
-npx codex-relay@latest --shared-app-server
+npx @aias00/codex-relay@latest --shared-app-server
 ```
 
 Require the relay to start through Codex's shared app-server socket.
 
 ```sh
-npx codex-relay@latest qr
+npx @aias00/codex-relay@latest qr
 ```
 
 Print the latest pairing QR for an already running relay.
 
 ```sh
-npx codex-relay@latest approve XXXX-XXXX
+npx @aias00/codex-relay@latest approve XXXX-XXXX
 ```
 
 Approve a pending mobile pairing request.
 
 ```sh
-npx codex-relay@latest --dangerously-auto-approve
+npx @aias00/codex-relay@latest --dangerously-auto-approve
 ```
 
 Start the relay and automatically approve mobile pairing requests. Use this only for controlled review or demo environments.
 
 ```sh
-npx codex-relay@latest diagnostics
-npx codex-relay@latest compatibility
-npx codex-relay@latest backup
-npx codex-relay@latest compact THREAD_ID --through 2000
-npx codex-relay@latest repair-owner THREAD_ID
-npx codex-relay@latest tailcat-key rotate --region derp.example.com
-npx codex-relay@latest transport-benchmark transport-samples.jsonl
+npx @aias00/codex-relay@latest diagnostics
+npx @aias00/codex-relay@latest compatibility
+npx @aias00/codex-relay@latest backup
+npx @aias00/codex-relay@latest compact THREAD_ID --through 2000
+npx @aias00/codex-relay@latest repair-owner THREAD_ID
+npx @aias00/codex-relay@latest tailcat-key rotate --region derp.example.com
+npx @aias00/codex-relay@latest transport-benchmark transport-samples.jsonl
 ```
 
 Inspect content-safe state and compatibility counts, create online-consistent database backups, compact one thread at an explicit durable sequence, repair an expired owner lease, rotate the optional Tailcat server key, or summarize strict content-safe transport benchmark JSONL. `repair-owner` refuses active and non-expiring owners. Tailcat key rotation discards connection-token output, validates the generated key, atomically replaces it, preserves one mode-0600 `.previous` rollback copy, and requires a Relay restart before old tokens become invalid; pairing sessions and durable state are unchanged. Transport benchmark input rejects URLs, credentials, Relay/thread/workspace identity, conversation content, and free-form notes; output contains grouped success rates and P50/P95 metrics only.
@@ -166,7 +166,7 @@ The relay listens on `0.0.0.0:8787` by default. Configure it with environment va
 | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `PORT`                                 | Server port. Defaults to `8787`.                                                                                                                                |
 | `HOST`                                 | Listen host. Defaults to `0.0.0.0`.                                                                                                                             |
-| `CODEX_RELAY_WORKSPACE_PATH`           | Workspace path Codex should use. Defaults to the directory where you run `npx codex-relay@latest`.                                                              |
+| `CODEX_RELAY_WORKSPACE_PATH`           | Workspace path Codex should use. Defaults to the directory where you run `npx @aias00/codex-relay@latest`.                                                      |
 | `CODEX_RELAY_AUTH_DB_PATH`             | Pairing and session database path. Defaults to `.codex-relay/auth.db`.                                                                                          |
 | `CODEX_RELAY_MAX_THREAD_EVENTS`        | Optional per-thread durable event retention limit. Unset keeps all events; clients with compacted cursors reset from the authoritative thread detail.           |
 | `CODEX_RELAY_OWNER_LEASE_MS`           | Optional cross-process owner lease duration in milliseconds. Unset disables lease enforcement; an active lease prevents another Relay from starting a turn.     |
@@ -190,15 +190,15 @@ Tailcat remains capability-gated. The server returns its token only from the aut
 Examples:
 
 ```sh
-PORT=8788 npx codex-relay@latest
+PORT=8788 npx @aias00/codex-relay@latest
 ```
 
 ```sh
-PORT=8788 CODEX_RELAY_PUBLIC_URL=https://codex-relay.example.com npx codex-relay@latest
+PORT=8788 CODEX_RELAY_PUBLIC_URL=https://codex-relay.example.com npx @aias00/codex-relay@latest
 ```
 
 ```sh
-CODEX_RELAY_WORKSPACE_PATH=/path/to/project npx codex-relay@latest
+CODEX_RELAY_WORKSPACE_PATH=/path/to/project npx @aias00/codex-relay@latest
 ```
 
 ## Network Notes
@@ -211,22 +211,22 @@ The phone must be able to reach one of the URLs printed by the relay.
 
 ## Troubleshooting
 
-If `npx codex-relay@latest qr` cannot find a server, start one first:
+If `npx @aias00/codex-relay@latest qr` cannot find a server, start one first:
 
 ```sh
-npx codex-relay@latest
+npx @aias00/codex-relay@latest
 ```
 
 If the relay says another process is using the local pairing database, use the existing server:
 
 ```sh
-npx codex-relay@latest qr
+npx @aias00/codex-relay@latest qr
 ```
 
 Or stop the background process shown by the CLI:
 
 ```sh
-npx codex-relay@latest stop
+npx @aias00/codex-relay@latest stop
 ```
 
 If the mobile app cannot connect, confirm that the phone can reach the printed `Mobile:` URL and that the chosen port is not blocked by a firewall.

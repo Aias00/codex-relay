@@ -9,8 +9,11 @@ import type {
   RateLimitBucket,
   ThreadCollaborationMode,
   ThreadGoal,
-} from "codex-relay/api-schema";
-import { promptSkillMentionLabel, promptSkillMentionTextCandidates } from "codex-relay/api-schema";
+} from "@aias00/codex-relay/api-schema";
+import {
+  promptSkillMentionLabel,
+  promptSkillMentionTextCandidates,
+} from "@aias00/codex-relay/api-schema";
 import { Image } from "expo-image";
 import {
   memo,

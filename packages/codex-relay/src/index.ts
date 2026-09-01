@@ -116,7 +116,7 @@ const color = {
   prompt: colors.cyan,
   url: colors.blue,
 };
-const npxCommand = "npx codex-relay@latest";
+const npxCommand = "npx @aias00/codex-relay@latest";
 const workspacePath = resolve(process.env.CODEX_RELAY_WORKSPACE_PATH ?? process.cwd());
 
 const sessionStore = await createTursoPairingSessionStore(

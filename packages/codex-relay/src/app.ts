@@ -232,7 +232,7 @@ const LOCAL_MARKDOWN_IMAGE_PATTERN = /!\[([^\]]*)\]\(([^)]*)\)/g;
 const LOCAL_IMAGE_REFERENCE_PATTERN = /\.(gif|heic|heif|jpe?g|png|webp)$/i;
 const imageAttachmentDirectory = codexRelayDataPath("attachments/images");
 const requirePackage = createRequire(import.meta.url);
-const relayPackage = requirePackage("../package.json") as { version: string };
+const relayPackage = requirePackage("../package.json") as { name: string; version: string };
 const collaborationModeTemplateNames = ["default", "execute", "pair_programming", "plan"] as const;
 const knownCollaborationModeNames = "Default and Plan";
 const collaborationModeTemplates = Object.fromEntries(
@@ -1503,7 +1503,7 @@ export function createApp(options: AppOptions = {}) {
     const response: VersionResponse = VersionResponseSchema.parse({
       ok: true,
       service: "codex-relay-server",
-      packageName: "codex-relay",
+      packageName: relayPackage.name,
       packageVersion: relayPackage.version,
     });
 
