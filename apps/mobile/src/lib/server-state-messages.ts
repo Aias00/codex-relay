@@ -341,6 +341,16 @@ export function preferredThreadSnapshot(current: ThreadSummary, incoming: Thread
   return incoming;
 }
 
+export function preferredThreadSnapshotWithAuthoritativeGoal(
+  current: ThreadSummary,
+  incoming: ThreadSummary,
+) {
+  return {
+    ...preferredThreadSnapshot(current, incoming),
+    goal: incoming.goal,
+  };
+}
+
 function sortMessagesByCreation(messages: ChatMessage[]) {
   return messages
     .map((message, index) => ({ index, message }))

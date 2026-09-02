@@ -90,6 +90,7 @@ import {
   appendOptimisticSteeringMessageToDetail,
   mergeThreadDetailState,
   preferredThreadSnapshot,
+  preferredThreadSnapshotWithAuthoritativeGoal,
   upsertMessage,
 } from "./server-state-messages";
 import {
@@ -339,7 +340,7 @@ export function fetchContextWindowState(queryClient: QueryClient, threadId: stri
 
 export async function fetchThreadGoalState(queryClient: QueryClient, threadId: string) {
   const response = await getThreadGoal(threadId);
-  upsertThreadState(queryClient, response.thread);
+  upsertThreadState(queryClient, response.thread, { authoritativeGoal: true });
   return response;
 }
 
@@ -706,7 +707,7 @@ export async function updateThreadGoalServerState(
     ...body,
     expectedOwnerEpoch: body.expectedOwnerEpoch ?? getCachedThreadOwnerEpoch(queryClient, threadId),
   });
-  upsertThreadState(queryClient, response.thread);
+  upsertThreadState(queryClient, response.thread, { authoritativeGoal: true });
   return response;
 }
 
@@ -714,7 +715,7 @@ export async function clearThreadGoalServerState(queryClient: QueryClient, threa
   const response = await clearThreadGoal(threadId, {
     expectedOwnerEpoch: getCachedThreadOwnerEpoch(queryClient, threadId),
   });
-  upsertThreadState(queryClient, response.thread);
+  upsertThreadState(queryClient, response.thread, { authoritativeGoal: true });
   return response;
 }
 
@@ -891,7 +892,7 @@ export function setThreadsState(
 export function upsertThreadState(
   queryClient: QueryClient,
   thread: ThreadSummary,
-  options: { authoritativeThreadState?: boolean } = {},
+  options: { authoritativeGoal?: boolean; authoritativeThreadState?: boolean } = {},
 ) {
   markThreadSeenIfActive(thread);
   promoteThreadCache(queryClient, thread);
@@ -904,7 +905,9 @@ export function upsertThreadState(
         upsertById(
           threads,
           existing && !options.authoritativeThreadState
-            ? preferredThreadSnapshot(existing, thread)
+            ? options.authoritativeGoal
+              ? preferredThreadSnapshotWithAuthoritativeGoal(existing, thread)
+              : preferredThreadSnapshot(existing, thread)
             : thread,
         ),
       ),
@@ -918,7 +921,9 @@ export function upsertThreadState(
             ...current,
             thread: options.authoritativeThreadState
               ? thread
-              : preferredThreadSnapshot(current.thread, thread),
+              : options.authoritativeGoal
+                ? preferredThreadSnapshotWithAuthoritativeGoal(current.thread, thread)
+                : preferredThreadSnapshot(current.thread, thread),
           }
         : current,
   );
@@ -1157,7 +1162,7 @@ export function applyStreamEventToServerState(
       });
       return;
     case "thread.goal.updated":
-      upsertThreadState(queryClient, event.thread);
+      upsertThreadState(queryClient, event.thread, { authoritativeGoal: true });
       return;
     case "thread.error":
       if (event.thread) {

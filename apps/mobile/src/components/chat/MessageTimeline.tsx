@@ -26,6 +26,10 @@ import { hapticSelection } from "@/lib/haptics";
 
 import { MessageBubble } from "./MessageBubble";
 import { messageItemType, messageKeyExtractor } from "./timeline-message-items";
+import {
+  scheduleInitialTimelineEndPosition,
+  shouldPositionInitialTimelineAtEnd,
+} from "./timeline-initial-position";
 import type { WorkspaceMarkdownPreviewTarget } from "./workspace-preview/markdown-target";
 import { RunningFooter } from "./RunningFooter";
 
@@ -76,6 +80,8 @@ export function MessageTimeline({
 }) {
   const listRef = useRef<LegendListRef | null>(null);
   const latestMessageIdRef = useRef<string | undefined>(undefined);
+  const positionedTimelineKeyRef = useRef<string | undefined>(undefined);
+  const cancelInitialPositionRef = useRef<(() => void) | undefined>(undefined);
   const wasLoadingRef = useRef(Boolean(isLoading));
   const removeAtEndListenerRef = useRef<(() => void) | null>(null);
   const { bottom } = useSafeAreaInsets();
@@ -105,10 +111,38 @@ export function MessageTimeline({
   }, [bottomAccessoryHeight, extraContentPadding]);
 
   useEffect(() => {
+    cancelInitialPositionRef.current?.();
+    cancelInitialPositionRef.current = undefined;
     setIsAtEnd(true);
     setSettledTimelineKey(undefined);
     latestMessageIdRef.current = undefined;
+    positionedTimelineKeyRef.current = undefined;
   }, [timelineKey]);
+
+  const positionInitialTimelineAtEnd = useCallback(() => {
+    if (
+      !shouldPositionInitialTimelineAtEnd({
+        hasRows,
+        positionedTimelineKey: positionedTimelineKeyRef.current,
+        timelineKey,
+      })
+    ) {
+      return;
+    }
+    positionedTimelineKeyRef.current = timelineKey;
+    cancelInitialPositionRef.current?.();
+    cancelInitialPositionRef.current = scheduleInitialTimelineEndPosition({
+      cancelFrame: cancelAnimationFrame,
+      onSettled: () => {
+        if (positionedTimelineKeyRef.current === timelineKey) {
+          setIsAtEnd(true);
+          setSettledTimelineKey(timelineKey);
+        }
+      },
+      scheduleFrame: requestAnimationFrame,
+      scrollToEnd: () => listRef.current?.scrollToEnd({ animated: false }) ?? Promise.resolve(),
+    });
+  }, [hasRows, timelineKey]);
 
   useEffect(() => {
     const previousLatestMessageId = latestMessageIdRef.current;
@@ -157,31 +191,14 @@ export function MessageTimeline({
   useEffect(
     () => () => {
       removeAtEndListenerRef.current?.();
+      cancelInitialPositionRef.current?.();
     },
     [],
   );
 
   useEffect(() => {
-    if (!hasRows) {
-      return;
-    }
-    let didCancel = false;
-    let settleFrame: number | undefined;
-    const layoutFrame = requestAnimationFrame(() => {
-      settleFrame = requestAnimationFrame(() => {
-        if (!didCancel) {
-          setSettledTimelineKey(timelineKey);
-        }
-      });
-    });
-    return () => {
-      didCancel = true;
-      cancelAnimationFrame(layoutFrame);
-      if (settleFrame !== undefined) {
-        cancelAnimationFrame(settleFrame);
-      }
-    };
-  }, [hasRows, timelineKey]);
+    positionInitialTimelineAtEnd();
+  }, [positionInitialTimelineAtEnd]);
 
   useEffect(() => {
     contentRevealProgress.value = withTiming(showLoadingConversation ? 0 : 1, {
@@ -202,10 +219,12 @@ export function MessageTimeline({
     [onMessageCopied, onMessageRewind, onOpenMarkdownAttachment],
   );
   const handleTimelineLoad = useCallback(() => {
-    requestAnimationFrame(() => {
-      setSettledTimelineKey(timelineKey);
-    });
-  }, [timelineKey]);
+    if (hasRows) {
+      positionInitialTimelineAtEnd();
+      return;
+    }
+    setSettledTimelineKey(timelineKey);
+  }, [hasRows, positionInitialTimelineAtEnd, timelineKey]);
   const handleListRef = useCallback((list: LegendListRef | null) => {
     removeAtEndListenerRef.current?.();
     listRef.current = list;
