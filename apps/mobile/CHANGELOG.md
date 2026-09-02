@@ -1,5 +1,11 @@
 # @codex-relay/mobile
 
+## 1.4.0-ship.10
+
+### Patch Changes
+
+- 2a336e0: Switch the companion app and documentation to the independently published `@aias00/codex-relay` package while preserving the existing CLI binary name, pairing protocol, and local Relay data.
+
 ## 1.4.0-ship.9
 
 ### Patch Changes
