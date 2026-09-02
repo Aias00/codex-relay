@@ -32,6 +32,8 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+          registry-url: https://registry.npmjs.org
+          scope: "@aias00"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -130,6 +132,7 @@ jobs:
         if: steps.npm-release.outputs.publish == 'true'
         continue-on-error: true
         env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: pnpm release
 
